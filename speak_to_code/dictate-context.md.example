@@ -1,0 +1,26 @@
+# Dictate Context
+
+This file is prepended to every LLM cleanup call. Keep it under ~400 tokens (~1600 chars).
+Copy this to ~/.config/dictate/context.md and personalize it.
+
+## Vocabulary (stable — update rarely)
+
+Proper nouns and tools that voice transcription commonly mangles:
+
+- Claude (not "Cloud") — AI assistant by Anthropic; also Claude Code (the CLI)
+- Cursor — AI code editor (not "cursor" the mouse pointer)
+- <YourCompany> — your company name (add any common transcription errors here)
+- <YourTeam> — your team name (e.g., "not 'surcharge team' but 'SuperCharged Team'")
+- LiteLLM — open-source LLM proxy toolkit (not "light LLM" or "little LLM")
+- mlx-whisper — on-device transcription tool (not "MLX whisper" or "mix whisper")
+- GitLab / GitHub — version control platforms (not "get lab" or "git lab")
+
+## Current Focus (ephemeral — update weekly or as projects shift)
+
+Active projects and context to help the cleanup LLM understand references:
+
+- Working on: <your current project or feature>
+- Key repos: <your main repos>
+- Team: <your team name>
+
+<!-- Update the Current Focus section regularly. The Vocabulary section rarely needs changes. -->

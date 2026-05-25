@@ -57,6 +57,7 @@ The repo is the **source of truth** for tool code. Where a tool actually runs fr
 | Tool | Description | Runtime |
 |---|---|---|
 | [`cli_ready_alerts/`](./cli_ready_alerts/) | Context-aware notification framework for Cursor and Claude Code agents. Fires per-workspace sounds on `done` / `approval` / `failed`. Supports talking mode (macOS `say`) and custom recorded sounds. Ships a `cra` control CLI + companion skill. macOS-only. | Heavy (installs to `~/.local/share/cli_ready_alerts/`, symlinks `cra` into `~/.local/bin/`) |
+| [`speak_to_code/`](./speak_to_code/) | Voice-to-code dictation pipeline. Records speech, transcribes on-device via Apple Silicon (mlx-whisper), cleans up with the `llm` CLI, and copies to clipboard. macOS + Apple Silicon only. | Heavy (symlinks `dictate` into `~/.local/bin/`) |
 
 ## Graduation
 
@@ -83,5 +84,10 @@ workshop/
 │   ├── sounds/                    # Drop <context>_<event>.mp3 here to override defaults
 │   ├── lib/common.sh              # Shared helpers (config, context, dedup, logging)
 │   └── skills/cra/SKILL.md        # Companion skill for Claude Code / Cursor
+├── speak_to_code/                 # Voice dictation pipeline — record → transcribe → llm → clipboard
+│   ├── README.md                  # Install + usage
+│   ├── setup.sh                   # Installs deps, symlinks dictate to ~/.local/bin/
+│   ├── dictate                    # Main script
+│   └── dictate-context.md.example # Vocabulary template for context.md
 └── _archive/                      # Retired tools, kept for reference
 ```

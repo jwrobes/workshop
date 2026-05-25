@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# dictate: record -> transcribe -> llm cleanup -> pbcopy
+# Usage: dictate [--model whisper-model] [--backend llm|ollama] [context hint...]
+#
+# Backends:
+#   llm      — Simon Willison's llm CLI (pip install llm; llm keys set openai)
+#   ollama   — ollama run directly (offline / no API key; no extra deps)
+#
+# Examples:
+#   dictate                                 # record, transcribe, clean via llm, copy
+#   dictate --backend ollama                # fully local cleanup
+#   dictate --model whisper-small.en        # use a larger whisper model
+#   dictate --raw                           # skip LLM cleanup, copy raw transcript
+#   dictate write a cursor cli prompt       # context hint for the cleanup LLM
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WHISPER_MODEL="mlx-community/whisper-small.en-mlx"
+LLM_BACKEND="llm"
+OLLAMA_MODEL="llama3.2"
+RAW_MODE=false
+CONTEXT=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --model)   WHISPER_MODEL="$2"; shift 2 ;;
+        --backend) LLM_BACKEND="$2"; shift 2 ;;
+        --ollama-model) OLLAMA_MODEL="$2"; shift 2 ;;
+        --raw)     RAW_MODE=true; shift ;;
+        -h|--help)
+            sed -n '2,/^$/s/^# //p' "$0"
+            exit 0
+            ;;
+        *)         CONTEXT="$CONTEXT $1"; shift ;;
+    esac
+done
+CONTEXT="${CONTEXT# }"
+
+TMP_DIR=$(mktemp -d /tmp/dictate_XXXX)
+TMP_AUDIO="$TMP_DIR/recording.wav"
+TMP_TRANSCRIPT="$TMP_DIR/recording.txt"
+
+cleanup() { rm -rf "$TMP_DIR"; }
+trap cleanup EXIT
+
+step_time() { date +%s; }
+
+SYSTEM_PROMPT="Clean up this voice transcription for use as a developer prompt or message. \
+Fix grammar, remove filler words (um, uh, like, you know), make it concise and clear. \
+Preserve technical terms, code references, and variable names exactly as spoken. \
+Return only the cleaned text with no commentary."
+
+# --- Step 1: Record ---
+echo "Recording... (Ctrl-C to stop)"
+START=$(step_time)
+
+trap '' INT
+rec -q -c 1 "$TMP_AUDIO" || true
+trap - INT
+
+DURATION=$(( $(step_time) - START ))
+echo "Recorded ${DURATION}s of audio."
+
+if [[ ! -s "$TMP_AUDIO" ]]; then
+    echo "No audio captured. Exiting."
+    exit 1
+fi
+
+# --- Step 2: Transcribe ---
+echo "Transcribing..."
+START=$(step_time)
+
+mlx_whisper "$TMP_AUDIO" \
+    --model "$WHISPER_MODEL" \
+    --output-format txt \
+    --output-dir "$TMP_DIR" \
+    2>/dev/null
+
+if [[ ! -s "$TMP_TRANSCRIPT" ]]; then
+    echo "Transcription failed or produced empty output."
+    exit 1
+fi
+
+RAW=$(cat "$TMP_TRANSCRIPT")
+DURATION=$(( $(step_time) - START ))
+echo "Transcribed in ${DURATION}s. (${#RAW} chars)"
+
+# --- Step 3: LLM Cleanup ---
+if $RAW_MODE; then
+    FINAL="$RAW"
+else
+    echo "Cleaning up via $LLM_BACKEND..."
+    START=$(step_time)
+
+    PROMPT="$SYSTEM_PROMPT"
+    if [[ -n "$CONTEXT" ]]; then
+        PROMPT="$PROMPT Context for this dictation: $CONTEXT"
+    fi
+
+    case "$LLM_BACKEND" in
+        llm)
+            FINAL=$(echo "$RAW" | llm -s "$PROMPT")
+            ;;
+        ollama)
+            FINAL=$(ollama run "$OLLAMA_MODEL" "$(printf '%s\n\n%s' "$PROMPT" "$RAW")")
+            ;;
+        *)
+            echo "Unknown backend: $LLM_BACKEND (use llm or ollama)"
+            exit 1
+            ;;
+    esac
+
+    DURATION=$(( $(step_time) - START ))
+    echo "Cleaned in ${DURATION}s."
+fi
+
+# --- Step 4: Clipboard ---
+echo "$FINAL" | pbcopy
+echo "---"
+echo "$FINAL"
+echo "---"
+echo "Copied to clipboard."
