@@ -1,0 +1,7 @@
+# Personal recorded sounds — not committed. Drop <context>_<event>.mp3 here to
+# override system sounds or talking mode for that context+event.
+# The myproject_done.aiff below is kept as a naming reference only.
+*.mp3
+*.wav
+*.aiff
+!myproject_done.aiff

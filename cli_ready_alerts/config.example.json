@@ -1,0 +1,51 @@
+{
+  "_comment": "cli-ready-alerts config. Copied to config.json on first setup.sh run. Hot-reloadable (dispatch reads on every hook fire). See README for how to add contexts.",
+  "enabled": true,
+  "sound_mode": "sounds",
+  "_sound_mode_note": "sounds = use macOS system sounds below | talking = use macOS say (no files needed) | drop <context>_<event>.mp3 in sounds/ to override either mode",
+  "talking": {
+    "_note": "Active when sound_mode=talking. Voice must be installed (run: say -v ? | grep en_ to list options).",
+    "voice": "Samantha",
+    "messages": {
+      "done": "All done",
+      "approval": "Needs your approval",
+      "failed": "Something failed"
+    }
+  },
+  "guardrails": {
+    "quiet_hours": {
+      "start": 22,
+      "end": 7
+    },
+    "skip_if_cursor_frontmost": true
+  },
+  "channels": {
+    "sound": {
+      "enabled": true
+    },
+    "banner": {
+      "enabled": false,
+      "_note": "phase 6 — requires `brew install terminal-notifier`"
+    },
+    "telegram": {
+      "enabled": false,
+      "_note": "phase 7 — requires env vars set in $TELEGRAM_BOT_TOKEN / $TELEGRAM_CHAT_ID",
+      "bot_token_env": "TELEGRAM_BOT_TOKEN",
+      "chat_id_env": "TELEGRAM_CHAT_ID"
+    }
+  },
+  "routing": {
+    "done": ["sound"],
+    "approval": ["sound"],
+    "failed": ["sound"]
+  },
+  "contexts": [],
+  "default_context": {
+    "name": "default",
+    "sounds": {
+      "done": "Glass.aiff",
+      "approval": "Funk.aiff",
+      "failed": "Basso.aiff"
+    }
+  }
+}

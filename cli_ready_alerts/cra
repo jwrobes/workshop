@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+###############################################################################
+# cra — cli-ready-alerts control CLI
+#
+# Small wrapper for toggling the alert framework on/off, muting individual
+# contexts, tailing logs, and firing test sounds without needing to hand-edit
+# config.json or remember which env var does what.
+#
+# Installed via symlink:  ~/.local/bin/cra -> .../runtime/cra
+# Source of truth:        ai_coding_practices/cli_ready_alerts/runtime/cra
+#
+# Design rules:
+#  - All state changes go through jq + atomic rename on config.json (no partial
+#    writes).
+#  - No network, no heavy deps.
+#  - Fail loud here (this is a user-facing CLI; stdout + stderr are fair game),
+#    unlike dispatch.sh which must be silent.
+###############################################################################
+
+set -uo pipefail
+
+# Resolve symlinks so `cra` works when invoked via ~/.local/bin/cra symlink.
+_cra_src="${BASH_SOURCE[0]}"
+while [ -L "$_cra_src" ]; do
+  _cra_dir="$(cd -P "$(dirname "$_cra_src")" && pwd)"
+  _cra_link="$(readlink "$_cra_src")"
+  case "$_cra_link" in
+    /*) _cra_src="$_cra_link" ;;
+    *)  _cra_src="$_cra_dir/$_cra_link" ;;
+  esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_cra_src")" && pwd)"
+unset _cra_src _cra_dir _cra_link
+
+source "$SCRIPT_DIR/lib/common.sh"
+
+# ── Utilities ───────────────────────────────────────────────────────────────
+die() { printf 'cra: %s\n' "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*"; }
+
+# Atomic config write via jq filter.
+# Usage:  _cra_write_config '<jq-filter>' [--arg NAME VALUE ...]
+_cra_write_config() {
+  local filter="$1"; shift
+  local tmp
+  tmp="$(mktemp "${CRA_CONFIG}.XXXXXX")" || die "could not create temp file"
+  if ! jq "$@" "$filter" "$CRA_CONFIG" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    die "jq filter failed: $filter"
+  fi
+  # Preserve perms; mv is atomic within the same filesystem.
+  mv "$tmp" "$CRA_CONFIG" || { rm -f "$tmp"; die "failed to replace config"; }
+}
+
+# ── Subcommands ─────────────────────────────────────────────────────────────
+cmd_on() {
+  _cra_write_config '.enabled = true'
+  info "cli-ready-alerts: ON"
+}
+
+cmd_off() {
+  _cra_write_config '.enabled = false'
+  info "cli-ready-alerts: OFF"
+  info "(per-shell override still available: unset CURSOR_ALERT_DISABLE to re-enable for one terminal)"
+}
+
+cmd_status() {
+  local enabled quiet_start quiet_end skip_frontmost
+  enabled="$(cra_config_get '.enabled')"
+  quiet_start="$(cra_config_get '.guardrails.quiet_hours.start')"
+  quiet_end="$(cra_config_get '.guardrails.quiet_hours.end')"
+  skip_frontmost="$(cra_config_get '.guardrails.skip_if_cursor_frontmost')"
+
+  printf 'cli-ready-alerts\n'
+  printf '  enabled:              %s\n' "$enabled"
+  printf '  quiet_hours:          %s..%s\n' "$quiet_start" "$quiet_end"
+  printf '  skip_if_cursor_front: %s\n' "$skip_frontmost"
+
+  if [[ -n "${CURSOR_ALERT_DISABLE:-}" && "${CURSOR_ALERT_DISABLE}" == "1" ]]; then
+    printf '  shell override:       CURSOR_ALERT_DISABLE=1 (this terminal is muted)\n'
+  fi
+  if [[ -n "${CURSOR_ALERT_CONTEXT:-}" ]]; then
+    printf '  shell context override: CURSOR_ALERT_CONTEXT=%s\n' "$CURSOR_ALERT_CONTEXT"
+  fi
+
+  printf '\nrouting:\n'
+  jq -r '.routing | to_entries[] | "  \(.key): \(.value | join(","))"' "$CRA_CONFIG"
+
+  printf '\nchannels:\n'
+  jq -r '.channels | to_entries[] | "  \(.key): enabled=\(.value.enabled)"' "$CRA_CONFIG"
+
+  printf '\ncontexts:\n'
+  local ctx_json
+  ctx_json="$(jq -c '.contexts // []' "$CRA_CONFIG")"
+  if [[ "$ctx_json" == "[]" ]]; then
+    printf '  (none — using default_context only)\n'
+  else
+    jq -r '
+      .contexts[] |
+      "  \(.name)  match=\(.match.workspace_path)  muted=\(.muted // false)  done=\(.sounds.done // "<default>")"
+    ' "$CRA_CONFIG"
+  fi
+
+  printf '\ndefault_context sounds:\n'
+  jq -r '.default_context.sounds | to_entries[] | "  \(.key): \(.value)"' "$CRA_CONFIG"
+
+  printf '\npaths:\n'
+  printf '  config:     %s\n' "$CRA_CONFIG"
+  printf '  log:        %s\n' "$CRA_LOG"
+  printf '  state_dir:  %s\n' "$CRA_STATE_DIR"
+}
+
+cmd_mute() {
+  local ctx="${1:-}"
+  [[ -z "$ctx" ]] && die "usage: cra mute <context>"
+  local exists
+  exists="$(jq -r --arg c "$ctx" '(.contexts // []) | map(select(.name == $c)) | length' "$CRA_CONFIG")"
+  [[ "$exists" == "0" ]] && die "no such context: $ctx (run 'cra status' to list)"
+  # Flag the context as muted. dispatch.sh short-circuits when it sees this.
+  _cra_write_config \
+    '(.contexts[] | select(.name == $c) | .muted) |= true' \
+    --arg c "$ctx"
+  info "muted: $ctx"
+}
+
+cmd_unmute() {
+  local ctx="${1:-}"
+  [[ -z "$ctx" ]] && die "usage: cra unmute <context>"
+  _cra_write_config \
+    '(.contexts[] | select(.name == $c) | .muted) |= false' \
+    --arg c "$ctx"
+  info "unmuted: $ctx"
+}
+
+cmd_tail() {
+  local n="${1:-40}"
+  if [[ ! -f "$CRA_LOG" ]]; then
+    info "no log file yet at $CRA_LOG"
+    return 0
+  fi
+  tail -n "$n" "$CRA_LOG"
+}
+
+cmd_test() {
+  local event="${1:-done}"
+  local ctx="${2:-default}"
+  local sound_file
+  sound_file="$(cra_sound_for_context_event "$ctx" "$event")"
+  if [[ -z "$sound_file" ]]; then
+    die "no sound resolved for context=$ctx event=$event"
+  fi
+  info "playing: $sound_file (context=$ctx event=$event)"
+  afplay "$sound_file"
+}
+
+cmd_edit() {
+  "${EDITOR:-vi}" "$CRA_CONFIG"
+}
+
+cmd_help() {
+  cat <<'HELP'
+cra — cli-ready-alerts control CLI
+
+Usage: cra <command> [args]
+
+Commands:
+  on                    Enable alerts (sets config.enabled=true)
+  off                   Disable alerts globally (persists across sessions)
+  status                Show current config, contexts, routing, overrides
+  mute <context>        Silence a specific context (e.g. cra mute myproject)
+  unmute <context>      Re-enable a silenced context
+  test [event] [ctx]    Play the sound that would fire for an event+context
+                        (defaults: event=done, ctx=default)
+  tail [N]              Tail the last N lines of /tmp/cli-ready-alerts.log (default 40)
+  edit                  Open config.json in $EDITOR
+  help                  Show this help
+
+Per-shell overrides (no persistent state):
+  export CURSOR_ALERT_DISABLE=1   # mute only this terminal
+  export CURSOR_ALERT_CONTEXT=... # force a context in this terminal
+HELP
+}
+
+# ── Dispatch ────────────────────────────────────────────────────────────────
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  on)      cmd_on ;;
+  off)     cmd_off ;;
+  status|st) cmd_status ;;
+  mute)    cmd_mute "$@" ;;
+  unmute)  cmd_unmute "$@" ;;
+  tail|log) cmd_tail "$@" ;;
+  test)    cmd_test "$@" ;;
+  edit)    cmd_edit ;;
+  help|-h|--help) cmd_help ;;
+  *)       die "unknown command: $cmd (try 'cra help')" ;;
+esac
