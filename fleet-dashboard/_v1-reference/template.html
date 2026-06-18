@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fleet Dashboard</title>
+<style>
+  :root { --bg:#0f1117; --card:#181b24; --txt:#d7dae2; --dim:#8b91a0; --line:#262b38;
+          --red:#e5534b; --amber:#d4a72c; --green:#46954a; --blue:#539bf5; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 -apple-system, "SF Mono", Menlo, monospace; background:var(--bg); color:var(--txt); padding:24px; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  .sub { color:var(--dim); margin-bottom:20px; font-size:12px; }
+  .summary { display:flex; gap:12px; margin-bottom:24px; flex-wrap:wrap; }
+  .stat { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:10px 16px; }
+  .stat b { font-size:20px; display:block; }
+  .stat.bad b { color:var(--red); }
+  .stat.ok b { color:var(--green); }
+  h2 { font-size:14px; color:var(--dim); text-transform:uppercase; letter-spacing:.08em; margin:28px 0 10px; }
+  table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  th, td { text-align:left; padding:8px 12px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { cursor:pointer; color:var(--dim); font-size:12px; user-select:none; white-space:nowrap; }
+  th:hover { color:var(--txt); }
+  tr.flagged { background:rgba(229,83,75,.07); }
+  td.path { color:var(--dim); font-size:11px; max-width:320px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .chip { display:inline-block; border-radius:10px; padding:1px 8px; font-size:11px; margin:1px 3px 1px 0; white-space:nowrap; }
+  .chip.red { background:rgba(229,83,75,.18); color:var(--red); }
+  .chip.amber { background:rgba(212,167,44,.15); color:var(--amber); }
+  .chip.blue { background:rgba(83,155,245,.15); color:var(--blue); }
+  .chip.green { background:rgba(70,149,74,.18); color:var(--green); }
+  .chip.dim { background:rgba(139,145,160,.12); color:var(--dim); }
+  .ok { color:var(--green); } .dim { color:var(--dim); }
+</style>
+</head>
+<body>
+<h1>Workspace Fleet Dashboard</h1>
+<div class="sub" id="generated"></div>
+<div class="summary" id="summary"></div>
+<h2>Worktrees &amp; Clones</h2>
+<table id="wt"><thead></thead><tbody></tbody></table>
+<h2>Workbench Initiatives</h2>
+<table id="ini"><thead></thead><tbody></tbody></table>
+
+<script>
+const DATA = /*__DATA__*/null;
+
+const FLAG_SEVERITY = {
+  "unprotected":"red", "zombie":"red", "merged-but-not-removed":"amber",
+  "stale":"amber", "orphan":"amber", "behind-origin":"blue",
+  "no-workbench-pair":"dim", "no-worktree-pair":"dim"
+};
+
+function chip(text, cls){ return `<span class="chip ${cls}">${text}</span>`; }
+function flagChips(flags){ return (flags||[]).map(f=>chip(f, FLAG_SEVERITY[f]||"dim")).join("") || '<span class="ok">✓</span>'; }
+function days(iso){ if(!iso) return ""; const d=Math.floor((Date.now()-new Date(iso))/864e5); return d===0?"today":d+"d ago"; }
+function prChip(pr){
+  if(!pr) return '<span class="dim">—</span>';
+  const cls = pr.state==="MERGED"?"green":pr.state==="OPEN"?"blue":"dim";
+  return chip(`#${pr.number} ${pr.state}`, cls);
+}
+
+function renderTable(el, cols, rows){
+  const thead = el.querySelector("thead"), tbody = el.querySelector("tbody");
+  let sortKey = null, asc = true;
+  function draw(){
+    let sorted = [...rows];
+    if(sortKey!==null){
+      sorted.sort((a,b)=>{ const x=a._sort[sortKey], y=b._sort[sortKey];
+        return (x>y?1:x<y?-1:0)*(asc?1:-1); });
+    }
+    tbody.innerHTML = sorted.map(r=>`<tr class="${r._flagged?"flagged":""}">${r._cells.map(c=>`<td class="${c.cls||""}">${c.html}</td>`).join("")}</tr>`).join("");
+  }
+  thead.innerHTML = "<tr>"+cols.map((c,i)=>`<th data-i="${i}">${c} ↕</th>`).join("")+"</tr>";
+  thead.querySelectorAll("th").forEach(th=>th.onclick=()=>{
+    const i=+th.dataset.i; asc = sortKey===i ? !asc : true; sortKey=i; draw();
+  });
+  draw();
+}
+
+const wtRows = DATA.worktrees.map(r=>({
+  _flagged: r.flags.some(f=>["unprotected","zombie","merged-but-not-removed","orphan"].includes(f)),
+  _sort: [r.repo, r.kind, r.branch, r.dirty_files, r.last_commit||"", r.merged?1:0, r.flags.length],
+  _cells: [
+    {html:`<b>${r.repo}</b><div class="path">${r.path.replace(/^.*workspace\//,"")}</div>`},
+    {html:r.kind==="clone"?chip("clone","dim"):chip("worktree","blue")},
+    {html:r.branch + (r.initiative?`<div class="dim" style="font-size:11px">↳ ${r.initiative} (${r.initiative_state})</div>`:"")},
+    {html:r.dirty_files?chip(r.dirty_files+" dirty","red"):'<span class="ok">clean</span>'},
+    {html:`${days(r.last_commit)}<div class="dim" style="font-size:11px">${(r.last_commit||"").slice(0,10)}</div>`},
+    {html:r.merged===true?chip("merged","green"):r.merged===false?chip("unmerged","amber"):'<span class="dim">—</span>'},
+    {html:prChip(r.pr)},
+    {html:flagChips(r.flags)}
+  ]
+}));
+renderTable(document.getElementById("wt"),
+  ["Repo / path","Kind","Branch / initiative","Dirty","Last commit","Merged","PR","Flags"], wtRows);
+
+const iniRows = DATA.initiatives.map(r=>({
+  _flagged:false,
+  _sort:[r.workspace, r.name, r.state, r.has_worktree?1:0],
+  _cells:[
+    {html:r.workspace},
+    {html:`<b>${r.name}</b>`},
+    {html:r.state==="completed"?chip("completed","green"):chip("active","blue")},
+    {html:r.has_worktree?'<span class="ok">yes</span>':'<span class="dim">no (docs-only?)</span>'},
+    {html:flagChips(r.flags)}
+  ]
+}));
+renderTable(document.getElementById("ini"),
+  ["Workspace","Initiative","State","Worktree","Flags"], iniRows);
+
+const wts = DATA.worktrees.filter(r=>r.kind==="worktree");
+const flagged = DATA.worktrees.filter(r=>r.flags.length);
+document.getElementById("generated").textContent =
+  "generated " + DATA.generated_at + " · " + DATA.worktrees.length + " rows";
+document.getElementById("summary").innerHTML = [
+  `<div class="stat"><b>${wts.length}</b>worktrees</div>`,
+  `<div class="stat"><b>${DATA.worktrees.length-wts.length}</b>clones</div>`,
+  `<div class="stat"><b>${DATA.initiatives.filter(i=>i.state==="active").length}</b>active initiatives</div>`,
+  `<div class="stat"><b>${DATA.initiatives.filter(i=>i.state==="completed").length}</b>completed</div>`,
+  `<div class="stat ${flagged.length?"bad":"ok"}"><b>${flagged.length}</b>need attention</div>`
+].join("");
+</script>
+</body>
+</html>
