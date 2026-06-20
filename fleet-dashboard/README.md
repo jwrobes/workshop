@@ -14,9 +14,13 @@ inlined, so it opens straight from `file://` with no CORS).
 
 - **`collector.py`** — the ported v1 engine: git/PR/flag fidelity, including the
   **squash-merge-aware** `is_merged` check, the `git worktree list --porcelain`
-  parse, naming-based pairing, and the self-contained HTML emit. The v1
-  `collect_initiatives()` workbench reader was removed; `collect_kanban()`
-  replaces it in Leaf 2 (#3).
+  parse, naming-based pairing, and the self-contained HTML emit.
+- **`collect_kanban()`** (Leaf 2) — reads plans as markdown at two levels:
+  product (coordinator repo's `coordinator_plans_path`) and repo (each member
+  clone's `repo_plans_path`). The column directory is the card's status; the
+  title comes from YAML frontmatter (`title:`) or the filename. Reads the local
+  filesystem, or — in forge-only mode — via `Forge.read_dir`/`get_file`.
+  Replaces v1's `collect_initiatives()`.
 - **`fleet.config.json`** — declares the forge, workspace root, products, and
   plan paths/columns. **No org or path is hardcoded in code** — it all comes
   from here. Ships a real Magic Me config.

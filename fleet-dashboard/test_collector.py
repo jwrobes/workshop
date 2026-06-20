@@ -287,6 +287,131 @@ class ConfigErrorTests(unittest.TestCase):
             os.unlink(name)
 
 
+class FrontmatterTests(unittest.TestCase):
+    """Leaf 2: frontmatter title parsed when present; filename fallback."""
+
+    def test_title_from_frontmatter(self):
+        text = "---\ntitle: Ship the thing\nstatus: wip\n---\n\nbody\n"
+        self.assertEqual(collector.parse_frontmatter_title(text), "Ship the thing")
+
+    def test_quoted_title(self):
+        self.assertEqual(
+            collector.parse_frontmatter_title('---\ntitle: "Quoted: Title"\n---\n'),
+            "Quoted: Title")
+
+    def test_no_frontmatter_returns_none(self):
+        self.assertIsNone(collector.parse_frontmatter_title("# Just a heading\n"))
+
+    def test_frontmatter_without_title_returns_none(self):
+        self.assertIsNone(collector.parse_frontmatter_title("---\nstatus: x\n---\n"))
+
+
+class CollectKanbanTests(unittest.TestCase):
+    """Leaf 2: collect_kanban() returns product- AND repo-level cards with
+    status from the column dir; columns/paths from config; title fallback."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.ws = root / "workspace"
+        self.ws.mkdir(parents=True)
+        self.cfg = {
+            "forge": "github",
+            "workspace_root": str(self.ws),
+            "repo_plans_path": "plans",
+            "plan_columns": ["active", "backlog", "completed", "done"],
+            "products": [{
+                "id": "magic-me", "name": "Magic Me", "forge_org": "Jwrobes-Magic",
+                "coordinator_repo": "Jwrobes-Magic/magic-me-workbench",
+                "coordinator_plans_path": "workbench/plans",
+            }],
+        }
+        # product-level coordinator plans
+        coord = self.ws / "magic-me-workbench" / "workbench" / "plans"
+        (coord / "active").mkdir(parents=True)
+        (coord / "active" / "launch.md").write_text("---\ntitle: Launch Magic Me\n---\nx\n")
+        (coord / "done").mkdir(parents=True)
+        (coord / "done" / "kickoff.md").write_text("kickoff body, no frontmatter\n")
+        self._init_clone(self.ws / "magic-me-workbench", "Jwrobes-Magic/magic-me-workbench")
+        # repo-level plans in a member clone
+        member = self.ws / "claw-playbook"
+        self._init_clone(member, "Jwrobes-Magic/claw-playbook")
+        rp = member / "plans"
+        (rp / "backlog").mkdir(parents=True)
+        (rp / "backlog" / "retries.md").write_text("---\ntitle: Add retries\n---\n")
+        (rp / "completed").mkdir(parents=True)
+        (rp / "completed" / "auth.md").write_text("no frontmatter\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _init_clone(self, path, slug):
+        path.mkdir(parents=True, exist_ok=True)
+        _git(path, "init")
+        _git(path, "remote", "add", "origin", f"https://github.com/{slug}.git")
+
+    def _cards(self):
+        return collector.collect_kanban(self.cfg, self.ws)
+
+    def test_product_level_cards(self):
+        cards = self._cards()
+        prod = [c for c in cards if c["level"] == "product"]
+        titles = {c["title"]: c for c in prod}
+        self.assertIn("Launch Magic Me", titles)
+        self.assertEqual(titles["Launch Magic Me"]["status"], "active")
+        self.assertEqual(titles["Launch Magic Me"]["product"], "magic-me")
+        # filename fallback + 'done' column honored
+        self.assertIn("kickoff", titles)
+        self.assertEqual(titles["kickoff"]["status"], "done")
+
+    def test_repo_level_cards(self):
+        cards = self._cards()
+        repo = [c for c in cards if c["level"] == "repo"]
+        by_title = {c["title"]: c for c in repo}
+        self.assertEqual(by_title["Add retries"]["status"], "backlog")
+        self.assertEqual(by_title["Add retries"]["repo"], "claw-playbook")
+        self.assertEqual(by_title["Add retries"]["product"], "magic-me")  # org match
+        # 'completed' column accepted alongside 'done'
+        self.assertEqual(by_title["auth"]["status"], "completed")
+
+    def test_columns_come_from_config(self):
+        # a column not in config is ignored
+        stray = self.ws / "claw-playbook" / "plans" / "icebox"
+        stray.mkdir(parents=True)
+        (stray / "later.md").write_text("---\ntitle: Later\n---\n")
+        titles = {c["title"] for c in self._cards()}
+        self.assertNotIn("Later", titles)
+
+
+class KanbanForgeReadTests(unittest.TestCase):
+    """Leaf 2: forge-only Kanban read goes through Forge.read_dir/get_file."""
+
+    def test_via_forge_stubbed(self):
+        class FakeForge(collector.Forge):
+            def list_repos(self, product): return []
+            def list_prs(self, repo_slug, branch=None): return []
+            def read_dir(self, repo_slug, path):
+                if path == "workbench/plans/active":
+                    return [{"name": "go.md", "path": "workbench/plans/active/go.md",
+                             "type": "file"}]
+                return []
+            def get_file(self, repo_slug, path):
+                return "---\ntitle: Go Live\n---\n"
+        cards = collector._kanban_via_forge(
+            FakeForge(), "Jwrobes-Magic/magic-me-workbench", "workbench/plans",
+            ["active", "done"], "product", "magic-me", None)
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0]["title"], "Go Live")
+        self.assertEqual(cards[0]["status"], "active")
+
+    def test_gitlab_kanban_methods_stubbed(self):
+        gl = collector.GitLabForge()
+        with self.assertRaises(NotImplementedError):
+            gl.read_dir("g/r", "p")
+        with self.assertRaises(NotImplementedError):
+            gl.get_file("g/r", "p")
+
+
 class SmokeRunTests(unittest.TestCase):
     """AC1 + AC4: collector.py runs end to end, --no-gh works, emits artifacts."""
 
@@ -326,7 +451,7 @@ class SmokeRunTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         status = json.loads((self.out / "status.json").read_text())
         self.assertIn("worktrees", status)
-        self.assertIn("initiatives", status)
+        self.assertIn("kanban", status)
         # dashboard.html is self-contained with the data inlined (token replaced)
         html = (self.out / "dashboard.html").read_text()
         self.assertNotIn("/*__DATA__*/null", html)
