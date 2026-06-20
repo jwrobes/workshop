@@ -83,15 +83,18 @@ def ahead_behind(path, branch, base):
     """Returns (ahead, behind) vs origin/<base>; (None, None) if not computable."""
     code, out = git(path, "rev-list", "--left-right", "--count",
                     f"origin/{base}...{branch}")
-    if code != 0:
+    parts = out.split()
+    if code != 0 or len(parts) != 2:
         return None, None
-    behind, ahead = (int(x) for x in out.split())
+    behind, ahead = (int(x) for x in parts)
     return ahead, behind
 
 
 def is_merged(path, branch, base):
     """Merged check that survives squash merges: git cherry lines starting
     with '-' are patch-equivalent upstream; any '+' line is unmerged."""
+    # Fast path: no commits unique to the branch (incl. a branch sitting at
+    # base) => nothing left to merge, treat as merged.
     code, out = git(path, "rev-list", "--count", f"origin/{base}..{branch}")
     if code == 0 and out == "0":
         return True
@@ -109,10 +112,20 @@ def norm(s):
 # Config
 # --------------------------------------------------------------------------
 
+class ConfigError(Exception):
+    """Raised when fleet.config.json is missing or malformed."""
+
+
 def load_config(path=DEFAULT_CONFIG):
     """Load fleet.config.json. All product/forge/path specifics live here;
     the collector logic reads them rather than hardcoding any value."""
-    return json.loads(Path(path).expanduser().read_text())
+    p = Path(path).expanduser()
+    try:
+        return json.loads(p.read_text())
+    except FileNotFoundError:
+        raise ConfigError(f"config not found: {p}")
+    except json.JSONDecodeError as e:
+        raise ConfigError(f"config is not valid JSON ({p}): {e}")
 
 
 # --------------------------------------------------------------------------
@@ -257,8 +270,12 @@ def main():
     ap.add_argument("--no-gh", action="store_true", help="skip forge PR lookups (offline)")
     args = ap.parse_args()
 
-    cfg = load_config(args.config)
-    forge = make_forge(cfg.get("forge", "github"))
+    try:
+        cfg = load_config(args.config)
+        forge = make_forge(cfg.get("forge", "github"))
+    except (ConfigError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
 
     workspace_root = Path(args.workspace or cfg.get("workspace_root", "~/workspace")).expanduser()
     out_dir = Path(args.out).expanduser() if args.out else (workspace_root / ".fleet")
@@ -324,10 +341,18 @@ def main():
                     age = (now - datetime.datetime.fromisoformat(last)).days
                     if age >= STALE_DAYS and not merged:
                         flags.append("stale")
-                if not ini:
+                # Only assert a missing pair when we actually have pairing data.
+                # In Leaf 1 `initiatives` is empty (collect_initiatives() stripped;
+                # collect_kanban() repopulates it in Leaf 2 / #3), so suppress this
+                # flag rather than tag every worktree spuriously.
+                if initiatives and not ini:
                     flags.append("no-workbench-pair")
                 if not in_workspace_dir:
                     flags.append("orphan")
+            # NOTE (v1-faithful behavior): under --no-gh, `pr` is always None, so a
+            # dirty/ahead-unmerged worktree is flagged `unprotected` even if an open
+            # PR would protect it online. Offline mode cannot know PR state; this
+            # matches the v1 engine. Treat offline `unprotected` as "PR state unknown".
             if dirty or (ahead and not pr and merged is False):
                 flags.append("unprotected")
             if kind == "clone" and behind:

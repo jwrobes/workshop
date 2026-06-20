@@ -188,6 +188,105 @@ class IsMergedSquashTests(unittest.TestCase):
         self.assertFalse(collector.is_merged(self.work, "build-unmerged", "main"))
 
 
+class ListReposParseTests(unittest.TestCase):
+    """AC3: GitHubForge.list_repos parses the forge response (stubbed run)."""
+
+    def test_parses_name_with_owner(self):
+        orig = collector.run
+        collector.run = lambda *a, **k: (0, json.dumps(
+            [{"nameWithOwner": "Jwrobes-Magic/claw-playbook"},
+             {"nameWithOwner": "Jwrobes-Magic/magic-me-workbench"}]))
+        try:
+            repos = collector.GitHubForge().list_repos({"forge_org": "Jwrobes-Magic"})
+        finally:
+            collector.run = orig
+        self.assertEqual(repos, ["Jwrobes-Magic/claw-playbook",
+                                 "Jwrobes-Magic/magic-me-workbench"])
+
+    def test_returns_empty_on_error(self):
+        orig = collector.run
+        collector.run = lambda *a, **k: (1, "boom")
+        try:
+            self.assertEqual(collector.GitHubForge().list_repos({"forge_org": "x"}), [])
+        finally:
+            collector.run = orig
+
+
+class FlagEngineTests(unittest.TestCase):
+    """AC1: flag fidelity — a squash-merged worktree yields merged==True and
+    the `merged-but-not-removed` flag. Exercises the engine end to end, not
+    just is_merged() in isolation."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.ws = root / "workspace"
+        self.ws.mkdir(parents=True)
+        repo = self.ws / "demo"
+        origin = root / "demo.git"
+        env = ["-c", "user.email=t@t", "-c", "user.name=t"]
+        _git(root, "init", "--bare", str(origin))
+        _git(root, "clone", str(origin), str(repo))
+        (repo / "a.txt").write_text("a\n")
+        _git(repo, "add", "a.txt")
+        _git(repo, *env, "commit", "-m", "init")
+        _git(repo, "branch", "-M", "main")
+        _git(repo, "push", "origin", "main")
+        # feature branch, then squash-merge into main
+        _git(repo, "checkout", "-b", "build-feature")
+        (repo / "b.txt").write_text("b\n")
+        _git(repo, "add", "b.txt")
+        _git(repo, *env, "commit", "-m", "feature")
+        _git(repo, "checkout", "main")
+        _git(repo, "merge", "--squash", "build-feature")
+        _git(repo, *env, "commit", "-m", "squashed")
+        _git(repo, "push", "origin", "main")
+        _git(repo, "fetch", "origin")
+        # a worktree still checked out on the merged branch
+        _git(repo, "worktree", "add", str(self.ws / "demo-feature"), "build-feature")
+        self.repo = repo
+        self.out = root / "out"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_merged_worktree_flagged(self):
+        import sys
+        old = sys.argv
+        sys.argv = ["collector.py", "--no-gh", "--workspace", str(self.ws),
+                    "--out", str(self.out)]
+        try:
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(collector.main(), 0)
+        finally:
+            sys.argv = old
+        status = json.loads((self.out / "status.json").read_text())
+        feat = [r for r in status["worktrees"] if r["branch"] == "build-feature"]
+        self.assertEqual(len(feat), 1, "expected the merged worktree row")
+        self.assertIs(feat[0]["merged"], True)
+        self.assertIn("merged-but-not-removed", feat[0]["flags"])
+        # F5 guard: pairing flag suppressed while initiatives is empty
+        self.assertNotIn("no-workbench-pair", feat[0]["flags"])
+
+
+class ConfigErrorTests(unittest.TestCase):
+    """F2: malformed/missing config yields a clean error, not a traceback."""
+
+    def test_missing_config_raises_config_error(self):
+        with self.assertRaises(collector.ConfigError):
+            collector.load_config("/nonexistent/fleet.config.json")
+
+    def test_malformed_config_raises_config_error(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write("{not json")
+            name = f.name
+        try:
+            with self.assertRaises(collector.ConfigError):
+                collector.load_config(name)
+        finally:
+            os.unlink(name)
+
+
 class SmokeRunTests(unittest.TestCase):
     """AC1 + AC4: collector.py runs end to end, --no-gh works, emits artifacts."""
 

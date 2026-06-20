@@ -73,6 +73,16 @@ into the output dir.
 }
 ```
 
+## Known limitations (Leaf 1)
+
+- **Offline `unprotected` is approximate.** Under `--no-gh` the collector can't
+  know PR state, so a dirty/ahead-unmerged worktree may be flagged `unprotected`
+  even when an open PR actually protects it. This is faithful to the v1 engine;
+  read offline `unprotected` as "PR state unknown."
+- **Pairing flags are dormant until Leaf 2.** `collect_initiatives()` was removed
+  here; `collect_kanban()` (#3) repopulates the pairing set. Until then,
+  pair-dependent flags (`no-workbench-pair`, `zombie`) don't fire.
+
 ## Tests
 
 ```bash
