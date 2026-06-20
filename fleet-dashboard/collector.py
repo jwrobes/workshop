@@ -474,8 +474,9 @@ def build_product_tree(cfg, clones, forge=None, allow_forge=False):
                 node["slug"] = c.get("slug") or node.get("slug")
                 claimed.add(c["name"])
 
+        pid = p.get("id") or p.get("forge_org") or "unknown"
         products_out.append({
-            "id": p["id"], "name": p.get("name", p["id"]),
+            "id": pid, "name": p.get("name") or pid,
             "coordinator_repo": p.get("coordinator_repo"),
             "repos": [repo_map[k] for k in sorted(repo_map)],
         })

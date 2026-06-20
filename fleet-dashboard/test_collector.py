@@ -495,6 +495,27 @@ class ProductTreeTests(unittest.TestCase):
         names = [r["name"] for r in products[0]["repos"]]
         self.assertEqual(names, ["api-only-repo"])
 
+    def test_forge_member_and_local_clone_dedup(self):
+        # same repo from forge AND a local clone => one node, worktrees attached
+        class FakeForge(collector.Forge):
+            def list_repos(self, product):
+                return ["Jwrobes-Magic/claw-playbook"]
+            def list_prs(self, s, branch=None): return []
+            def read_dir(self, s, p): return []
+            def get_file(self, s, p): return None
+        clones = [self._clone("claw-playbook", "Jwrobes-Magic", [{"branch": "build-x"}])]
+        products, unaff = collector.build_product_tree(
+            self.CFG, clones, forge=FakeForge(), allow_forge=True)
+        repos = products[0]["repos"]
+        self.assertEqual([r["name"] for r in repos], ["claw-playbook"])  # not duplicated
+        self.assertEqual(repos[0]["worktrees"], [{"branch": "build-x"}])
+        self.assertEqual(unaff, [])
+
+    def test_product_without_id_does_not_crash(self):
+        cfg = {"products": [{"forge_org": "Jwrobes-Magic", "name": "Magic Me"}]}
+        products, _ = collector.build_product_tree(cfg, [])
+        self.assertEqual(products[0]["id"], "Jwrobes-Magic")  # falls back to org
+
     def test_forge_not_called_when_disallowed(self):
         class BoomForge(collector.Forge):
             def list_repos(self, product): raise AssertionError("should not be called")
