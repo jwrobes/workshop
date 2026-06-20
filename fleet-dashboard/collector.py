@@ -12,11 +12,13 @@ engine and adds two seams the rest of v2 builds on:
     routes through the interface, so the collector body contains no direct
     `gh` calls. `GitHubForge` is complete; `GitLabForge` is a documented stub.
 
-The Kanban reader (`collect_kanban()`, Leaf 2 / #3) reads plans as markdown
-at two levels — product coordinator + per-repo. The product spine and the
-real product->repo->worktree render land in Leaves 3-4 (#4, #5). The v1
-`collect_initiatives()` workbench reader was replaced by `collect_kanban()`;
-the worktree<->card link inference lands in Leaf 4.
+The Kanban reader (`collect_kanban()`, Leaf 2 / #3) reads plans at two levels
+— product coordinator + per-repo. The product spine (`build_product_tree()`,
+Leaf 3 / #4) groups repos under products and worktrees under repos, with an
+unaffiliated bucket for loose clones. The real product->repo->worktree HTML
+render and `--no-local` mode land in Leaf 4 (#5). The v1 `collect_initiatives()`
+workbench reader was replaced by `collect_kanban()`; the worktree<->card link
+inference lands in Leaf 4.
 
 Usage:
     python3 collector.py [--config FILE] [--out DIR] [--workspace DIR] [--no-gh]
@@ -422,6 +424,68 @@ def parse_worktree_porcelain(out):
     return entries
 
 
+# --------------------------------------------------------------------------
+# Product spine: group repos under products, worktrees under repos
+# --------------------------------------------------------------------------
+
+def build_product_tree(cfg, clones, forge=None, allow_forge=False):
+    """Group repos under their product and worktrees under their repo.
+
+    `clones` is a list of {name, slug, org, worktrees:[rows]} for the local
+    workspace. A product's member repos come from config + `Forge.list_repos`
+    (when `allow_forge`), unioned with any matching local clones. The
+    coordinator repo is the product's Kanban home and is NOT listed as a
+    sub-repo card. Local clones whose org matches no configured product land in
+    the unaffiliated bucket. Returns `(products_out, unaffiliated_repos)`.
+    """
+    products = cfg.get("products", [])
+    claimed = set()  # names of local clones placed under some product
+    products_out = []
+
+    for p in products:
+        org = (p.get("forge_org") or "").lower()
+        coord = (p.get("coordinator_repo") or "").lower()
+        repo_map = {}  # keyed by slug-or-name (lower) -> repo node
+
+        member_slugs = []
+        if allow_forge and forge is not None:
+            try:
+                member_slugs = forge.list_repos(p)
+            except NotImplementedError:
+                member_slugs = []
+        for slug in member_slugs:
+            if slug.lower() == coord:
+                continue  # coordinator is product-level, not a repo card
+            repo_map.setdefault(slug.lower(),
+                                {"slug": slug, "name": slug.split("/")[-1],
+                                 "worktrees": []})
+
+        if org:
+            for c in clones:
+                if (c.get("org") or "") != org:
+                    continue
+                key = (c.get("slug") or c["name"]).lower()
+                if key == coord:
+                    claimed.add(c["name"])  # coordinator clone: not a sub-repo card
+                    continue
+                node = repo_map.setdefault(key, {"slug": c.get("slug"),
+                                                 "name": c["name"], "worktrees": []})
+                node["worktrees"] = c["worktrees"]
+                node["slug"] = c.get("slug") or node.get("slug")
+                claimed.add(c["name"])
+
+        products_out.append({
+            "id": p["id"], "name": p.get("name", p["id"]),
+            "coordinator_repo": p.get("coordinator_repo"),
+            "repos": [repo_map[k] for k in sorted(repo_map)],
+        })
+
+    unaffiliated = [{"slug": c.get("slug"), "name": c["name"],
+                     "worktrees": c["worktrees"]}
+                    for c in clones if c["name"] not in claimed]
+    return products_out, unaffiliated
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -457,6 +521,7 @@ def main():
         init_index.setdefault(norm(ini["name"]), ini)
 
     rows = []
+    clones = []
     seen_paths = set()
     if not workspace_root.is_dir():
         workspace_root.mkdir(parents=True, exist_ok=True)
@@ -465,6 +530,10 @@ def main():
             continue
         base = default_branch(repo)
         slug = remote_slug(repo)
+        clone = {"name": repo.name, "slug": slug,
+                 "org": (slug.split("/")[0].lower() if slug else None),
+                 "worktrees": []}
+        clones.append(clone)
         code, out = git(repo, "worktree", "list", "--porcelain")
         for e in parse_worktree_porcelain(out):
             path = Path(e["path"])
@@ -523,7 +592,7 @@ def main():
             if kind == "clone" and behind:
                 flags.append("behind-origin")
 
-            rows.append({
+            row = {
                 "repo": repo.name, "kind": kind, "path": str(path),
                 "branch": branch, "dirty_files": dirty, "last_commit": last,
                 "ahead": ahead, "behind": behind, "merged": merged,
@@ -531,7 +600,9 @@ def main():
                 "initiative": ini["name"] if ini else None,
                 "initiative_state": ini["state"] if ini else None,
                 "flags": flags,
-            })
+            }
+            rows.append(row)
+            clone["worktrees"].append(row)
 
     paired = {r["initiative"] for r in rows if r["initiative"]}
     for ini in initiatives:
@@ -540,9 +611,14 @@ def main():
         if ini["state"] == "active" and not ini["has_worktree"]:
             ini["flags"].append("no-worktree-pair")  # may be docs-only; informational
 
+    products_out, unaffiliated = build_product_tree(
+        cfg, clones, forge, allow_forge=not args.no_gh)
+
     status = {
         "generated_at": now.isoformat(timespec="seconds"),
         "worktrees": rows,
+        "products": products_out,
+        "unaffiliated": unaffiliated,
         "kanban": kanban,
         "initiatives": initiatives,
     }

@@ -441,6 +441,123 @@ class KanbanForgeReadTests(unittest.TestCase):
             gl.get_file("g/r", "p")
 
 
+class ProductTreeTests(unittest.TestCase):
+    """Leaf 3: group product->repo->worktree; unaffiliated bucket; coordinator
+    is product-level, not a sub-repo card; member repos from Forge.list_repos."""
+
+    CFG = {
+        "products": [{
+            "id": "magic-me", "name": "Magic Me", "forge_org": "Jwrobes-Magic",
+            "coordinator_repo": "Jwrobes-Magic/magic-me-workbench",
+        }],
+    }
+
+    def _clone(self, name, org, worktrees=()):
+        slug = f"{org}/{name}" if org else None
+        return {"name": name, "slug": slug,
+                "org": (org.lower() if org else None),
+                "worktrees": list(worktrees)}
+
+    def test_groups_clone_under_matching_product(self):
+        clones = [self._clone("claw-playbook", "Jwrobes-Magic",
+                              [{"branch": "build-x"}])]
+        products, unaff = collector.build_product_tree(self.CFG, clones)
+        self.assertEqual(len(products), 1)
+        self.assertEqual(products[0]["id"], "magic-me")
+        names = [r["name"] for r in products[0]["repos"]]
+        self.assertEqual(names, ["claw-playbook"])
+        self.assertEqual(products[0]["repos"][0]["worktrees"], [{"branch": "build-x"}])
+        self.assertEqual(unaff, [])
+
+    def test_loose_repo_goes_to_unaffiliated(self):
+        clones = [self._clone("random-tool", "SomeoneElse")]
+        products, unaff = collector.build_product_tree(self.CFG, clones)
+        self.assertEqual(products[0]["repos"], [])
+        self.assertEqual([r["name"] for r in unaff], ["random-tool"])
+
+    def test_coordinator_not_listed_as_repo(self):
+        clones = [self._clone("magic-me-workbench", "Jwrobes-Magic")]
+        products, unaff = collector.build_product_tree(self.CFG, clones)
+        self.assertEqual(products[0]["repos"], [])   # coordinator excluded
+        self.assertEqual(unaff, [])                   # but still claimed, not loose
+
+    def test_forge_member_repos_unioned(self):
+        # An org repo with no local clone still appears (worktree layer empty).
+        class FakeForge(collector.Forge):
+            def list_repos(self, product):
+                return ["Jwrobes-Magic/api-only-repo",
+                        "Jwrobes-Magic/magic-me-workbench"]  # coordinator filtered
+            def list_prs(self, s, branch=None): return []
+            def read_dir(self, s, p): return []
+            def get_file(self, s, p): return None
+        products, _ = collector.build_product_tree(
+            self.CFG, [], forge=FakeForge(), allow_forge=True)
+        names = [r["name"] for r in products[0]["repos"]]
+        self.assertEqual(names, ["api-only-repo"])
+
+    def test_forge_not_called_when_disallowed(self):
+        class BoomForge(collector.Forge):
+            def list_repos(self, product): raise AssertionError("should not be called")
+            def list_prs(self, s, branch=None): return []
+            def read_dir(self, s, p): return []
+            def get_file(self, s, p): return None
+        products, _ = collector.build_product_tree(
+            self.CFG, [], forge=BoomForge(), allow_forge=False)
+        self.assertEqual(products[0]["repos"], [])
+
+
+class ProductTreeE2ETests(unittest.TestCase):
+    """Leaf 3 AC: works for Magic Me end to end (local, --no-gh)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name) / "workspace"
+        self.ws.mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _clone(self, name, slug):
+        origin = Path(self.tmp.name) / f"{name}.git"
+        repo = self.ws / name
+        _git(Path(self.tmp.name), "init", "--bare", str(origin))
+        _git(Path(self.tmp.name), "clone", str(origin), str(repo))
+        _git(repo, "remote", "set-url", "origin", f"https://github.com/{slug}.git")
+        (repo / "f.txt").write_text("x\n")
+        _git(repo, "add", "f.txt")
+        _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init")
+        _git(repo, "branch", "-M", "main")
+        return repo
+
+    def test_magic_me_end_to_end(self):
+        self._clone("claw-playbook", "Jwrobes-Magic/claw-playbook")
+        self._clone("speak-to-code", "jwrobes/speak-to-code")  # loose
+        cfg = {
+            "forge": "github", "workspace_root": str(self.ws),
+            "repo_plans_path": "plans", "plan_columns": ["active"],
+            "products": [{"id": "magic-me", "name": "Magic Me",
+                          "forge_org": "Jwrobes-Magic",
+                          "coordinator_repo": "Jwrobes-Magic/magic-me-workbench"}],
+        }
+        cfg_path = Path(self.tmp.name) / "fleet.config.json"
+        cfg_path.write_text(json.dumps(cfg))
+        out = Path(self.tmp.name) / "out"
+        import sys
+        old = sys.argv
+        sys.argv = ["collector.py", "--no-gh", "--config", str(cfg_path),
+                    "--workspace", str(self.ws), "--out", str(out)]
+        try:
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(collector.main(), 0)
+        finally:
+            sys.argv = old
+        status = json.loads((out / "status.json").read_text())
+        self.assertEqual([p["id"] for p in status["products"]], ["magic-me"])
+        repos = [r["name"] for r in status["products"][0]["repos"]]
+        self.assertIn("claw-playbook", repos)
+        self.assertEqual([r["name"] for r in status["unaffiliated"]], ["speak-to-code"])
+
+
 class SmokeRunTests(unittest.TestCase):
     """AC1 + AC4: collector.py runs end to end, --no-gh works, emits artifacts."""
 
