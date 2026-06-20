@@ -21,6 +21,11 @@ inlined, so it opens straight from `file://` with no CORS).
   title comes from YAML frontmatter (`title:`) or the filename. Reads the local
   filesystem, or — in forge-only mode — via `Forge.read_dir`/`get_file`.
   Replaces v1's `collect_initiatives()`.
+- **`build_product_tree()`** (Leaf 3) — groups repos under their product and
+  worktrees under their repo, from config + `Forge.list_repos`. The coordinator
+  repo is the product's Kanban home (not a sub-repo card); local clones whose
+  org matches no product land in an **unaffiliated** bucket. Emitted as
+  `status["products"]` + `status["unaffiliated"]`.
 - **`fleet.config.json`** — declares the forge, workspace root, products, and
   plan paths/columns. **No org or path is hardcoded in code** — it all comes
   from here. Ships a real Magic Me config.
