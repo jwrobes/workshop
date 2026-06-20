@@ -1,53 +1,59 @@
 # fleet-dashboard
 
-A cross-product fleet view — **product → repo → worktree** — with worktree/PR
-health and (coming in later leaves) two-level Kanban. Walks a workspace of git
-clones and emits `status.json` plus a self-contained `dashboard.html` (data
-inlined, so it opens straight from `file://` with no CORS).
+A cross-product **fleet dashboard** — one view of every product, repo, and
+worktree, grouped **product → repo → worktree**, with two-level Kanban
+(coordinator + per-repo `plans/`), worktree/PR health flags, and plan↔work
+links inferred from naming. Walks a workspace of git clones and emits
+`status.json` plus a self-contained `dashboard.html` (data inlined, so it opens
+straight from `file://` — no server, no CORS).
 
-> **Alpha / work in progress.** This is **Leaf 1** (foundation) of Fleet
-> Dashboard v2 — see issues #1 (tracker) and #2 (this leaf). It ports the v1
-> collector engine and lays two seams the rest of v2 builds on. Leaves #3–#5
-> add the Kanban reader, the product spine, and the real hierarchy render.
+> **Alpha.** Built and used, not hardened — see the repo root README's "alpha"
+> convention. v1 scope is the **Magic Me** product, then fan out.
 
-## What's here (Leaf 1)
+## Why
 
-- **`collector.py`** — the ported v1 engine: git/PR/flag fidelity, including the
-  **squash-merge-aware** `is_merged` check, the `git worktree list --porcelain`
-  parse, naming-based pairing, and the self-contained HTML emit.
-- **`collect_kanban()`** (Leaf 2) — reads plans as markdown at two levels:
-  product (coordinator repo's `coordinator_plans_path`) and repo (each member
-  clone's `repo_plans_path`). The column directory is the card's status; the
-  title comes from YAML frontmatter (`title:`) or the filename. Reads the local
-  filesystem, or — in forge-only mode — via `Forge.read_dir`/`get_file`.
-  Replaces v1's `collect_initiatives()`.
-- **`build_product_tree()`** (Leaf 3) — groups repos under their product and
-  worktrees under their repo, from config + `Forge.list_repos`. The coordinator
-  repo is the product's Kanban home (not a sub-repo card); local clones whose
-  org matches no product land in an **unaffiliated** bucket. Emitted as
-  `status["products"]` + `status["unaffiliated"]`.
-- **`fleet.config.json`** — declares the forge, workspace root, products, and
-  plan paths/columns. **No org or path is hardcoded in code** — it all comes
-  from here. Ships a real Magic Me config.
-- **A forge seam** — a `Forge` ABC with `list_repos(product)` and
-  `list_prs(repo_slug, branch=None)`. `GitHubForge` (wraps `gh`) is complete;
-  `GitLabForge` is a documented stub (org→group, PR→MR, `gh`→`glab`). The
-  collector body makes **no direct `gh` calls** — everything routes through the
-  interface. Swapping forges is one class, zero collector changes.
-- **`template.html`** — a minimal placeholder render (Leaf 4 ships the real
-  product→repo→worktree drill hierarchy).
+It's the single gate before overnight scheduling: visibility before autonomy.
+One morning-triage page showing what's in flight, what's merged-but-not-cleaned,
+what's stale, and which plan cards have (or lack) a worktree.
+
+## How it's built
+
+Forge-agnostic and config-driven by design, so it can run on your laptop against
+local checkouts **or** as a scheduled cloud job with no checkouts at all:
+
+- **Config-driven** — no org/path/forge is hardcoded. `fleet.config.json`
+  declares products, the coordinator repo, and plan paths/columns.
+- **Forge seam** — every forge call goes through a `Forge` interface.
+  `GitHubForge` wraps `gh`; `GitLabForge` is a documented stub (org→group,
+  PR→MR, `gh`→`glab`). Adding GitLab later is one class, zero collector changes.
+- **Two collectors + a spine + a render:**
+  - `collect_kanban()` — reads plan cards as markdown at two levels: product
+    (coordinator repo's `coordinator_plans_path`) and repo (each member clone's
+    `repo_plans_path`). The column dir is the card's status; the title comes
+    from YAML frontmatter `title:` or the filename.
+  - the worktree walk — git/PR/flag fidelity from v1, incl. the
+    **squash-merge-aware** merged check.
+  - `build_product_tree()` — groups repos under products and worktrees under
+    repos (from config + `Forge.list_repos`); loose clones go to an
+    **unaffiliated** bucket; the coordinator repo is the product's Kanban home,
+    not a sub-repo card.
+  - `link_worktrees_to_cards()` — pairs a worktree (`build-<slug>` branch or
+    `<repo>-<slug>` dir) to a plan card by naming; unmatched is shown gracefully
+    both ways (worktree with no card, card with no worktree).
+  - `template.html` — renders the drill hierarchy with both Kanban levels and
+    health flags up top for fast triage.
 
 ## Requirements
 
 - Python 3.8+ (stdlib only — no third-party deps).
-- `git` on `PATH`.
-- `gh` (GitHub CLI), authenticated — only needed for PR lookups. Use `--no-gh`
-  to skip them and run fully offline.
+- `git` on `PATH` (for local mode).
+- `gh` (GitHub CLI), authenticated — for PR/repo lookups and forge-only mode.
+  Not needed with `--no-gh`.
 
 ## Usage
 
 ```bash
-python3 collector.py [--config FILE] [--out DIR] [--workspace DIR] [--no-gh]
+python3 collector.py [--config FILE] [--out DIR] [--workspace DIR] [--no-gh] [--no-local]
 ```
 
 | Flag | Default | Meaning |
@@ -55,10 +61,19 @@ python3 collector.py [--config FILE] [--out DIR] [--workspace DIR] [--no-gh]
 | `--config` | `./fleet.config.json` | fleet config to read |
 | `--workspace` | `workspace_root` from config | dir of git clones to walk |
 | `--out` | `<workspace_root>/.fleet` | where to write artifacts |
-| `--no-gh` | off | skip forge PR lookups (offline) |
+| `--no-gh` | off | skip forge calls (PR + repo lookups); local data only |
+| `--no-local` | off | forge-only: product→repo→PR+Kanban from the API, no checkouts |
 
-Outputs `status.json`, a dated `status-YYYY-MM-DD.json`, and `dashboard.html`
-into the output dir.
+Writes `status.json`, a dated `status-YYYY-MM-DD.json`, and the self-contained
+`dashboard.html` into the output dir. Open `dashboard.html` in a browser.
+
+### Modes
+
+| Mode | Command | What it reads |
+|------|---------|---------------|
+| **Local** (default) | `python3 collector.py` | worktrees + plans from disk, PRs from the forge |
+| **Offline** | `python3 collector.py --no-gh` | local worktrees + plans only (no forge calls) |
+| **Forge-only** | `python3 collector.py --no-local` | product→repo→PR + Kanban from the forge API; no worktree layer (cloud-portable — runs as a scheduled job with no clones) |
 
 ## Configuration
 
@@ -82,15 +97,37 @@ into the output dir.
 }
 ```
 
-## Known limitations (Leaf 1)
+| Key | Meaning |
+|-----|---------|
+| `forge` | which `Forge` to use (`github`; `gitlab` is a stub) |
+| `workspace_root` | dir of local git clones to walk |
+| `repo_plans_path` | per-repo plans dir (relative to each clone) |
+| `plan_columns` | Kanban columns = status values (`completed` and `done` both fine) |
+| `products[]` | `id`, `name`, `forge_org`, `coordinator_repo`, `coordinator_plans_path` |
+
+## Output shape (`status.json`)
+
+```
+generated_at, mode,
+worktrees[]    — flat rows (repo, kind, branch, flags, pr, merged, card, …)
+products[]     — { id, name, coordinator_repo, repos[] { slug, name, worktrees[], prs[] } }
+unaffiliated[] — loose repos (no configured product)
+kanban[]       — cards { level, product, repo, status, title, path, has_worktree }
+```
+
+## Health flags
+
+`merged-but-not-removed`, `stale` (>14d, unmerged), `zombie`, `unprotected`,
+`orphan`, `behind-origin`, `no-workbench-pair`. The dashboard surfaces flagged
+worktrees in a "Needs attention" block at the top.
+
+## Known limitations
 
 - **Offline `unprotected` is approximate.** Under `--no-gh` the collector can't
   know PR state, so a dirty/ahead-unmerged worktree may be flagged `unprotected`
-  even when an open PR actually protects it. This is faithful to the v1 engine;
-  read offline `unprotected` as "PR state unknown."
-- **Pairing flags are dormant until Leaf 2.** `collect_initiatives()` was removed
-  here; `collect_kanban()` (#3) repopulates the pairing set. Until then,
-  pair-dependent flags (`no-workbench-pair`, `zombie`) don't fire.
+  even when an open PR protects it. Faithful to the v1 engine.
+- **Forge-only `--no-local` with `--no-gh`** has no data source (no worktrees,
+  no forge) and warns.
 
 ## Tests
 
@@ -98,6 +135,8 @@ into the output dir.
 python3 test_collector.py      # stdlib unittest, no deps
 ```
 
-Covers config loading, the forge seam (GitHub + GitLab stub), PR selection,
-worktree parsing, the squash-merge-aware merged check (against a real local
-git fixture), and an end-to-end `--no-gh` smoke run.
+Covers config loading, the forge seam (GitHub + GitLab stub), PR selection, the
+two-level Kanban reader (frontmatter + filename fallback, config columns), the
+product spine (grouping + unaffiliated + coordinator handling), link inference,
+the squash-merge-aware merged check (real git fixture), `--no-gh` and
+`--no-local` modes, and end-to-end smoke runs.

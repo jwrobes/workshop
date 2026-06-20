@@ -5,59 +5,167 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Fleet Dashboard</title>
 <style>
-  :root { color-scheme: light dark; }
-  body { font-family: system-ui, -apple-system, sans-serif; margin: 2rem; line-height: 1.4; }
-  h1 { margin: 0 0 .25rem; }
-  .meta { color: #888; font-size: .85rem; margin-bottom: 1.5rem; }
-  table { border-collapse: collapse; width: 100%; font-size: .9rem; }
-  th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #8884; }
-  th { font-weight: 600; }
-  code { font-family: ui-monospace, monospace; }
-  .flag { display: inline-block; background: #c0392b22; color: #c0392b; border-radius: 3px;
-          padding: 0 .35rem; margin-right: .25rem; font-size: .78rem; }
-  .empty { color: #888; font-style: italic; }
+  :root { color-scheme: light dark; --line:#8884; --muted:#888; --accent:#1976d2; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 1000px;
+         margin: 0 auto; padding: 1rem 1rem 4rem; line-height: 1.45; }
+  h1 { margin: 0 0 .15rem; font-size: 1.4rem; }
+  .meta { color: var(--muted); font-size: .85rem; margin-bottom: 1rem; }
+  .badge { display:inline-block; font-size:.7rem; padding:.05rem .45rem; border-radius:999px;
+           background:#1976d222; color:var(--accent); margin-left:.4rem; vertical-align:middle; }
+  .counts { display:flex; flex-wrap:wrap; gap:.5rem 1.2rem; font-size:.85rem; margin-bottom:1.2rem; }
+  .counts b { font-size:1.05rem; }
+  h2 { margin: 1.8rem 0 .5rem; font-size: 1.15rem; border-bottom: 2px solid var(--line); padding-bottom:.25rem; }
+  h3 { margin: 1.1rem 0 .35rem; font-size: 1rem; }
+  h3 .slug { color: var(--muted); font-weight: 400; font-size: .8rem; }
+  .repo { border-left: 3px solid var(--line); padding-left: .8rem; margin: .6rem 0 1rem; }
+  table { border-collapse: collapse; width: 100%; font-size: .85rem; }
+  th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-weight: 600; color: var(--muted); font-size:.78rem; text-transform:uppercase; letter-spacing:.03em; }
+  code { font-family: ui-monospace, monospace; font-size: .9em; }
+  .flag { display:inline-block; background:#c0392b22; color:#c0392b; border-radius:3px;
+          padding:0 .35rem; margin:0 .2rem .15rem 0; font-size:.74rem; white-space:nowrap; }
+  .flag.merged-but-not-removed { background:#8e44ad22; color:#8e44ad; }
+  .flag.stale { background:#e67e2222; color:#e67e22; }
+  .flag.behind-origin { background:#16a08522; color:#16a085; }
+  .card { display:inline-block; background:#2e7d3222; color:#2e7d32; border-radius:3px;
+          padding:0 .4rem; font-size:.78rem; }
+  .col { display:inline-block; font-size:.7rem; color:var(--muted); border:1px solid var(--line);
+         border-radius:3px; padding:0 .3rem; margin-left:.3rem; text-transform:uppercase; }
+  .kanban { display:flex; flex-wrap:wrap; gap:.4rem; margin:.25rem 0 .5rem; }
+  .kcard { font-size:.8rem; border:1px solid var(--line); border-radius:4px; padding:.15rem .5rem; }
+  .kcard .st { color:var(--muted); font-size:.7rem; text-transform:uppercase; margin-left:.35rem; }
+  .kcard.unlinked { border-style:dashed; }
+  .empty { color: var(--muted); font-style: italic; font-size:.85rem; }
+  .attention { background:#c0392b11; border:1px solid #c0392b44; border-radius:6px; padding:.6rem .8rem; margin-bottom:1.2rem; }
+  .attention h2 { border:0; margin:.1rem 0 .4rem; font-size:1rem; color:#c0392b; }
+  .attention li { font-size:.85rem; margin:.15rem 0; }
+  a { color: var(--accent); }
 </style>
 </head>
 <body>
-<h1>Fleet Dashboard</h1>
+<h1>Fleet Dashboard <span class="badge" id="mode"></span></h1>
 <p class="meta" id="meta"></p>
+<div class="counts" id="counts"></div>
+<div id="attention"></div>
 <div id="app"></div>
+
 <script>
-// The collector replaces the token below with the status JSON at emit time,
-// so this page is fully self-contained (no fetch / no CORS when opened via file://).
+// Self-contained: the collector replaces the token below with the status JSON,
+// so this page works from file:// with no fetch / no CORS.
 const DATA = /*__DATA__*/null;
 
-// Minimal placeholder render. The product -> repo -> worktree drill hierarchy,
-// two-level Kanban, and link inference are Leaf 4 (#5); this flat table just
-// proves the data round-trips from collector -> dashboard.
 (function () {
-  const app = document.getElementById("app");
-  const meta = document.getElementById("meta");
-  if (!DATA) {
-    app.innerHTML = '<p class="empty">No data — run <code>python3 collector.py</code>.</p>';
-    return;
-  }
-  const rows = DATA.worktrees || [];
-  meta.textContent = `Generated ${DATA.generated_at} · ${rows.length} rows`;
-  if (!rows.length) {
-    app.innerHTML = '<p class="empty">No worktrees found in workspace.</p>';
-    return;
-  }
+  const $ = (id) => document.getElementById(id);
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>]/g,
     (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
-  const head = ["repo", "kind", "branch", "dirty", "ahead", "behind", "merged", "flags"];
-  const body = rows.map((r) => `<tr>
-    <td><code>${esc(r.repo)}</code></td>
-    <td>${esc(r.kind)}</td>
-    <td><code>${esc(r.branch)}</code></td>
-    <td>${esc(r.dirty_files)}</td>
-    <td>${esc(r.ahead)}</td>
-    <td>${esc(r.behind)}</td>
-    <td>${esc(r.merged)}</td>
-    <td>${(r.flags || []).map((f) => `<span class="flag">${esc(f)}</span>`).join("")}</td>
-  </tr>`).join("");
-  app.innerHTML = `<table><thead><tr>${head.map((h) => `<th>${h}</th>`).join("")}</tr></thead>`
-    + `<tbody>${body}</tbody></table>`;
+  if (!DATA) { $("app").innerHTML = '<p class="empty">No data — run <code>python3 collector.py</code>.</p>'; return; }
+
+  const products = DATA.products || [];
+  const unaffiliated = DATA.unaffiliated || [];
+  const kanban = DATA.kanban || [];
+  const worktrees = DATA.worktrees || [];
+
+  // ---- header ----
+  $("mode").textContent = DATA.mode || "local";
+  const repoCount = products.reduce((n, p) => n + (p.repos || []).length, 0) + unaffiliated.length;
+  const flagged = worktrees.filter((w) => (w.flags || []).length);
+  const counts = [
+    ["Products", products.length], ["Repos", repoCount],
+    ["Worktrees", worktrees.length], ["Plan cards", kanban.length],
+    ["Flagged", flagged.length],
+  ];
+  $("meta").textContent = "Generated " + (DATA.generated_at || "");
+  $("counts").innerHTML = counts.map(([k, v]) => `<span><b>${v}</b> ${k}</span>`).join("");
+
+  // ---- needs-attention triage ----
+  if (flagged.length) {
+    const items = flagged.map((w) =>
+      `<li><code>${esc(w.repo)}</code> / <code>${esc(w.branch)}</code> ${flagHtml(w.flags)}</li>`).join("");
+    $("attention").innerHTML =
+      `<div class="attention"><h2>⚠ Needs attention (${flagged.length})</h2><ul>${items}</ul></div>`;
+  }
+
+  // ---- kanban helpers ----
+  function cardsFor(level, productId, repoName) {
+    return kanban.filter((c) => c.level === level && c.product === productId
+      && (repoName == null || c.repo === repoName));
+  }
+  function kanbanHtml(cards) {
+    if (!cards.length) return "";
+    return `<div class="kanban">` + cards.map((c) =>
+      `<span class="kcard ${c.has_worktree ? "" : "unlinked"}">${esc(c.title)}`
+      + `<span class="st">${esc(c.status)}</span></span>`).join("") + `</div>`;
+  }
+  function flagHtml(flags) {
+    return (flags || []).map((f) => `<span class="flag ${esc(f)}">${esc(f)}</span>`).join("");
+  }
+
+  // ---- worktree / PR table per repo ----
+  function worktreeTable(repo) {
+    const wts = (repo.worktrees || []).filter((w) => w.kind === "worktree");
+    if (wts.length) {
+      const body = wts.map((w) => `<tr>
+        <td><code>${esc(w.branch)}</code></td>
+        <td>${w.merged === true ? "✓" : ""} ${fmtAheadBehind(w)}</td>
+        <td>${w.card ? `<span class="card">${esc(w.card.title)}</span>` : '<span class="empty">no card</span>'}</td>
+        <td>${prHtml(w.pr)}</td>
+        <td>${flagHtml(w.flags)}</td>
+      </tr>`).join("");
+      return `<table><thead><tr><th>Worktree</th><th>State</th><th>Plan card</th><th>PR</th><th>Flags</th></tr></thead><tbody>${body}</tbody></table>`;
+    }
+    if (repo.prs && repo.prs.length) {  // forge-only mode: show PRs
+      const body = repo.prs.map((p) => `<tr><td>#${esc(p.number)}</td><td>${esc(p.state)}</td></tr>`).join("");
+      return `<table><thead><tr><th>PR</th><th>State</th></tr></thead><tbody>${body}</tbody></table>`;
+    }
+    return `<p class="empty">no worktrees</p>`;
+  }
+  function fmtAheadBehind(w) {
+    const bits = [];
+    if (w.ahead) bits.push("↑" + w.ahead);
+    if (w.behind) bits.push("↓" + w.behind);
+    return bits.join(" ");
+  }
+  function prHtml(pr) {
+    if (!pr) return "";
+    return `<code>#${esc(pr.number)}</code> ${esc(pr.state)}`;
+  }
+
+  // ---- repo block ----
+  function repoBlock(productId, repo) {
+    const cards = productId ? cardsFor("repo", productId, repo.name) : [];
+    return `<div class="repo"><h3><code>${esc(repo.name)}</code>`
+      + (repo.slug ? ` <span class="slug">${esc(repo.slug)}</span>` : "") + `</h3>`
+      + kanbanHtml(cards) + worktreeTable(repo) + `</div>`;
+  }
+
+  // ---- render products ----
+  let html = "";
+  for (const p of products) {
+    html += `<h2>${esc(p.name)}</h2>`;
+    const prodCards = cardsFor("product", p.id, null);
+    if (prodCards.length) html += `<div><strong>Product plans</strong>${kanbanHtml(prodCards)}</div>`;
+    if (p.coordinator_repo) html += `<p class="meta">Kanban home: <code>${esc(p.coordinator_repo)}</code></p>`;
+    const repos = p.repos || [];
+    html += repos.length ? repos.map((r) => repoBlock(p.id, r)).join("")
+                         : `<p class="empty">no member repos</p>`;
+  }
+
+  if (unaffiliated.length) {
+    html += `<h2>Unaffiliated <span class="col">no product</span></h2>`;
+    html += unaffiliated.map((r) => repoBlock(null, r)).join("");
+  }
+
+  // ---- cards with no worktree (graceful unmatched) ----
+  const orphanCards = kanban.filter((c) => !c.has_worktree);
+  if (orphanCards.length) {
+    html += `<h2>Plan cards without a worktree (${orphanCards.length})</h2>`;
+    html += `<div class="kanban">` + orphanCards.map((c) =>
+      `<span class="kcard unlinked">${esc(c.title)}<span class="st">${esc(c.status)}`
+      + ` · ${esc(c.repo || c.product)}</span></span>`).join("") + `</div>`;
+  }
+
+  $("app").innerHTML = html || '<p class="empty">Nothing to show.</p>';
 })();
 </script>
 </body>
