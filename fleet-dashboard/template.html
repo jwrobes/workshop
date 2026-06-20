@@ -57,8 +57,8 @@ const DATA = /*__DATA__*/null;
 
 (function () {
   const $ = (id) => document.getElementById(id);
-  const esc = (s) => String(s == null ? "" : s).replace(/[&<>]/g,
-    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   if (!DATA) { $("app").innerHTML = '<p class="empty">No data — run <code>python3 collector.py</code>.</p>'; return; }
 
   const products = DATA.products || [];

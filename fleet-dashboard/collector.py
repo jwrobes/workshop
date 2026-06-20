@@ -329,12 +329,19 @@ def _kanban_via_forge(forge, repo_slug, plans_path, columns, level, product_id, 
     cards = []
     for column in columns:
         dir_path = "/".join(p for p in (plans_path, column) if p)
-        for entry in forge.read_dir(repo_slug, dir_path):
+        try:
+            entries = forge.read_dir(repo_slug, dir_path)
+        except NotImplementedError:
+            return cards
+        for entry in entries:
             name = entry.get("name") or ""
             path = entry.get("path")
             if not path or not name.endswith(".md"):
                 continue
-            text = forge.get_file(repo_slug, path) or ""
+            try:
+                text = forge.get_file(repo_slug, path) or ""
+            except NotImplementedError:
+                text = ""
             title = parse_frontmatter_title(text) or name[:-3]
             cards.append(_card(level, product_id, repo_name, column, title, path))
     return cards
@@ -530,15 +537,17 @@ def link_worktrees_to_cards(rows, cards):
     which cards have a worktree. Mutates rows (adds `card`) and cards (adds
     `has_worktree`). Unmatched both ways are left visible: a worktree keeps
     `card=None`; a card keeps `has_worktree=False`."""
+    # Scope matches to the same repo so two repos' cards that normalize to the
+    # same stem don't cross-link across the fleet.
     index = {}
     for c in cards:
         c.setdefault("has_worktree", False)
-        index.setdefault(norm(Path(c["path"]).stem), c)
+        index.setdefault((norm(c.get("repo") or ""), norm(Path(c["path"]).stem)), c)
     for row in rows:
         row["card"] = None
         if row.get("kind") != "worktree":
             continue
-        card = index.get(worktree_card_key(row))
+        card = index.get((norm(row.get("repo") or ""), worktree_card_key(row)))
         if card:
             card["has_worktree"] = True
             row["card"] = {"title": card["title"], "status": card["status"],
@@ -690,7 +699,10 @@ def main():
         for prod in products_out:
             for repo in prod["repos"]:
                 if repo.get("slug"):
-                    repo["prs"] = forge.list_prs(repo["slug"])
+                    try:
+                        repo["prs"] = forge.list_prs(repo["slug"])
+                    except NotImplementedError:
+                        repo["prs"] = []
 
     # Link inference: pair worktrees to plan cards by naming; unmatched stays
     # visible (worktree with card=None, card with has_worktree=False).
@@ -711,7 +723,11 @@ def main():
     (out_dir / f"status-{now.date()}.json").write_text(json.dumps(status, indent=2))
 
     template = (Path(__file__).parent / "template.html").read_text()
-    html = template.replace("/*__DATA__*/null", json.dumps(status))
+    # Escape <, >, & as JSON \uXXXX so an inlined string containing "</script>"
+    # (a card title, branch, path, ...) can't break out of the <script> element.
+    payload = (json.dumps(status)
+               .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026"))
+    html = template.replace("/*__DATA__*/null", payload)
     (out_dir / "dashboard.html").write_text(html)
 
     n_flagged = sum(1 for r in rows if r["flags"])

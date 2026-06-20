@@ -623,7 +623,7 @@ class LinkInferenceTests(unittest.TestCase):
         rows = [{"kind": "worktree", "branch": "build-add-retries",
                  "path": "/ws/claw-add-retries", "repo": "claw"}]
         cards = [{"title": "Add retries", "status": "active", "level": "repo",
-                  "path": "plans/active/add-retries.md"}]
+                  "repo": "claw", "path": "plans/active/add-retries.md"}]
         collector.link_worktrees_to_cards(rows, cards)
         self.assertEqual(rows[0]["card"]["title"], "Add retries")
         self.assertTrue(cards[0]["has_worktree"])
@@ -632,7 +632,7 @@ class LinkInferenceTests(unittest.TestCase):
         rows = [{"kind": "worktree", "branch": "feature",
                  "path": "/ws/claw-playbook-auth-flow", "repo": "claw-playbook"}]
         cards = [{"title": "Auth flow", "status": "backlog", "level": "repo",
-                  "path": "plans/backlog/auth-flow.md"}]
+                  "repo": "claw-playbook", "path": "plans/backlog/auth-flow.md"}]
         collector.link_worktrees_to_cards(rows, cards)
         self.assertEqual(rows[0]["card"]["status"], "backlog")
         self.assertTrue(cards[0]["has_worktree"])
@@ -641,10 +641,27 @@ class LinkInferenceTests(unittest.TestCase):
         rows = [{"kind": "worktree", "branch": "build-nothing",
                  "path": "/ws/x", "repo": "r"}]
         cards = [{"title": "Other", "status": "active", "level": "repo",
-                  "path": "plans/active/other.md"}]
+                  "repo": "r", "path": "plans/active/other.md"}]
         collector.link_worktrees_to_cards(rows, cards)
         self.assertIsNone(rows[0]["card"])          # worktree w/o card
         self.assertFalse(cards[0]["has_worktree"])  # card w/o worktree
+
+    def test_same_stem_different_repos_scoped(self):
+        # two repos each with a 'deploy' card — must not cross-link
+        rows = [
+            {"kind": "worktree", "branch": "build-deploy", "path": "/ws/a-deploy", "repo": "a"},
+            {"kind": "worktree", "branch": "build-deploy", "path": "/ws/b-deploy", "repo": "b"},
+        ]
+        cards = [
+            {"title": "Deploy A", "status": "active", "level": "repo", "repo": "a",
+             "path": "a/plans/active/deploy.md"},
+            {"title": "Deploy B", "status": "active", "level": "repo", "repo": "b",
+             "path": "b/plans/active/deploy.md"},
+        ]
+        collector.link_worktrees_to_cards(rows, cards)
+        self.assertEqual(rows[0]["card"]["title"], "Deploy A")
+        self.assertEqual(rows[1]["card"]["title"], "Deploy B")
+        self.assertTrue(all(c["has_worktree"] for c in cards))
 
     def test_clone_rows_not_linked(self):
         rows = [{"kind": "clone", "branch": "main", "path": "/ws/r", "repo": "r"}]
@@ -706,6 +723,90 @@ class NoLocalModeTests(unittest.TestCase):
         self.assertEqual(claw["prs"], [{"number": 7, "state": "OPEN"}])  # PRs from API
         self.assertTrue(any(c["level"] == "product" for c in status["kanban"]))
         self.assertTrue(any(c["level"] == "repo" for c in status["kanban"]))
+
+
+class DashboardInjectionTests(unittest.TestCase):
+    """Leaf 4 security: an inlined string containing </script> must not break
+    out of the dashboard's <script> element."""
+
+    def test_script_breakout_is_escaped(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        ws = root / "ws"
+        repo = ws / "claw-playbook"
+        repo.mkdir(parents=True)
+        _git(repo, "init")
+        _git(repo, "remote", "add", "origin",
+             "https://github.com/Jwrobes-Magic/claw-playbook.git")
+        col = repo / "plans" / "active"
+        col.mkdir(parents=True)
+        (col / "x.md").write_text('---\ntitle: INJ</script><img src=x>INJ\n---\n')
+        cfg = {"forge": "github", "repo_plans_path": "plans",
+               "plan_columns": ["active"],
+               "products": [{"id": "magic-me", "forge_org": "Jwrobes-Magic",
+                             "coordinator_repo": "Jwrobes-Magic/magic-me-workbench",
+                             "coordinator_plans_path": "workbench/plans"}]}
+        (root / "c.json").write_text(json.dumps(cfg))
+        out = root / "out"
+        import sys
+        old = sys.argv
+        sys.argv = ["collector.py", "--no-gh", "--config", str(root / "c.json"),
+                    "--workspace", str(ws), "--out", str(out)]
+        try:
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(collector.main(), 0)
+        finally:
+            sys.argv = old
+        html = (out / "dashboard.html").read_text()
+        self.assertNotIn("INJ</script>", html)              # not a raw breakout
+        self.assertIn("INJ\\u003c/script\\u003e", html)     # escaped instead
+        self.assertEqual(html.count("</script>"), 1)        # only the real tag
+
+
+class NoLocalForgeErrorTests(unittest.TestCase):
+    """Leaf 4: --no-local must not crash when a forge method raises
+    (e.g. GitLabForge stub) — cloud-portability must degrade gracefully."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.orig = collector.make_forge
+
+        class RaisingForge(collector.Forge):
+            def list_repos(self, product): return ["Jwrobes-Magic/claw-playbook"]
+            def list_prs(self, slug, branch=None):
+                raise NotImplementedError("no PRs here")
+            def read_dir(self, slug, path):
+                raise NotImplementedError("no files here")
+            def get_file(self, slug, path):
+                raise NotImplementedError("no files here")
+        collector.make_forge = lambda name: RaisingForge()
+
+    def tearDown(self):
+        collector.make_forge = self.orig
+        self.tmp.cleanup()
+
+    def test_no_local_survives_raising_forge(self):
+        root = Path(self.tmp.name)
+        cfg = {"forge": "github", "repo_plans_path": "plans", "plan_columns": ["active"],
+               "products": [{"id": "magic-me", "forge_org": "Jwrobes-Magic",
+                             "coordinator_repo": "Jwrobes-Magic/magic-me-workbench",
+                             "coordinator_plans_path": "workbench/plans"}]}
+        (root / "c.json").write_text(json.dumps(cfg))
+        out = root / "out"
+        import sys
+        old = sys.argv
+        sys.argv = ["collector.py", "--no-local", "--config", str(root / "c.json"),
+                    "--workspace", str(root / "ws"), "--out", str(out)]
+        try:
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(collector.main(), 0)  # no crash
+        finally:
+            sys.argv = old
+        status = json.loads((out / "status.json").read_text())
+        self.assertEqual(status["kanban"], [])  # reads degraded to empty
+        claw = status["products"][0]["repos"][0]
+        self.assertEqual(claw["prs"], [])       # PRs degraded to empty
 
 
 class SmokeRunTests(unittest.TestCase):
