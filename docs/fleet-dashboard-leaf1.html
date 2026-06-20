@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What I built — Fleet Dashboard v2, Leaf 1</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 820px;
+         margin: 0 auto; padding: 1.5rem 1.1rem 4rem; line-height: 1.5; }
+  h1 { margin: 0 0 .2rem; font-size: 1.5rem; }
+  h2 { margin: 2rem 0 .6rem; font-size: 1.15rem; border-bottom: 1px solid #8884; padding-bottom: .2rem; }
+  .sub { color: #888; margin: 0 0 1rem; }
+  code { font-family: ui-monospace, monospace; font-size: .9em; background: #8881; padding: .05rem .3rem; border-radius: 3px; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; margin: .5rem 0; }
+  th, td { text-align: left; padding: .4rem .55rem; border-bottom: 1px solid #8884; vertical-align: top; }
+  .ok { color: #2e7d32; font-weight: 600; }
+  ul { padding-left: 1.2rem; }
+  li { margin: .25rem 0; }
+  .pill { display: inline-block; font-size: .72rem; padding: .05rem .45rem; border-radius: 999px; background: #1976d222; color: #1976d2; margin-left: .3rem; }
+  .files li code { background: none; padding: 0; }
+  .note { background: #ed6c0211; border-left: 3px solid #ed6c02; padding: .5rem .8rem; border-radius: 4px; margin: .5rem 0; }
+</style>
+</head>
+<body>
+
+<h1>Fleet Dashboard v2 — Leaf 1 <span class="pill">foundation</span></h1>
+<p class="sub">Closes <strong>#2</strong> · part of tracker #1 · branch <code>claude/modest-rubin-dhpi47</code></p>
+
+<p>Established <code>fleet-dashboard/</code> in the workshop repo: the ported v1
+collector engine plus the two seams the rest of v2 stands on — a
+<strong>config file</strong> (nothing forge- or product-specific is hardcoded)
+and a <strong>forge abstraction</strong> (every <code>gh</code> call lives behind
+an interface). It runs today and emits a self-contained dashboard; the Kanban
+reader, product spine, and real hierarchy render are Leaves 2–4 (#3, #4, #5).</p>
+
+<h2>What changed</h2>
+<ul class="files">
+  <li><code>fleet-dashboard/collector.py</code> — ported v1 engine: git/PR/flag
+      logic, the <strong>squash-merge-aware</strong> <code>is_merged</code>,
+      <code>git worktree list --porcelain</code> parsing, naming-based pairing,
+      and the self-contained HTML emit. <code>collect_initiatives()</code> (the
+      workbench reader) was stripped — <code>collect_kanban()</code> replaces it
+      in #3.</li>
+  <li><code>fleet-dashboard/fleet.config.json</code> — real Magic Me config:
+      org <code>Jwrobes-Magic</code>, coordinator
+      <code>Jwrobes-Magic/magic-me-workbench</code>, plans paths + columns.</li>
+  <li><code>fleet-dashboard/collector.py</code> — <code>Forge</code> ABC +
+      complete <code>GitHubForge</code> + documented <code>GitLabForge</code>
+      stub (org→group, PR→MR, <code>gh</code>→<code>glab</code>).</li>
+  <li><code>fleet-dashboard/template.html</code> — minimal placeholder render
+      (real drill hierarchy is #5).</li>
+  <li><code>fleet-dashboard/test_collector.py</code> — 23 stdlib-only tests.</li>
+  <li><code>fleet-dashboard/README.md</code> — what/config/usage/limits.</li>
+</ul>
+
+<h2>How the seam works</h2>
+<p>The collector body never calls <code>gh</code> directly. It picks a forge from
+config (<code>make_forge(cfg["forge"])</code>) and asks the interface for data:</p>
+<ul>
+  <li><code>Forge.list_prs(slug, branch)</code> → PR dicts; the collector ranks
+      them with <code>pick_pr()</code> (prefer merged &gt; open &gt; closed),
+      preserving the v1 selection.</li>
+  <li><code>Forge.list_repos(product)</code> → member repos (used by the product
+      spine in #4).</li>
+  <li>Swapping to GitLab later is one class, zero collector edits.</li>
+</ul>
+
+<h2>Acceptance criteria</h2>
+<table>
+  <tr><th>#</th><th>Criterion</th><th>Met by</th><th>Status</th></tr>
+  <tr><td>1</td><td>collector.py runs; v1 git/PR/flag fidelity (squash-merge-aware merged check)</td>
+      <td><code>SmokeRunTests</code>, <code>IsMergedSquashTests</code>, <code>FlagEngineTests</code></td><td class="ok">✓</td></tr>
+  <tr><td>2</td><td>config present, real Magic Me values, no hardcoded org/path in logic</td>
+      <td><code>ConfigTests</code>, <code>NoHardcodingTests</code></td><td class="ok">✓</td></tr>
+  <tr><td>3</td><td>Forge ABC + GitHubForge + GitLabForge stub; all forge calls via the interface</td>
+      <td><code>ForgeTests</code>, <code>ListReposParseTests</code>, gh-only-in-GitHubForge test</td><td class="ok">✓</td></tr>
+  <tr><td>4</td><td><code>--no-gh</code> offline flag still works</td>
+      <td><code>SmokeRunTests</code> (offline run)</td><td class="ok">✓</td></tr>
+</table>
+
+<h2>Validation</h2>
+<ul>
+  <li><strong>Tests:</strong> 23 passing (stdlib <code>unittest</code>, no deps) — incl. a real-git squash-merge fixture and an offline end-to-end smoke run.</li>
+  <li><strong>Code review:</strong> fresh-context reviewer scored it <strong>Solid</strong>; all should-fix items fixed, must-fix (offline flag drift) preserved-and-documented as v1-faithful — see note below.</li>
+  <li><strong>E2E:</strong> n/a (no <code>.e2e.json</code>; the offline smoke run substitutes for a local fleet-walker).</li>
+</ul>
+
+<h2>Reviewer notes</h2>
+<div class="note">
+  <strong>Offline <code>unprotected</code> is approximate.</strong> Under
+  <code>--no-gh</code> the collector can't know PR state, so a dirty/ahead-unmerged
+  worktree may be flagged <code>unprotected</code> even when an open PR would
+  protect it. This matches the v1 engine; it's documented rather than changed so
+  the port stays faithful. Say the word if you'd prefer a tri-state
+  ("PR unknown") instead.
+</div>
+<p>Pairing flags (<code>no-workbench-pair</code>, <code>zombie</code>) are dormant
+until #3 repopulates the pairing set — suppressed for now so Leaf 1 doesn't
+mislabel every worktree.</p>
+
+<h2>What unblocks on merge</h2>
+<p>Merging #2 lands the collector + config + Forge seam on <code>main</code>, which
+is the foundation #3, #4, and #5 all build on. Per the orchestrator, those leaves
+are started off <code>main</code> only after this merges (no stacking on an
+unmerged branch).</p>
+
+</body>
+</html>
