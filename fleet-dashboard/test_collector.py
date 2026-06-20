@@ -299,6 +299,12 @@ class FrontmatterTests(unittest.TestCase):
             collector.parse_frontmatter_title('---\ntitle: "Quoted: Title"\n---\n'),
             "Quoted: Title")
 
+    def test_asymmetric_quote_not_stripped(self):
+        # only a matched quote pair is stripped — a trailing inline quote stays
+        self.assertEqual(
+            collector.parse_frontmatter_title('---\ntitle: She said "hi"\n---\n'),
+            'She said "hi"')
+
     def test_no_frontmatter_returns_none(self):
         self.assertIsNone(collector.parse_frontmatter_title("# Just a heading\n"))
 
@@ -403,6 +409,29 @@ class KanbanForgeReadTests(unittest.TestCase):
         self.assertEqual(len(cards), 1)
         self.assertEqual(cards[0]["title"], "Go Live")
         self.assertEqual(cards[0]["status"], "active")
+
+    def test_collect_kanban_use_forge_through_public_entry(self):
+        # Drives the forge path end to end via collect_kanban(use_forge=True),
+        # incl. an entry missing 'path' (must be skipped, not KeyError).
+        class FakeForge(collector.Forge):
+            def list_repos(self, product): return []
+            def list_prs(self, repo_slug, branch=None): return []
+            def read_dir(self, repo_slug, path):
+                if path == "workbench/plans/active":
+                    return [{"name": "go.md", "path": "workbench/plans/active/go.md"},
+                            {"name": "broken.md"}]  # no 'path' → skipped
+                return []
+            def get_file(self, repo_slug, path):
+                return "---\ntitle: Go Live\n---\n"
+        cfg = {
+            "plan_columns": ["active", "done"], "repo_plans_path": "plans",
+            "products": [{"id": "magic-me", "forge_org": "Jwrobes-Magic",
+                          "coordinator_repo": "Jwrobes-Magic/magic-me-workbench",
+                          "coordinator_plans_path": "workbench/plans"}],
+        }
+        cards = collector.collect_kanban(cfg, "/unused", forge=FakeForge(), use_forge=True)
+        self.assertEqual([c["title"] for c in cards], ["Go Live"])
+        self.assertEqual(cards[0]["level"], "product")
 
     def test_gitlab_kanban_methods_stubbed(self):
         gl = collector.GitLabForge()

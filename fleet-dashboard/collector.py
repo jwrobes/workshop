@@ -23,6 +23,7 @@ Usage:
 """
 
 import argparse
+import base64
 import datetime
 import json
 import re
@@ -216,7 +217,6 @@ class GitHubForge(Forge):
                          "--jq", ".content"], timeout=20)
         if code != 0 or not out:
             return None
-        import base64
         try:
             return base64.b64decode(out).decode("utf-8", "replace")
         except (ValueError, TypeError):
@@ -287,7 +287,10 @@ def parse_frontmatter_title(text):
             for fm in lines[1:i]:
                 m = re.match(r"\s*title\s*:\s*(.+?)\s*$", fm)
                 if m:
-                    return m.group(1).strip().strip("\"'") or None
+                    v = m.group(1).strip()
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                        v = v[1:-1]  # strip a matched quote pair only
+                    return v or None
             return None
     return None
 
@@ -319,11 +322,12 @@ def _kanban_via_forge(forge, repo_slug, plans_path, columns, level, product_id, 
         dir_path = "/".join(p for p in (plans_path, column) if p)
         for entry in forge.read_dir(repo_slug, dir_path):
             name = entry.get("name") or ""
-            if not name.endswith(".md"):
+            path = entry.get("path")
+            if not path or not name.endswith(".md"):
                 continue
-            text = forge.get_file(repo_slug, entry["path"]) or ""
+            text = forge.get_file(repo_slug, path) or ""
             title = parse_frontmatter_title(text) or name[:-3]
-            cards.append(_card(level, product_id, repo_name, column, title, entry["path"]))
+            cards.append(_card(level, product_id, repo_name, column, title, path))
     return cards
 
 
@@ -368,7 +372,15 @@ def collect_kanban(cfg, workspace_root, forge=None, use_forge=False):
             cards += _kanban_local(repo / repo_plans_path, columns,
                                    "repo", product_id, repo.name)
 
-    return cards
+    # De-dupe by path so a card never double-counts (e.g. a coordinator whose
+    # repo_plans_path and coordinator_plans_path overlap at both levels).
+    seen, unique = set(), []
+    for c in cards:
+        if c["path"] in seen:
+            continue
+        seen.add(c["path"])
+        unique.append(c)
+    return unique
 
 
 # --------------------------------------------------------------------------
