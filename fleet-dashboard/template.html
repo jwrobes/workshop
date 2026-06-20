@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fleet Dashboard</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, sans-serif; margin: 2rem; line-height: 1.4; }
+  h1 { margin: 0 0 .25rem; }
+  .meta { color: #888; font-size: .85rem; margin-bottom: 1.5rem; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #8884; }
+  th { font-weight: 600; }
+  code { font-family: ui-monospace, monospace; }
+  .flag { display: inline-block; background: #c0392b22; color: #c0392b; border-radius: 3px;
+          padding: 0 .35rem; margin-right: .25rem; font-size: .78rem; }
+  .empty { color: #888; font-style: italic; }
+</style>
+</head>
+<body>
+<h1>Fleet Dashboard</h1>
+<p class="meta" id="meta"></p>
+<div id="app"></div>
+<script>
+// The collector replaces the token below with the status JSON at emit time,
+// so this page is fully self-contained (no fetch / no CORS when opened via file://).
+const DATA = /*__DATA__*/null;
+
+// Minimal placeholder render. The product -> repo -> worktree drill hierarchy,
+// two-level Kanban, and link inference are Leaf 4 (#5); this flat table just
+// proves the data round-trips from collector -> dashboard.
+(function () {
+  const app = document.getElementById("app");
+  const meta = document.getElementById("meta");
+  if (!DATA) {
+    app.innerHTML = '<p class="empty">No data — run <code>python3 collector.py</code>.</p>';
+    return;
+  }
+  const rows = DATA.worktrees || [];
+  meta.textContent = `Generated ${DATA.generated_at} · ${rows.length} rows`;
+  if (!rows.length) {
+    app.innerHTML = '<p class="empty">No worktrees found in workspace.</p>';
+    return;
+  }
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>]/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  const head = ["repo", "kind", "branch", "dirty", "ahead", "behind", "merged", "flags"];
+  const body = rows.map((r) => `<tr>
+    <td><code>${esc(r.repo)}</code></td>
+    <td>${esc(r.kind)}</td>
+    <td><code>${esc(r.branch)}</code></td>
+    <td>${esc(r.dirty_files)}</td>
+    <td>${esc(r.ahead)}</td>
+    <td>${esc(r.behind)}</td>
+    <td>${esc(r.merged)}</td>
+    <td>${(r.flags || []).map((f) => `<span class="flag">${esc(f)}</span>`).join("")}</td>
+  </tr>`).join("");
+  app.innerHTML = `<table><thead><tr>${head.map((h) => `<th>${h}</th>`).join("")}</tr></thead>`
+    + `<tbody>${body}</tbody></table>`;
+})();
+</script>
+</body>
+</html>

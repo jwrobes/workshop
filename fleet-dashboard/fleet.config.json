@@ -1,0 +1,15 @@
+{
+  "forge": "github",
+  "workspace_root": "~/workspace",
+  "repo_plans_path": "plans",
+  "plan_columns": ["active", "backlog", "completed", "done"],
+  "products": [
+    {
+      "id": "magic-me",
+      "name": "Magic Me",
+      "forge_org": "Jwrobes-Magic",
+      "coordinator_repo": "Jwrobes-Magic/magic-me-workbench",
+      "coordinator_plans_path": "workbench/plans"
+    }
+  ]
+}
