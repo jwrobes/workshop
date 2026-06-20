@@ -15,13 +15,20 @@ engine and adds two seams the rest of v2 builds on:
 The Kanban reader (`collect_kanban()`, Leaf 2 / #3) reads plans at two levels
 — product coordinator + per-repo. The product spine (`build_product_tree()`,
 Leaf 3 / #4) groups repos under products and worktrees under repos, with an
-unaffiliated bucket for loose clones. The real product->repo->worktree HTML
-render and `--no-local` mode land in Leaf 4 (#5). The v1 `collect_initiatives()`
-workbench reader was replaced by `collect_kanban()`; the worktree<->card link
-inference lands in Leaf 4.
+unaffiliated bucket for loose clones. The render (`template.html`), worktree<->
+card link inference (`link_worktrees_to_cards()`), and `--no-local` forge-only
+mode are Leaf 4 (#5). The v1 `collect_initiatives()` workbench reader was
+replaced by `collect_kanban()`.
+
+Modes:
+    (default)   local — walk worktrees on disk + read plans from disk + forge PRs.
+    --no-gh     skip forge calls (PR/repo lookups); local data only.
+    --no-local  forge-only — product->repo->PR + Kanban from the API, no checkouts
+                (cloud-portable; runs as a scheduled job with no local clones).
 
 Usage:
-    python3 collector.py [--config FILE] [--out DIR] [--workspace DIR] [--no-gh]
+    python3 collector.py [--config FILE] [--out DIR] [--workspace DIR]
+                         [--no-gh] [--no-local]
 """
 
 import argparse
@@ -322,12 +329,19 @@ def _kanban_via_forge(forge, repo_slug, plans_path, columns, level, product_id, 
     cards = []
     for column in columns:
         dir_path = "/".join(p for p in (plans_path, column) if p)
-        for entry in forge.read_dir(repo_slug, dir_path):
+        try:
+            entries = forge.read_dir(repo_slug, dir_path)
+        except NotImplementedError:
+            return cards
+        for entry in entries:
             name = entry.get("name") or ""
             path = entry.get("path")
             if not path or not name.endswith(".md"):
                 continue
-            text = forge.get_file(repo_slug, path) or ""
+            try:
+                text = forge.get_file(repo_slug, path) or ""
+            except NotImplementedError:
+                text = ""
             title = parse_frontmatter_title(text) or name[:-3]
             cards.append(_card(level, product_id, repo_name, column, title, path))
     return cards
@@ -363,9 +377,22 @@ def collect_kanban(cfg, workspace_root, forge=None, use_forge=False):
             base = workspace_root / coord_name / coord_path
             cards += _kanban_local(base, columns, "product", p["id"], None)
 
-    # Repo level — each local clone's plans, attributed to a product by org.
-    # (Forge-only repo enumeration is wired in Leaf 4 via Forge.list_repos.)
-    if not use_forge and workspace_root.is_dir():
+    # Repo level — each member repo's plans.
+    if use_forge and forge is not None:
+        # Forge-only: enumerate member repos from the forge and read via the API.
+        for p in products:
+            coord = (p.get("coordinator_repo") or "").lower()
+            try:
+                member_slugs = forge.list_repos(p)
+            except NotImplementedError:
+                member_slugs = []
+            for slug in member_slugs:
+                if slug.lower() == coord:
+                    continue  # coordinator already read at product level
+                cards += _kanban_via_forge(forge, slug, repo_plans_path, columns,
+                                           "repo", p["id"], slug.split("/")[-1])
+    elif workspace_root.is_dir():
+        # Local: each clone's plans, attributed to a product by org.
         for repo in sorted(workspace_root.iterdir()):
             if not (repo / ".git").is_dir():
                 continue
@@ -487,6 +514,46 @@ def build_product_tree(cfg, clones, forge=None, allow_forge=False):
     return products_out, unaffiliated
 
 
+# --------------------------------------------------------------------------
+# Link inference: pair worktrees to plan cards by naming (reuse norm())
+# --------------------------------------------------------------------------
+
+def worktree_card_key(row):
+    """Derive a normalized slug for a worktree row from its branch
+    (`build-<slug>`) or directory name (`<repo>-<slug>`)."""
+    branch = row.get("branch") or ""
+    if branch.startswith("build-"):
+        return norm(branch[len("build-"):])
+    name = Path(row.get("path", "")).name
+    repo = row.get("repo") or ""
+    prefix = repo + "-"
+    if name.lower().startswith(prefix.lower()):
+        return norm(name[len(prefix):])
+    return norm(branch or name)
+
+
+def link_worktrees_to_cards(rows, cards):
+    """Attach a matching plan card to each worktree row by naming, and mark
+    which cards have a worktree. Mutates rows (adds `card`) and cards (adds
+    `has_worktree`). Unmatched both ways are left visible: a worktree keeps
+    `card=None`; a card keeps `has_worktree=False`."""
+    # Scope matches to the same repo so two repos' cards that normalize to the
+    # same stem don't cross-link across the fleet.
+    index = {}
+    for c in cards:
+        c.setdefault("has_worktree", False)
+        index.setdefault((norm(c.get("repo") or ""), norm(Path(c["path"]).stem)), c)
+    for row in rows:
+        row["card"] = None
+        if row.get("kind") != "worktree":
+            continue
+        card = index.get((norm(row.get("repo") or ""), worktree_card_key(row)))
+        if card:
+            card["has_worktree"] = True
+            row["card"] = {"title": card["title"], "status": card["status"],
+                           "level": card["level"], "path": card["path"]}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -497,6 +564,9 @@ def main():
     ap.add_argument("--workspace", default=None,
                     help="override workspace_root from config")
     ap.add_argument("--no-gh", action="store_true", help="skip forge PR lookups (offline)")
+    ap.add_argument("--no-local", action="store_true",
+                    help="forge-only mode: product->repo->PR+Kanban from the API, "
+                         "no local worktrees (cloud-portable)")
     args = ap.parse_args()
 
     try:
@@ -506,16 +576,24 @@ def main():
         print(f"error: {e}", file=sys.stderr)
         return 2
 
-    workspace_root = Path(args.workspace or cfg.get("workspace_root", "~/workspace")).expanduser()
+    # Resolve to an absolute path so each clone's path matches what
+    # `git worktree list --porcelain` reports (which is always absolute) —
+    # otherwise a relative --workspace misclassifies main clones as worktrees.
+    workspace_root = Path(args.workspace or cfg.get("workspace_root", "~/workspace")).expanduser().resolve()
     out_dir = Path(args.out).expanduser() if args.out else (workspace_root / ".fleet")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     now = datetime.datetime.now(datetime.timezone.utc)
 
-    # Two-level Kanban cards (product coordinator + per-repo plans). The
-    # worktree<->card link inference (reusing norm()) lands in Leaf 4 (#5);
-    # until then the worktree pairing below runs against an empty set.
-    kanban = collect_kanban(cfg, workspace_root, forge, use_forge=False)
+    # local mode walks worktrees + reads plans from disk; --no-local is
+    # forge-only (product->repo->PR + Kanban from the API, no checkouts).
+    local = not args.no_local
+    if not local and args.no_gh:
+        print("warning: --no-local with --no-gh has no data source "
+              "(no local worktrees, no forge calls)", file=sys.stderr)
+
+    # Two-level Kanban cards (product coordinator + per-repo plans).
+    kanban = collect_kanban(cfg, workspace_root, forge, use_forge=not local)
     initiatives = []
     init_index = {}
     for ini in initiatives:
@@ -524,9 +602,10 @@ def main():
     rows = []
     clones = []
     seen_paths = set()
-    if not workspace_root.is_dir():
+    if local and not workspace_root.is_dir():
         workspace_root.mkdir(parents=True, exist_ok=True)
-    for repo in sorted(workspace_root.iterdir()):
+    repo_iter = sorted(workspace_root.iterdir()) if local and workspace_root.is_dir() else []
+    for repo in repo_iter:
         if not (repo / ".git").is_dir():  # main clones only (worktrees have a .git *file*)
             continue
         base = default_branch(repo)
@@ -615,8 +694,23 @@ def main():
     products_out, unaffiliated = build_product_tree(
         cfg, clones, forge, allow_forge=not args.no_gh)
 
+    # Forge-only mode: repos carry no local worktrees — surface their open PRs.
+    if not local and not args.no_gh:
+        for prod in products_out:
+            for repo in prod["repos"]:
+                if repo.get("slug"):
+                    try:
+                        repo["prs"] = forge.list_prs(repo["slug"])
+                    except NotImplementedError:
+                        repo["prs"] = []
+
+    # Link inference: pair worktrees to plan cards by naming; unmatched stays
+    # visible (worktree with card=None, card with has_worktree=False).
+    link_worktrees_to_cards(rows, kanban)
+
     status = {
         "generated_at": now.isoformat(timespec="seconds"),
+        "mode": "forge-only" if not local else "local",
         "worktrees": rows,
         "products": products_out,
         "unaffiliated": unaffiliated,
@@ -629,7 +723,11 @@ def main():
     (out_dir / f"status-{now.date()}.json").write_text(json.dumps(status, indent=2))
 
     template = (Path(__file__).parent / "template.html").read_text()
-    html = template.replace("/*__DATA__*/null", json.dumps(status))
+    # Escape <, >, & as JSON \uXXXX so an inlined string containing "</script>"
+    # (a card title, branch, path, ...) can't break out of the <script> element.
+    payload = (json.dumps(status)
+               .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026"))
+    html = template.replace("/*__DATA__*/null", payload)
     (out_dir / "dashboard.html").write_text(html)
 
     n_flagged = sum(1 for r in rows if r["flags"])

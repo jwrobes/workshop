@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What I built — Fleet Dashboard v2</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 860px;
+         margin: 0 auto; padding: 1.5rem 1.1rem 4rem; line-height: 1.5; }
+  h1 { margin: 0 0 .2rem; font-size: 1.55rem; }
+  .sub { color: #888; margin: 0 0 1.2rem; }
+  h2 { margin: 2rem 0 .6rem; font-size: 1.18rem; border-bottom: 1px solid #8884; padding-bottom: .2rem; }
+  code { font-family: ui-monospace, monospace; font-size: .9em; background: #8881; padding: .05rem .3rem; border-radius: 3px; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; margin: .5rem 0; }
+  th, td { text-align: left; padding: .4rem .55rem; border-bottom: 1px solid #8884; vertical-align: top; }
+  .ok { color: #2e7d32; font-weight: 600; }
+  ul { padding-left: 1.2rem; } li { margin: .3rem 0; }
+  .pill { display: inline-block; font-size: .72rem; padding: .05rem .5rem; border-radius: 999px; background: #1976d222; color: #1976d2; margin-left: .3rem; }
+  .flow { font-family: ui-monospace, monospace; font-size: .82rem; background: #8881; padding: .7rem .9rem; border-radius: 6px; overflow-x: auto; }
+</style>
+</head>
+<body>
+
+<h1>Fleet Dashboard v2 <span class="pill">tracker #1</span></h1>
+<p class="sub">A cross-product view — product → repo → worktree — with two-level Kanban, worktree/PR health, and plan↔work links. Shipped as four leaves (#2–#5) in <code>fleet-dashboard/</code>.</p>
+
+<p>One morning-triage page showing what's in flight, what's merged-but-not-cleaned,
+what's stale, and which plan cards have a worktree. Forge-agnostic and
+config-driven so it runs on a laptop against local checkouts <em>or</em> as a
+scheduled cloud job with no checkouts at all.</p>
+
+<h2>The pipeline</h2>
+<div class="flow">
+config (fleet.config.json) ─┐<br>
+&nbsp;&nbsp;collect_kanban() ──── plan cards (product coordinator + per-repo plans)<br>
+&nbsp;&nbsp;worktree walk ─────── git/PR/flag health (squash-merge-aware)<br>
+&nbsp;&nbsp;build_product_tree() ─ group repos→products, worktrees→repos (+ unaffiliated)<br>
+&nbsp;&nbsp;link_worktrees_to_cards() ─ pair build-&lt;slug&gt; / &lt;repo&gt;-&lt;slug&gt; ↔ card by naming<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;↓<br>
+status.json ──▶ self-contained dashboard.html (data inlined, no CORS)
+</div>
+
+<h2>The four leaves</h2>
+<table>
+  <tr><th>Leaf</th><th>What it added</th><th>PR</th></tr>
+  <tr><td>#2 — foundation</td><td>Ported v1 collector engine + <code>fleet.config.json</code> + the <code>Forge</code> seam (GitHubForge real, GitLabForge stub). No <code>gh</code> calls in the collector body.</td><td>#7</td></tr>
+  <tr><td>#3 — Kanban</td><td><code>collect_kanban()</code>: two-level plans reader (product coordinator + per-repo); status from the column dir; title from frontmatter or filename. Extended Forge with <code>read_dir</code>/<code>get_file</code>.</td><td>#8</td></tr>
+  <tr><td>#4 — spine</td><td><code>build_product_tree()</code>: group repos→products, worktrees→repos from config + <code>Forge.list_repos</code>; unaffiliated bucket; coordinator = product-level.</td><td>#9</td></tr>
+  <tr><td>#5 — render + modes</td><td>The product→repo→worktree HTML render with both Kanban levels + flags; <code>link_worktrees_to_cards()</code>; <code>--no-local</code> forge-only mode; README.</td><td>this PR</td></tr>
+</table>
+
+<h2>Modes</h2>
+<table>
+  <tr><th>Mode</th><th>Command</th><th>Reads</th></tr>
+  <tr><td>Local (default)</td><td><code>python3 collector.py</code></td><td>worktrees + plans from disk, PRs from the forge</td></tr>
+  <tr><td>Offline</td><td><code>--no-gh</code></td><td>local worktrees + plans only</td></tr>
+  <tr><td>Forge-only</td><td><code>--no-local</code></td><td>product→repo→PR + Kanban from the API; no checkouts (cloud-portable)</td></tr>
+</table>
+
+<h2>Leaf 4 acceptance criteria</h2>
+<table>
+  <tr><th>AC</th><th>Criterion</th><th>Status</th></tr>
+  <tr><td>1</td><td>emits status.json + self-contained dashboard.html grouped product→repo→worktree with both Kanbans + flags</td><td class="ok">✓</td></tr>
+  <tr><td>2</td><td><code>--no-local</code> forge-only mode works; <code>--no-gh</code> works</td><td class="ok">✓</td></tr>
+  <tr><td>3</td><td>link inference works; unmatched graceful (worktree w/o card, card w/o worktree)</td><td class="ok">✓</td></tr>
+  <tr><td>4</td><td>README present</td><td class="ok">✓</td></tr>
+</table>
+
+<h2>Validation</h2>
+<ul>
+  <li><strong>Tests:</strong> 48 passing across all four leaves (stdlib <code>unittest</code>, no deps) — incl. real-git squash-merge + worktree fixtures, link inference both naming forms, and an end-to-end <code>--no-local</code> run via an injected fake forge.</li>
+  <li><strong>Code review:</strong> each leaf passed a fresh-context review (Solid/Strong); findings fixed or documented.</li>
+  <li><strong>Verified by hand:</strong> a fixture workspace renders the hierarchy correctly — magic-me → [claw-playbook] (coordinator excluded), random-tool → unaffiliated, the <code>build-add-retries</code> worktree linked to its "Add retries" card, and the unlinked "Launch Magic Me" product card shown under "plan cards without a worktree".</li>
+</ul>
+
+<h2>Try it</h2>
+<div class="flow">python3 fleet-dashboard/collector.py --no-gh --workspace &lt;your ~/workspace&gt;<br># then open &lt;workspace&gt;/.fleet/dashboard.html</div>
+
+</body>
+</html>

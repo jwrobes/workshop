@@ -579,6 +579,236 @@ class ProductTreeE2ETests(unittest.TestCase):
         self.assertEqual([r["name"] for r in status["unaffiliated"]], ["speak-to-code"])
 
 
+class RelativeWorkspaceTests(unittest.TestCase):
+    """Regression: a relative --workspace must still classify a main clone as
+    'clone' (git porcelain reports absolute paths; workspace_root is resolved)."""
+
+    def test_relative_workspace_classifies_clone(self):
+        import os
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        ws = root / "ws"
+        ws.mkdir()
+        repo, origin = ws / "demo", root / "demo.git"
+        _git(root, "init", "--bare", str(origin))
+        _git(root, "clone", str(origin), str(repo))
+        (repo / "f.txt").write_text("x\n")
+        _git(repo, "add", "f.txt")
+        _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init")
+        _git(repo, "branch", "-M", "main")
+        cfg = {"forge": "github", "plan_columns": [], "products": []}
+        (root / "c.json").write_text(json.dumps(cfg))
+        out = root / "out"
+        import sys
+        oldcwd, old = os.getcwd(), sys.argv
+        os.chdir(root)
+        sys.argv = ["collector.py", "--no-gh", "--config", "c.json",
+                    "--workspace", "ws", "--out", str(out)]
+        try:
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(collector.main(), 0)
+        finally:
+            sys.argv = old
+            os.chdir(oldcwd)
+        status = json.loads((out / "status.json").read_text())
+        kinds = {w["branch"]: w["kind"] for w in status["worktrees"]}
+        self.assertEqual(kinds.get("main"), "clone")
+
+
+class LinkInferenceTests(unittest.TestCase):
+    """Leaf 4: worktree<->card link inference by naming (reuse norm())."""
+
+    def test_branch_build_slug_matches_card(self):
+        rows = [{"kind": "worktree", "branch": "build-add-retries",
+                 "path": "/ws/claw-add-retries", "repo": "claw"}]
+        cards = [{"title": "Add retries", "status": "active", "level": "repo",
+                  "repo": "claw", "path": "plans/active/add-retries.md"}]
+        collector.link_worktrees_to_cards(rows, cards)
+        self.assertEqual(rows[0]["card"]["title"], "Add retries")
+        self.assertTrue(cards[0]["has_worktree"])
+
+    def test_dir_repo_slug_matches_card(self):
+        rows = [{"kind": "worktree", "branch": "feature",
+                 "path": "/ws/claw-playbook-auth-flow", "repo": "claw-playbook"}]
+        cards = [{"title": "Auth flow", "status": "backlog", "level": "repo",
+                  "repo": "claw-playbook", "path": "plans/backlog/auth-flow.md"}]
+        collector.link_worktrees_to_cards(rows, cards)
+        self.assertEqual(rows[0]["card"]["status"], "backlog")
+        self.assertTrue(cards[0]["has_worktree"])
+
+    def test_unmatched_is_graceful_both_ways(self):
+        rows = [{"kind": "worktree", "branch": "build-nothing",
+                 "path": "/ws/x", "repo": "r"}]
+        cards = [{"title": "Other", "status": "active", "level": "repo",
+                  "repo": "r", "path": "plans/active/other.md"}]
+        collector.link_worktrees_to_cards(rows, cards)
+        self.assertIsNone(rows[0]["card"])          # worktree w/o card
+        self.assertFalse(cards[0]["has_worktree"])  # card w/o worktree
+
+    def test_same_stem_different_repos_scoped(self):
+        # two repos each with a 'deploy' card — must not cross-link
+        rows = [
+            {"kind": "worktree", "branch": "build-deploy", "path": "/ws/a-deploy", "repo": "a"},
+            {"kind": "worktree", "branch": "build-deploy", "path": "/ws/b-deploy", "repo": "b"},
+        ]
+        cards = [
+            {"title": "Deploy A", "status": "active", "level": "repo", "repo": "a",
+             "path": "a/plans/active/deploy.md"},
+            {"title": "Deploy B", "status": "active", "level": "repo", "repo": "b",
+             "path": "b/plans/active/deploy.md"},
+        ]
+        collector.link_worktrees_to_cards(rows, cards)
+        self.assertEqual(rows[0]["card"]["title"], "Deploy A")
+        self.assertEqual(rows[1]["card"]["title"], "Deploy B")
+        self.assertTrue(all(c["has_worktree"] for c in cards))
+
+    def test_clone_rows_not_linked(self):
+        rows = [{"kind": "clone", "branch": "main", "path": "/ws/r", "repo": "r"}]
+        cards = [{"title": "main", "status": "active", "level": "repo",
+                  "path": "plans/active/main.md"}]
+        collector.link_worktrees_to_cards(rows, cards)
+        self.assertIsNone(rows[0]["card"])
+
+
+class NoLocalModeTests(unittest.TestCase):
+    """Leaf 4 AC: --no-local forge-only mode (cloud-portable, no checkouts)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.orig_make = collector.make_forge
+
+        class FakeForge(collector.Forge):
+            def list_repos(self, product):
+                return ["Jwrobes-Magic/claw-playbook",
+                        "Jwrobes-Magic/magic-me-workbench"]  # coordinator filtered
+            def list_prs(self, slug, branch=None):
+                return [{"number": 7, "state": "OPEN"}]
+            def read_dir(self, slug, path):
+                return [{"name": "go.md", "path": path + "/go.md"}] \
+                    if path.endswith("active") else []
+            def get_file(self, slug, path):
+                return "---\ntitle: Go\n---\n"
+        collector.make_forge = lambda name: FakeForge()
+
+    def tearDown(self):
+        collector.make_forge = self.orig_make
+        self.tmp.cleanup()
+
+    def test_forge_only_end_to_end(self):
+        cfg = {
+            "forge": "github", "workspace_root": str(Path(self.tmp.name) / "ws"),
+            "repo_plans_path": "plans", "plan_columns": ["active"],
+            "products": [{"id": "magic-me", "name": "Magic Me",
+                          "forge_org": "Jwrobes-Magic",
+                          "coordinator_repo": "Jwrobes-Magic/magic-me-workbench",
+                          "coordinator_plans_path": "workbench/plans"}],
+        }
+        cfgp = Path(self.tmp.name) / "c.json"
+        cfgp.write_text(json.dumps(cfg))
+        out = Path(self.tmp.name) / "out"
+        import sys
+        old = sys.argv
+        sys.argv = ["collector.py", "--no-local", "--config", str(cfgp), "--out", str(out)]
+        try:
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(collector.main(), 0)
+        finally:
+            sys.argv = old
+        status = json.loads((out / "status.json").read_text())
+        self.assertEqual(status["mode"], "forge-only")
+        self.assertEqual(status["worktrees"], [])  # worktree layer absent
+        prod = status["products"][0]
+        claw = [r for r in prod["repos"] if r["name"] == "claw-playbook"][0]
+        self.assertEqual(claw["prs"], [{"number": 7, "state": "OPEN"}])  # PRs from API
+        self.assertTrue(any(c["level"] == "product" for c in status["kanban"]))
+        self.assertTrue(any(c["level"] == "repo" for c in status["kanban"]))
+
+
+class DashboardInjectionTests(unittest.TestCase):
+    """Leaf 4 security: an inlined string containing </script> must not break
+    out of the dashboard's <script> element."""
+
+    def test_script_breakout_is_escaped(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        ws = root / "ws"
+        repo = ws / "claw-playbook"
+        repo.mkdir(parents=True)
+        _git(repo, "init")
+        _git(repo, "remote", "add", "origin",
+             "https://github.com/Jwrobes-Magic/claw-playbook.git")
+        col = repo / "plans" / "active"
+        col.mkdir(parents=True)
+        (col / "x.md").write_text('---\ntitle: INJ</script><img src=x>INJ\n---\n')
+        cfg = {"forge": "github", "repo_plans_path": "plans",
+               "plan_columns": ["active"],
+               "products": [{"id": "magic-me", "forge_org": "Jwrobes-Magic",
+                             "coordinator_repo": "Jwrobes-Magic/magic-me-workbench",
+                             "coordinator_plans_path": "workbench/plans"}]}
+        (root / "c.json").write_text(json.dumps(cfg))
+        out = root / "out"
+        import sys
+        old = sys.argv
+        sys.argv = ["collector.py", "--no-gh", "--config", str(root / "c.json"),
+                    "--workspace", str(ws), "--out", str(out)]
+        try:
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(collector.main(), 0)
+        finally:
+            sys.argv = old
+        html = (out / "dashboard.html").read_text()
+        self.assertNotIn("INJ</script>", html)              # not a raw breakout
+        self.assertIn("INJ\\u003c/script\\u003e", html)     # escaped instead
+        self.assertEqual(html.count("</script>"), 1)        # only the real tag
+
+
+class NoLocalForgeErrorTests(unittest.TestCase):
+    """Leaf 4: --no-local must not crash when a forge method raises
+    (e.g. GitLabForge stub) — cloud-portability must degrade gracefully."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.orig = collector.make_forge
+
+        class RaisingForge(collector.Forge):
+            def list_repos(self, product): return ["Jwrobes-Magic/claw-playbook"]
+            def list_prs(self, slug, branch=None):
+                raise NotImplementedError("no PRs here")
+            def read_dir(self, slug, path):
+                raise NotImplementedError("no files here")
+            def get_file(self, slug, path):
+                raise NotImplementedError("no files here")
+        collector.make_forge = lambda name: RaisingForge()
+
+    def tearDown(self):
+        collector.make_forge = self.orig
+        self.tmp.cleanup()
+
+    def test_no_local_survives_raising_forge(self):
+        root = Path(self.tmp.name)
+        cfg = {"forge": "github", "repo_plans_path": "plans", "plan_columns": ["active"],
+               "products": [{"id": "magic-me", "forge_org": "Jwrobes-Magic",
+                             "coordinator_repo": "Jwrobes-Magic/magic-me-workbench",
+                             "coordinator_plans_path": "workbench/plans"}]}
+        (root / "c.json").write_text(json.dumps(cfg))
+        out = root / "out"
+        import sys
+        old = sys.argv
+        sys.argv = ["collector.py", "--no-local", "--config", str(root / "c.json"),
+                    "--workspace", str(root / "ws"), "--out", str(out)]
+        try:
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(collector.main(), 0)  # no crash
+        finally:
+            sys.argv = old
+        status = json.loads((out / "status.json").read_text())
+        self.assertEqual(status["kanban"], [])  # reads degraded to empty
+        claw = status["products"][0]["repos"][0]
+        self.assertEqual(claw["prs"], [])       # PRs degraded to empty
+
+
 class SmokeRunTests(unittest.TestCase):
     """AC1 + AC4: collector.py runs end to end, --no-gh works, emits artifacts."""
 
@@ -619,10 +849,12 @@ class SmokeRunTests(unittest.TestCase):
         status = json.loads((self.out / "status.json").read_text())
         self.assertIn("worktrees", status)
         self.assertIn("kanban", status)
-        # dashboard.html is self-contained with the data inlined (token replaced)
+        # dashboard.html is self-contained with the grouped data inlined
         html = (self.out / "dashboard.html").read_text()
         self.assertNotIn("/*__DATA__*/null", html)
         self.assertIn("generated_at", html)
+        self.assertIn("products", html)     # product->repo->worktree tree inlined
+        self.assertIn("Fleet Dashboard", html)
 
 
 if __name__ == "__main__":
