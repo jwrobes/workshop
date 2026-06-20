@@ -12,17 +12,18 @@ engine and adds two seams the rest of v2 builds on:
     routes through the interface, so the collector body contains no direct
     `gh` calls. `GitHubForge` is complete; `GitLabForge` is a documented stub.
 
-The Kanban reader (`collect_kanban()`), product spine, and the real
-product->repo->worktree render land in Leaves 2-4 (issues #3, #4, #5). The
-v1 `collect_initiatives()` workbench reader has been STRIPPED here; the
-naming-based pairing and health flags are preserved and operate on an
-(initially empty) initiatives list that Leaf 2 repopulates.
+The Kanban reader (`collect_kanban()`, Leaf 2 / #3) reads plans as markdown
+at two levels — product coordinator + per-repo. The product spine and the
+real product->repo->worktree render land in Leaves 3-4 (#4, #5). The v1
+`collect_initiatives()` workbench reader was replaced by `collect_kanban()`;
+the worktree<->card link inference lands in Leaf 4.
 
 Usage:
     python3 collector.py [--config FILE] [--out DIR] [--workspace DIR] [--no-gh]
 """
 
 import argparse
+import base64
 import datetime
 import json
 import re
@@ -149,6 +150,17 @@ class Forge(ABC):
         """Return a list of PR dicts ({number, state, mergedAt}) for repo_slug,
         optionally filtered to a head branch. [] when none/forge unavailable."""
 
+    @abstractmethod
+    def read_dir(self, repo_slug, path):
+        """List a directory in a repo's default branch. Returns a list of
+        {name, path, type} dicts ([] when missing/unavailable). Used by the
+        forge-only Kanban reader so it needs no local checkout."""
+
+    @abstractmethod
+    def get_file(self, repo_slug, path):
+        """Return the decoded text of a file in a repo's default branch,
+        or None when missing/unavailable."""
+
 
 class GitHubForge(Forge):
     """GitHub forge wrapping the `gh` CLI. This is the ONLY place `gh` is
@@ -183,6 +195,33 @@ class GitHubForge(Forge):
             return []
         return prs
 
+    def read_dir(self, repo_slug, path):
+        if not repo_slug:
+            return []
+        code, out = run(["gh", "api", f"repos/{repo_slug}/contents/{path}"], timeout=20)
+        if code != 0 or not out:
+            return []
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(data, list):  # a file, not a directory
+            return []
+        return [{"name": e.get("name"), "path": e.get("path"), "type": e.get("type")}
+                for e in data]
+
+    def get_file(self, repo_slug, path):
+        if not repo_slug:
+            return None
+        code, out = run(["gh", "api", f"repos/{repo_slug}/contents/{path}",
+                         "--jq", ".content"], timeout=20)
+        if code != 0 or not out:
+            return None
+        try:
+            return base64.b64decode(out).decode("utf-8", "replace")
+        except (ValueError, TypeError):
+            return None
+
 
 class GitLabForge(Forge):
     """STUB — not yet implemented. GitLab mapping for a future port:
@@ -207,6 +246,14 @@ class GitLabForge(Forge):
         raise NotImplementedError(
             "GitLabForge.list_prs: PR->MR; use `glab mr list -R <repo> --source-branch <branch>`")
 
+    def read_dir(self, repo_slug, path):
+        raise NotImplementedError(
+            "GitLabForge.read_dir: use `glab api projects/:id/repository/tree?path=<path>`")
+
+    def get_file(self, repo_slug, path):
+        raise NotImplementedError(
+            "GitLabForge.get_file: use `glab api projects/:id/repository/files/<path>/raw`")
+
 
 FORGES = {"github": GitHubForge, "gitlab": GitLabForge}
 
@@ -217,6 +264,123 @@ def make_forge(name):
         return FORGES[name]()
     except KeyError:
         raise ValueError(f"unknown forge {name!r}; known: {sorted(FORGES)}")
+
+
+# --------------------------------------------------------------------------
+# Kanban reader (two-level: product coordinator + per-repo plans)
+#
+# Replaces v1's collect_initiatives() workbench reader. Plans live as markdown
+# under <plans_path>/<column>/*.md; the column directory IS the card's status.
+# Paths and columns come from config, so `completed` and `done` are both just
+# configured columns. Reads from the local filesystem, or — in forge-only mode
+# — through the Forge file API (no checkout needed).
+# --------------------------------------------------------------------------
+
+def parse_frontmatter_title(text):
+    """Return the `title:` value from a leading YAML frontmatter block
+    (between `---` fences), or None if absent."""
+    if not text.startswith("---"):
+        return None
+    lines = text.splitlines()
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            for fm in lines[1:i]:
+                m = re.match(r"\s*title\s*:\s*(.+?)\s*$", fm)
+                if m:
+                    v = m.group(1).strip()
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                        v = v[1:-1]  # strip a matched quote pair only
+                    return v or None
+            return None
+    return None
+
+
+def _card(level, product_id, repo_name, status, title, path):
+    return {"level": level, "product": product_id, "repo": repo_name,
+            "status": status, "title": title, "path": str(path)}
+
+
+def _kanban_local(base_dir, columns, level, product_id, repo_name):
+    """Read cards from <base_dir>/<column>/*.md on the local filesystem."""
+    cards = []
+    base = Path(base_dir)
+    for column in columns:
+        col_dir = base / column
+        if not col_dir.is_dir():
+            continue
+        for md in sorted(col_dir.glob("*.md")):
+            text = md.read_text(errors="replace")
+            title = parse_frontmatter_title(text) or md.stem
+            cards.append(_card(level, product_id, repo_name, column, title, md))
+    return cards
+
+
+def _kanban_via_forge(forge, repo_slug, plans_path, columns, level, product_id, repo_name):
+    """Read cards from <plans_path>/<column>/*.md via the Forge file API."""
+    cards = []
+    for column in columns:
+        dir_path = "/".join(p for p in (plans_path, column) if p)
+        for entry in forge.read_dir(repo_slug, dir_path):
+            name = entry.get("name") or ""
+            path = entry.get("path")
+            if not path or not name.endswith(".md"):
+                continue
+            text = forge.get_file(repo_slug, path) or ""
+            title = parse_frontmatter_title(text) or name[:-3]
+            cards.append(_card(level, product_id, repo_name, column, title, path))
+    return cards
+
+
+def collect_kanban(cfg, workspace_root, forge=None, use_forge=False):
+    """Collect Kanban cards at two levels, paths/columns driven by config:
+
+      * product level — each product's coordinator repo `coordinator_plans_path`;
+      * repo level     — each member clone's `repo_plans_path`.
+
+    In local mode reads the filesystem; in forge-only mode reads via the Forge
+    file API. Each card carries its level, owning product/repo, status (the
+    column), title (frontmatter or filename), and path.
+    """
+    columns = cfg.get("plan_columns", [])
+    repo_plans_path = cfg.get("repo_plans_path", "plans")
+    products = cfg.get("products", [])
+    org_to_product = {p["forge_org"].lower(): p["id"]
+                      for p in products if p.get("forge_org")}
+    workspace_root = Path(workspace_root)
+    cards = []
+
+    # Product level — coordinator repo plans.
+    for p in products:
+        coord_repo = p.get("coordinator_repo", "")
+        coord_path = p.get("coordinator_plans_path", "")
+        if use_forge and forge is not None:
+            cards += _kanban_via_forge(forge, coord_repo, coord_path, columns,
+                                       "product", p["id"], None)
+        else:
+            coord_name = coord_repo.split("/")[-1]
+            base = workspace_root / coord_name / coord_path
+            cards += _kanban_local(base, columns, "product", p["id"], None)
+
+    # Repo level — each local clone's plans, attributed to a product by org.
+    # (Forge-only repo enumeration is wired in Leaf 4 via Forge.list_repos.)
+    if not use_forge and workspace_root.is_dir():
+        for repo in sorted(workspace_root.iterdir()):
+            if not (repo / ".git").is_dir():
+                continue
+            org = (remote_slug(repo) or "/").split("/")[0].lower()
+            product_id = org_to_product.get(org)
+            cards += _kanban_local(repo / repo_plans_path, columns,
+                                   "repo", product_id, repo.name)
+
+    # De-dupe by path so a card never double-counts (e.g. a coordinator whose
+    # repo_plans_path and coordinator_plans_path overlap at both levels).
+    seen, unique = set(), []
+    for c in cards:
+        if c["path"] in seen:
+            continue
+        seen.add(c["path"])
+        unique.append(c)
+    return unique
 
 
 # --------------------------------------------------------------------------
@@ -283,9 +447,10 @@ def main():
 
     now = datetime.datetime.now(datetime.timezone.utc)
 
-    # Initiatives are repopulated by collect_kanban() in Leaf 2 (#3); the v1
-    # collect_initiatives() workbench reader has been stripped. Pairing + flags
-    # below are preserved and simply pair against this (currently empty) set.
+    # Two-level Kanban cards (product coordinator + per-repo plans). The
+    # worktree<->card link inference (reusing norm()) lands in Leaf 4 (#5);
+    # until then the worktree pairing below runs against an empty set.
+    kanban = collect_kanban(cfg, workspace_root, forge, use_forge=False)
     initiatives = []
     init_index = {}
     for ini in initiatives:
@@ -378,6 +543,7 @@ def main():
     status = {
         "generated_at": now.isoformat(timespec="seconds"),
         "worktrees": rows,
+        "kanban": kanban,
         "initiatives": initiatives,
     }
 
