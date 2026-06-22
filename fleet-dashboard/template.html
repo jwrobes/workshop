@@ -6,13 +6,15 @@
 <title>Fleet Dashboard</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Spectral:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Spectral:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
   *{box-sizing:border-box}
   html,body{margin:0;padding:0}
   body{background:#f7f4ee;color:#23211c;font-family:'IBM Plex Sans',system-ui,sans-serif;-webkit-font-smoothing:antialiased}
   @keyframes viewIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
   @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+  @keyframes pulseAmber{0%,100%{opacity:1}50%{opacity:.3}}
+  @keyframes cardIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
   ::-webkit-scrollbar{height:9px;width:9px}
   ::-webkit-scrollbar-thumb{background:#d8d0c2;border-radius:6px}
   ::-webkit-scrollbar-track{background:transparent}
@@ -44,11 +46,31 @@
   .attn .dot{width:8px;height:8px;border-radius:50%;background:#cf962f;box-shadow:0 0 0 4px rgba(207,150,47,.15)}
   .ubucket{all:unset;cursor:pointer;display:flex;flex-direction:column;justify-content:space-between;min-height:172px;background:transparent;border:1px dashed #d3cab8;border-radius:6px;padding:20px;transition:background .15s,border-color .15s}
   .ubucket:hover{background:#faf6ee;border-color:#c2b89f}
+  /* pipeline map */
+  .pmwrap{margin-top:26px;animation:viewIn .3s ease}
+  .pmhead{display:flex;align-items:baseline;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+  .pmbox{background:#fffdf9;border:1px solid #ece5d8;border-radius:8px;padding:20px 22px 22px}
+  .pmtop{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}
+  .pmtoggle{all:unset;cursor:pointer;font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:.04em;color:#9a7b3f;border:1px solid #e3d6bd;background:#fbf4e5;padding:5px 11px;border-radius:20px}
+  .pmtoggle:hover{color:#7d6230;border-color:#d9c8a6;background:#f6ecd6}
+  .pmrail{position:relative}
+  .pmline{position:absolute;left:9%;right:9%;top:18px;height:3px;border-radius:3px;background:linear-gradient(90deg,#cdc4b2,#cdb079,#cf962f,#c07f33,#7faa8c)}
+  .pmstops{position:relative;display:flex}
+  .pmstop{all:unset;cursor:pointer;flex:1;display:flex;flex-direction:column;align-items:center;text-align:center;padding-bottom:6px;border-radius:8px;transition:background .15s}
+  .pmstop:hover{background:#f6f1e8}
+  .pmdetail{display:flex;margin-top:4px}
+  .pmcol{flex:1;display:flex;flex-direction:column;gap:7px;padding:0 5px}
+  .pmchip{all:unset;cursor:pointer;display:block;animation:cardIn .2s ease;background:#fffdf9;border:1px solid #ece5d8;border-radius:6px;padding:7px 9px;box-shadow:0 1px 2px rgba(60,50,30,.03);margin-bottom:7px;width:100%;box-sizing:border-box}
+  .pmchip:hover{background:#fff;border-color:#d9cfbd;box-shadow:0 4px 12px rgba(60,50,30,.06)}
+  .river{background:#fffdf9;border:1px solid #ece5d8;border-radius:8px;padding:18px 16px}
   .na{margin-top:26px;border:1px solid #e7d3a6;background:linear-gradient(#fffdf6,#fdf7e9);border-radius:8px;overflow:hidden}
   .na-h{display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid #efe0bd}
   .na-item{all:unset;cursor:pointer;display:flex;align-items:center;gap:14px;width:100%;box-sizing:border-box;padding:13px 18px;border-bottom:1px solid #f1e6c9}
   .na-item:hover{background:#fdf6e4}
   .tag{flex:none;width:78px;font-family:'IBM Plex Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;padding:4px 7px;border-radius:4px;text-align:center}
+  .repogrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(232px,1fr));gap:14px}
+  .rcard{all:unset;cursor:pointer;position:relative;display:flex;flex-direction:column;justify-content:space-between;min-height:128px;background:#fffdf9;border:1px solid #e9e3d7;border-radius:6px;padding:16px 16px 14px;box-shadow:0 1px 2px rgba(60,50,30,.03);transition:transform .15s,box-shadow .15s,border-color .15s}
+  .rcard:hover{border-color:#d8cfbd;box-shadow:0 6px 18px rgba(60,50,30,.07);transform:translateY(-2px)}
   .board{margin-top:34px;display:grid;gap:16px;align-items:start}
   .col-h{display:flex;align-items:baseline;gap:8px;margin-bottom:12px}
   .col-h .lbl{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.14em;text-transform:uppercase}
@@ -66,6 +88,7 @@
   .colstack{display:flex;flex-direction:column;gap:10px}
   .planhead{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   .statuspill{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.12em;text-transform:uppercase;padding:4px 9px;border-radius:5px}
+  .pathtag{font-family:'IBM Plex Mono',monospace;font-size:10px;padding:3px 8px;border-radius:4px}
   .l3grid{display:grid;gap:22px;margin-top:26px;align-items:start}
   .links{border:1px solid #e9e3d7;border-radius:8px;overflow:hidden;background:#fffdf9}
   .lrow{display:flex;align-items:center;gap:13px;text-decoration:none;color:inherit;padding:13px 16px;border-bottom:1px solid #f1ece1}
@@ -77,6 +100,11 @@
   .handoff pre{margin:14px 0 0;padding:14px 17px;font-family:'IBM Plex Mono',monospace;font-size:11px;line-height:1.55;color:#d8d1c2;white-space:pre-wrap;word-break:break-word;border-top:1px solid #3a3730;background:#211f1b;max-height:260px;overflow:auto}
   .copybtn{all:unset;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;width:100%;box-sizing:border-box;background:#d7a23f;color:#241f12;font-family:'IBM Plex Mono',monospace;font-size:12px;letter-spacing:.04em;padding:11px;border-radius:6px;font-weight:500}
   .copybtn:hover{background:#e2b256}
+  .artifacts{margin-top:18px;border:1px solid #e9e3d7;border-radius:8px;background:#fffdf9;padding:16px 18px 18px}
+  .artcard{display:flex;align-items:center;gap:12px;text-decoration:none;color:inherit;border:1px solid #ece5d8;border-radius:6px;padding:12px 13px;background:#fbf8f2}
+  .artcard:hover{border-color:#d9cfbd;background:#fff}
+  .artslot{border:1px dashed #ddd4c2;border-radius:6px;padding:14px 15px;background:#faf6ee;color:#8c8576;font-size:12.5px;line-height:1.5}
+  .yah{margin-top:24px;border:1px solid #ece5d8;background:#fffdf9;border-radius:8px;padding:22px 24px 20px}
   .backbtn{all:unset;cursor:pointer;display:inline-flex;align-items:center;gap:8px;margin-top:26px;font-family:'IBM Plex Mono',monospace;font-size:12px;color:#8c8576}
   .backbtn:hover{color:#3b372f}
   .empty{color:#8c8576;padding:60px 0;text-align:center}
@@ -107,11 +135,11 @@ const DATA = /*__DATA__*/null;
 
 function el(html){const t=document.createElement('template');t.innerHTML=html.trim();return t.content.firstChild;}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function attr(s){return esc(s).replace(/"/g,'&quot;');}
 // tiny, safe markdown -> html (escapes first, then applies a minimal subset)
 function mdToHtml(src){
   if(!src) return '';
   let s=src;
-  // strip leading frontmatter
   if(s.replace(/^\s+/,'').startsWith('---')){const p=s.split('---');if(p.length>=3){s=p.slice(2).join('---');}}
   s=esc(s);
   const lines=s.split('\n');const out=[];let inCode=false,inList=false;
@@ -135,8 +163,9 @@ function mdToHtml(src){
   return out.join('\n');
 }
 function $(id){return document.getElementById(id);}
+function slug(s){return String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');}
 
-const STATE={level:'fleet',productId:null,planId:null,doneOpen:false};
+const STATE={level:'fleet',productId:null,repoId:null,planId:null,doneOpen:false,mapExpanded:{},mapAll:false};
 
 function products(){return (DATA&&DATA.products)||[];}
 function kanban(){return (DATA&&DATA.kanban)||[];}
@@ -152,6 +181,12 @@ function worktreeForCard(card){
     if(hay.includes(t)) return w;
   }
   return null;
+}
+// repo a plan belongs to: explicit card.repo, else its matched worktree's repo
+function repoForCard(card){
+  if(card.repo) return card.repo;
+  const w=worktreeForCard(card);
+  return w&&w.repo?w.repo:null;
 }
 function cardAttention(card){
   if(card.status==='blocked') return {type:'blocked'};
@@ -177,12 +212,42 @@ function attnMeta(type){
   if(type==='blocked') return {tag:'blocked',color:'#a85a39',bg:'#f4e3da',action:'Unblock this plan'};
   return {tag:'worktree',color:'#7a6a3f',bg:'#efe7d2',action:'Remove the merged worktree'};
 }
-
+// path inference (single helper, easy to swap later)
+function planPath(card){
+  const w=worktreeForCard(card);
+  if(w&&((w.branch||'').includes('build-spec')||w.pr)) return 'cloud';
+  if(w) return 'local';
+  return 'unrouted';
+}
+function pathMeta(path){
+  if(path==='cloud') return {tag:'cloud',color:'#9a7b3f',bg:'#f2e9d6'};
+  if(path==='local') return {tag:'local',color:'#5f7d68',bg:'#e6efe7'};
+  if(path==='openclaw') return {tag:'openclaw',color:'#9a6048',bg:'#f0e1d9'};
+  return {tag:'unrouted',color:'#8c8576',bg:'#efeae0'};
+}
+// pipeline stages
+const STAGES=[
+  {key:'spec',name:"spec'd",color:'#b3a997'},
+  {key:'routed',name:'routed',color:'#bd9a5e'},
+  {key:'executing',name:'executing',color:'#cf962f'},
+  {key:'review',name:'in-review',color:'#c07f33'},
+  {key:'shipped',name:'shipped',color:'#7faa8c'},
+];
+function planStage(card){
+  if(card.status==='completed'||card.status==='done') return {key:'shipped',stuck:null};
+  if(card.status==='blocked') return {key:'executing',stuck:'6d'};
+  if(card.status==='backlog') return {key:'spec',stuck:null};
+  const w=worktreeForCard(card),pr=(w&&w.pr)||{};
+  if(pr.state==='MERGED') return {key:'shipped',stuck:null};
+  if(pr.state==='OPEN') return {key:'review',stuck:null};
+  if(w){ if((w.dirty_files||0)>0) return {key:'executing',stuck:null}; return {key:'routed',stuck:null}; }
+  return {key:'spec',stuck:null};
+}
 function buildPrompt(card,prod){
   const w=worktreeForCard(card),L=[];
   L.push('Pick up and continue this plan autonomously.');L.push('');
   L.push('Plan: '+card.title);
-  L.push('Product: '+(prod?prod.name:card.product)+'  ·  Repo: '+(card.repo||'(product-level)'));
+  L.push('Product: '+(prod?prod.name:card.product)+'  ·  Repo: '+(repoForCard(card)||'(product-level)'));
   if(card.path) L.push('Plan doc: '+card.path);
   if(w){L.push('Branch: '+(w.branch||'—'));if(w.path)L.push('Worktree: '+w.path);if(w.pr&&w.pr.number)L.push('PR: #'+w.pr.number+' ('+(w.pr.state||'').toLowerCase()+')');}
   const a=cardAttention(card);if(a)L.push('Next action: '+attnMeta(a.type).action);
@@ -190,26 +255,142 @@ function buildPrompt(card,prod){
   return L.join('\n');
 }
 
-function goTo(level,productId,planId){STATE.level=level;STATE.productId=productId??null;STATE.planId=planId??null;STATE.doneOpen=false;window.scrollTo({top:0});render();}
+function goTo(level,productId,planId,repoId){
+  STATE.level=level;STATE.productId=productId??null;STATE.planId=planId??null;STATE.repoId=repoId??null;
+  STATE.doneOpen=false;STATE.mapExpanded={};STATE.mapAll=false;
+  window.scrollTo({top:0});render();
+}
 
 function renderCrumbs(){
   const c=$('crumbs');c.innerHTML='';
   const root=el('<button class="crumb root">fleet</button>');root.onclick=()=>goTo('fleet');c.appendChild(root);
-  if(STATE.level!=='fleet'){
-    const pid=STATE.productId;
-    const pname=pid==='unaffiliated'?'unaffiliated':((products().find(p=>p.id===pid)||{}).name||pid);
+  if(STATE.level==='fleet') return;
+  const pid=STATE.productId;
+  const pname=pid==='unaffiliated'?'unaffiliated':((products().find(p=>p.id===pid)||{}).name||pid);
+  c.appendChild(el('<span class="sep">/</span>'));
+  const pb=el('<button class="crumb" style="color:'+(STATE.level==='product'?'#23211c':'#9a9384')+'">'+esc(pname)+'</button>');
+  pb.onclick=()=>goTo('product',pid);c.appendChild(pb);
+  if(STATE.repoId){
     c.appendChild(el('<span class="sep">/</span>'));
-    const pb=el('<button class="crumb" style="color:'+(STATE.level==='product'?'#23211c':'#9a9384')+'">'+esc(pname)+'</button>');
-    pb.onclick=()=>goTo('product',pid);c.appendChild(pb);
-    if(STATE.level==='plan'){c.appendChild(el('<span class="sep">/</span>'));c.appendChild(el('<button class="crumb" style="color:#23211c">'+esc(STATE.planId)+'</button>'));}
+    const rb=el('<button class="crumb" style="color:'+(STATE.level==='repo'?'#23211c':'#9a9384')+'">'+esc(STATE.repoId)+'</button>');
+    rb.onclick=()=>goTo('repo',pid,null,STATE.repoId);c.appendChild(rb);
   }
+  if(STATE.level==='plan'){c.appendChild(el('<span class="sep">/</span>'));c.appendChild(el('<button class="crumb" style="color:#23211c">'+esc(STATE.planId)+'</button>'));}
 }
 
+// ---------- PIPELINE MAP (shared) ----------
+function inFlight(plans){return plans.filter(c=>c.status==='active'||c.status==='backlog'||c.status==='blocked');}
+function mapChip(card,prod){
+  const pm=pathMeta(planPath(card)),stg=planStage(card),w=worktreeForCard(card),pr=(w&&w.pr)||{};
+  const a=cardAttention(card);
+  const accent=stg.stuck?'#d99a2c':(a?'#cf962f':pm.color);
+  const chip=el('<button class="pmchip" data-plan="'+attr(card.title)+'" data-path="'+pm.tag+'" data-stuck="'+(!!stg.stuck)+'" title="'+attr(card.title)+'"></button>');
+  let meta='<div style="display:flex;align-items:center;gap:5px;margin-top:6px;flex-wrap:wrap">'
+    +'<span class="mono" style="font-size:8.5px;color:'+pm.color+';background:'+pm.bg+';padding:1px 5px;border-radius:4px">'+pm.tag+'</span>';
+  if(pr.number) meta+='<span class="mono" style="font-size:8.5px;color:#9a6f22">PR #'+pr.number+'</span>';
+  if(stg.stuck) meta+='<span class="mono" style="display:inline-flex;align-items:center;gap:3px;font-size:8.5px;color:#b5701f"><span style="width:5px;height:5px;border-radius:50%;background:#d99a2c;animation:pulseAmber 1.8s ease-in-out infinite"></span>stuck '+stg.stuck+'</span>';
+  if(a) meta+='<span style="width:6px;height:6px;border-radius:50%;background:#cf962f;box-shadow:0 0 0 2.5px rgba(207,150,47,.16)"></span>';
+  meta+='</div>';
+  chip.style.borderLeft='3px solid '+accent;
+  chip.innerHTML='<div class="mono" style="font-size:10.5px;color:#33302a;line-height:1.25;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(card.title)+'</div>'+meta;
+  chip.onclick=()=>goTo('plan',prod?prod.id:STATE.productId,card.title,repoForCard(card));
+  return chip;
+}
+function pipelineGroups(plans){
+  return STAGES.map(s=>{
+    const ps=plans.filter(p=>planStage(p).key===s.key);
+    const stuckN=ps.filter(p=>planStage(p).stuck).length;
+    const attnN=ps.filter(p=>cardAttention(p)).length;
+    let statusLabel,statusColor,statusDot,statusAnim='',hasFlag=true;
+    if(stuckN){statusLabel=stuckN+' stuck';statusColor='#b5701f';statusDot='#d99a2c';statusAnim='animation:pulseAmber 1.8s ease-in-out infinite;';}
+    else if(attnN){statusLabel=attnN+' needs you';statusColor='#a9762a';statusDot='#cf962f';}
+    else if(ps.length){statusLabel='on track';statusColor='#6f8a78';statusDot='#9fc0a8';hasFlag=false;}
+    else{statusLabel='empty';statusColor='#bcb3a1';statusDot='#dcd3c2';hasFlag=false;}
+    const isOpen=STATE.mapAll||!!STATE.mapExpanded[s.key];
+    return {key:s.key,name:s.name,color:s.color,count:ps.length,plans:ps,
+      statusLabel,statusColor,statusDot,statusAnim,hasFlag,isOpen};
+  });
+}
+function renderMap(scopeLabel,plans,prod){
+  const wrap=el('<section class="pmwrap" data-region="pipeline-map" data-scope="'+attr(scopeLabel)+'"></section>');
+  wrap.appendChild(el('<div class="pmhead"><span class="mono" style="font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:#b08d4e">Pipeline</span>'
+    +'<span class="mono" style="font-size:11px;color:#a39c8c">'+esc(scopeLabel)+" · spec'd → routed → executing → in-review → shipped</span></div>"));
+  const groups=pipelineGroups(plans);
+  const narrow=window.innerWidth<700;
+  if(!narrow){
+    const box=el('<div class="pmbox" data-pipeline-map="subway"></div>');
+    const top=el('<div class="pmtop"></div>');
+    top.appendChild(el('<span class="mono" style="font-size:10px;letter-spacing:.04em;color:#b3aa98">'+(STATE.mapAll?'all stages open':'click a stop to open its cards')+'</span>'));
+    const tg=el('<button class="pmtoggle">'+(STATE.mapAll?'collapse all':'expand all')+'</button>');
+    tg.onclick=()=>{STATE.mapAll=!STATE.mapAll;STATE.mapExpanded={};render();};
+    top.appendChild(tg);box.appendChild(top);
+    const rail=el('<div class="pmrail"></div>');rail.appendChild(el('<div class="pmline"></div>'));
+    const stops=el('<div class="pmstops"></div>');
+    groups.forEach(g=>{
+      const dotSize=g.isOpen?'17px':'15px',dotMargin=g.isOpen?'9px':'10px',dotGlow=g.isOpen?'0 0 0 4px rgba(176,141,78,.14)':'none';
+      const stop=el('<button class="pmstop" data-stage="'+g.key+'" data-open="'+g.isOpen+'" style="background:'+(g.isOpen?'#f6f1e8':'transparent')+'"></button>');
+      stop.innerHTML='<div style="width:'+dotSize+';height:'+dotSize+';margin-top:'+dotMargin+';border-radius:50%;background:#fffdf9;border:3px solid '+g.color+';box-shadow:'+dotGlow+';transition:all .15s"></div>'
+        +'<div class="mono" style="margin-top:9px;font-size:10px;letter-spacing:.08em;text-transform:uppercase;white-space:nowrap;color:'+g.color+'">'+g.name+'</div>'
+        +'<div class="serif" style="margin-top:8px;font-size:22px;font-weight:500;line-height:1;color:#3b372f">'+g.count+'</div>'
+        +'<div class="mono" style="margin-top:6px;display:inline-flex;align-items:center;gap:5px;font-size:9.5px;color:'+g.statusColor+'"><span style="width:6px;height:6px;border-radius:50%;background:'+g.statusDot+';'+g.statusAnim+'"></span>'+g.statusLabel+'</div>'
+        +'<div class="mono" style="margin-top:8px;font-size:8.5px;letter-spacing:.06em;color:'+(g.isOpen?'#c2b9a6':'#c9c0ad')+'">'+(g.isOpen?'— click to close':'click to open')+'</div>';
+      stop.onclick=()=>{STATE.mapExpanded[g.key]=!STATE.mapExpanded[g.key];STATE.mapAll=false;render();};
+      stops.appendChild(stop);
+    });
+    rail.appendChild(stops);box.appendChild(rail);
+    const detail=el('<div class="pmdetail"></div>');
+    groups.forEach(g=>{
+      const col=el('<div class="pmcol" data-stage-cards="'+g.key+'"></div>');
+      if(g.isOpen) g.plans.forEach(c=>col.appendChild(mapChip(c,prod)));
+      detail.appendChild(col);
+    });
+    box.appendChild(detail);wrap.appendChild(box);
+  }else{
+    const box=el('<div class="river" data-pipeline-map="river"></div>');
+    box.appendChild(el('<div class="mono" style="font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:#b8af9c;margin-bottom:6px">flows top → bottom</div>'));
+    groups.forEach(g=>{
+      const stage=el('<div data-stage="'+g.key+'" style="position:relative;padding:12px 0 12px 24px;border-left:2px solid '+g.color+';margin-left:5px"></div>');
+      stage.appendChild(el('<div style="position:absolute;left:-8px;top:14px;width:13px;height:13px;border-radius:50%;background:#fffdf9;border:3px solid '+g.color+'"></div>'));
+      stage.appendChild(el('<div style="display:flex;align-items:baseline;gap:8px;margin-bottom:8px;flex-wrap:wrap"><span class="mono" style="font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:'+g.color+'">'+g.name+'</span><span class="mono" style="font-size:10px;color:#bcb3a1">'+g.count+'</span>'+(g.hasFlag?'<span class="mono" style="font-size:9px;color:'+g.statusColor+'">· '+g.statusLabel+'</span>':'')+'</div>'));
+      const stk=el('<div class="colstack" style="gap:7px"></div>');
+      g.plans.forEach(c=>stk.appendChild(mapChip(c,prod)));
+      stage.appendChild(stk);box.appendChild(stage);
+    });
+    wrap.appendChild(box);
+  }
+  return wrap;
+}
+
+// ---------- attention list (shared by product + repo) ----------
+function attnPanel(plans,onOpen){
+  const attnPlans=plans.filter(c=>cardAttention(c));
+  if(!attnPlans.length){
+    return el('<div style="margin-top:24px;display:flex;align-items:center;gap:10px;color:#5d8a6f" class="mono"><span style="width:16px;height:16px;border-radius:50%;border:1.5px solid #7faa8c;display:inline-flex;align-items:center;justify-content:center;font-size:10px">&#10003;</span>Nothing needs you here. All plans are healthy.</div>');
+  }
+  const na=el('<div class="na" data-region="needs-attention" data-count="'+attnPlans.length+'"></div>');
+  na.appendChild(el('<div class="na-h"><span style="width:9px;height:9px;border-radius:50%;background:#cf962f;box-shadow:0 0 0 4px rgba(207,150,47,.16)"></span>'
+    +'<span class="mono" style="font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#a9762a">Needs attention</span>'
+    +'<span class="mono" style="font-size:11px;color:#bca06a">'+attnPlans.length+' item'+(attnPlans.length===1?'':'s')+' need a decision</span></div>'));
+  attnPlans.forEach(c=>{
+    const a=cardAttention(c),m=attnMeta(a.type);
+    const it=el('<button class="na-item" data-attn-item="'+attr(c.title)+'" data-attn-type="'+esc(a.type)+'"></button>');
+    it.innerHTML='<span class="tag" style="color:'+m.color+';background:'+m.bg+'">'+m.tag+'</span>'
+      +'<span style="flex:1;min-width:0"><span style="display:block" class="mono">'+esc(m.action)+'</span>'
+      +'<span style="display:block;font-size:12px;color:#8c8576;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(c.title)+'</span></span>'
+      +'<span style="flex:none;color:#c9a960;font-size:15px">&#8594;</span>';
+    it.onclick=()=>onOpen(c);na.appendChild(it);
+  });
+  return na;
+}
+
+// ---------- L1 FLEET ----------
 function renderFleet(app){
   const ps=products();
   const totalActive=ps.reduce((n,p)=>n+productActive(p.id),0);
   const totalAttn=ps.reduce((n,p)=>n+productAttention(p.id),0);
-  const sec=el('<section></section>');
+  // pipeline map over ALL in-flight plans
+  app.appendChild(renderMap('whole fleet',inFlight(kanban()),null));
+  const sec=el('<section data-view="fleet"></section>');
   sec.innerHTML='<div style="padding:34px 0 8px"><div class="eyebrow">The fleet</div>'
     +'<h1 class="title">Where things stand</h1>'
     +'<p class="lede">'+totalActive+' plans in flight across '+ps.length+' products. '
@@ -218,7 +399,7 @@ function renderFleet(app){
   ps.forEach(p=>{
     const ac=productActive(p.id),at=productAttention(p.id),edge=at>0?'#d7a23f':'#7faa8c';
     const repoLine=(p.repos||[]).length+' repo'+((p.repos||[]).length===1?'':'s');
-    const card=el('<button class="pcard" data-product="'+esc(p.id)+'" data-active-plans="'+ac+'" data-attention="'+at+'"></button>');
+    const card=el('<button class="pcard" data-product="'+attr(p.id)+'" data-active-plans="'+ac+'" data-attention="'+at+'"></button>');
     card.innerHTML='<span class="edge" style="background:'+edge+'"></span>'
       +'<div><span class="pname">'+esc(p.name)+'</span><div class="prepo">'+esc(repoLine)+'</div></div>'
       +'<div class="pfoot"><div style="display:flex;align-items:baseline;gap:7px"><span class="pbig">'+ac+'</span>'
@@ -234,139 +415,287 @@ function renderFleet(app){
   sec.appendChild(grid);app.appendChild(sec);
 }
 
+// ---------- L2 PRODUCT ----------
 function renderProduct(app){
   if(STATE.productId==='unaffiliated') return renderUnaffiliated(app);
   const p=products().find(x=>x.id===STATE.productId)||{repos:[]};
-  const sec=el('<section style="padding-top:30px"></section>');
-  const repoNames=(p.repos||[]).map(r=>(r.slug||'').split('/').pop()).join(' · ');
-  sec.innerHTML='<div class="eyebrow" style="color:#a39c8c;letter-spacing:.16em">'+esc(repoNames)+'</div><h1 class="title" style="font-weight:500">'+esc(p.name)+'</h1>';
   const plans=plansFor(p.id);
-  const attnPlans=plans.filter(c=>cardAttention(c));
-  if(attnPlans.length){
-    const na=el('<div class="na" data-region="needs-attention" data-count="'+attnPlans.length+'"></div>');
-    na.appendChild(el('<div class="na-h"><span style="width:9px;height:9px;border-radius:50%;background:#cf962f;box-shadow:0 0 0 4px rgba(207,150,47,.16)"></span>'
-      +'<span class="mono" style="font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#a9762a">Needs attention</span>'
-      +'<span class="mono" style="font-size:11px;color:#bca06a">'+attnPlans.length+' item'+(attnPlans.length===1?'':'s')+' need a decision</span></div>'));
-    attnPlans.forEach(c=>{
-      const a=cardAttention(c),m=attnMeta(a.type);
-      const it=el('<button class="na-item" data-attn-type="'+esc(a.type)+'"></button>');
-      it.innerHTML='<span class="tag" style="color:'+m.color+';background:'+m.bg+'">'+m.tag+'</span>'
-        +'<span style="flex:1;min-width:0"><span style="display:block" class="mono">'+esc(m.action)+'</span>'
-        +'<span style="display:block;font-size:12px;color:#8c8576;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(c.title)+'</span></span>'
-        +'<span style="flex:none;color:#c9a960;font-size:15px">&#8594;</span>';
-      it.onclick=()=>goTo('plan',p.id,c.title);na.appendChild(it);
-    });
-    sec.appendChild(na);
-  }else{
-    sec.appendChild(el('<div style="margin-top:24px;display:flex;align-items:center;gap:10px;color:#5d8a6f" class="mono"><span style="width:16px;height:16px;border-radius:50%;border:1.5px solid #7faa8c;display:inline-flex;align-items:center;justify-content:center;font-size:10px">&#10003;</span>Nothing needs you here. All plans are healthy.</div>'));
-  }
+  app.appendChild(renderMap(p.name,inFlight(plans),p));
+  const sec=el('<section data-view="product" data-product="'+attr(p.id)+'" style="padding-top:30px"></section>');
+  const repoNames=(p.repos||[]).map(r=>r.name||(r.slug||'').split('/').pop()).join(' · ');
+  sec.innerHTML='<div class="eyebrow" style="color:#a39c8c;letter-spacing:.16em">'+esc(repoNames)+'</div><h1 class="title" style="font-weight:500">'+esc(p.name)+'</h1>';
+  sec.appendChild(attnPanel(plans,c=>goTo('plan',p.id,c.title,repoForCard(c))));
+
+  // REPOS grid
+  const reposWrap=el('<div data-region="repos" style="margin-top:34px"></div>');
+  reposWrap.appendChild(el('<div style="display:flex;align-items:baseline;gap:8px;margin-bottom:14px"><span class="mono" style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#9a917f">Repositories</span><span class="mono" style="font-size:11px;color:#b3ab9b">drill into one for its board</span></div>'));
+  const rgrid=el('<div class="repogrid"></div>');
+  reposOf(p).forEach(r=>{
+    const edge=r.attn>0?'#d7a23f':'#7faa8c';
+    const card=el('<button class="rcard" data-repo="'+attr(r.name)+'" data-active="'+r.active+'" data-attention="'+r.attn+'"></button>');
+    card.innerHTML='<span class="edge" style="background:'+edge+'"></span>'
+      +'<div><div class="mono" style="font-size:14px;color:#2a2722;overflow-wrap:anywhere;line-height:1.25">'+esc(r.name)+'</div>'
+      +'<div class="mono" style="font-size:10.5px;color:#a39c8c;margin-top:7px">'+r.planCount+' plans · '+(r.worktrees===1?'1 worktree':r.worktrees+' worktrees')+'</div></div>'
+      +'<div style="display:flex;align-items:flex-end;justify-content:space-between;gap:10px;margin-top:14px"><span style="display:flex;align-items:baseline;gap:6px"><span class="serif" style="font-size:24px;font-weight:500;line-height:1;color:#3b372f">'+r.active+'</span><span style="font-size:11px;color:#8c8576">active</span></span>'
+      +(r.attn>0?'<span class="mono" style="display:inline-flex;align-items:center;gap:5px;font-size:11px;color:#a9762a"><span style="width:8px;height:8px;border-radius:50%;background:#cf962f;box-shadow:0 0 0 3px rgba(207,150,47,.15)"></span>'+r.attn+' to clear</span>':'<span class="mono" style="display:inline-flex;align-items:center;gap:5px;font-size:11px;color:#5d8a6f"><span style="width:13px;height:13px;border-radius:50%;border:1.5px solid #7faa8c;display:inline-flex;align-items:center;justify-content:center;font-size:8px">&#10003;</span>clear</span>')
+      +'</div>';
+    card.onclick=()=>goTo('repo',p.id,null,r.name);rgrid.appendChild(card);
+  });
+  reposWrap.appendChild(rgrid);sec.appendChild(reposWrap);
+  app.appendChild(sec);
+}
+// repos within a product: declared repos ∪ repos referenced by plans (via repoForCard)
+function reposOf(p){
+  const names=(p.repos||[]).map(r=>r.name||(r.slug||'').split('/').pop());
+  const plans=plansFor(p.id);
+  plans.forEach(c=>{const r=repoForCard(c);if(r&&names.indexOf(r)<0)names.push(r);});
+  return names.map(name=>{
+    const ps=plans.filter(c=>repoForCard(c)===name);
+    const active=ps.filter(c=>c.status==='active').length;
+    const attn=ps.filter(c=>cardAttention(c)).length;
+    const wt=worktrees().filter(w=>w.repo===name&&w.kind==='worktree').length;
+    return {name,planCount:ps.length,active,attn,worktrees:wt};
+  }).filter(r=>r.planCount>0||r.worktrees>0);
+}
+
+// ---------- L3 REPO ----------
+function renderRepo(app){
+  const p=products().find(x=>x.id===STATE.productId)||{};
+  const repoName=STATE.repoId;
+  const rplans=plansFor(STATE.productId).filter(c=>repoForCard(c)===repoName);
+  app.appendChild(renderMap(repoName,inFlight(rplans),p));
+  const sec=el('<section data-view="repo" data-product="'+attr(STATE.productId)+'" data-repo="'+attr(repoName)+'" style="padding-top:30px"></section>');
+  sec.innerHTML='<div class="eyebrow" style="color:#a39c8c;letter-spacing:.16em">'+esc(p.name||'')+' · repo</div><h1 class="mono" style="font-weight:500;font-size:clamp(24px,4vw,38px);margin:0;letter-spacing:-.01em;color:#2a2722;overflow-wrap:anywhere">'+esc(repoName)+'</h1>';
+  sec.appendChild(attnPanel(rplans,c=>goTo('plan',STATE.productId,c.title,repoName)));
+
+  // board
   const narrow=window.innerWidth<760;
   const board=el('<div class="board" data-region="board" style="grid-template-columns:'+(narrow?'1fr':'1fr 1fr 1fr')+'"></div>');
-  const active=plans.filter(c=>c.status==='active'),backlog=plans.filter(c=>c.status==='backlog'),completed=plans.filter(c=>c.status==='completed'||c.status==='done');
-  const ca=el('<div data-column="active"></div>');
-  ca.appendChild(el('<div class="col-h"><span style="width:8px;height:8px;border-radius:50%;background:#6f9d80"></span><span class="lbl" style="color:#5e7d6a">Active</span><span class="n">'+active.length+'</span></div>'));
-  const cas=el('<div class="colstack"></div>');
-  active.forEach(c=>{
-    const w=worktreeForCard(c),pr=prMeta(w&&w.pr),a=cardAttention(c);
-    const k=el('<button class="kcard" data-plan-id="'+esc(c.title)+'" data-status="active"></button>');
-    k.innerHTML='<span class="t">'+esc(c.title)+'</span><span class="kmeta">'
-      +'<span class="prpill" style="color:'+pr.color+'"><span class="d" style="background:'+pr.dot+'"></span>'+esc(pr.label)+'</span>'
-      +(a?'<span class="mono" style="font-size:9px;letter-spacing:.08em;text-transform:uppercase;color:'+attnMeta(a.type).color+';background:'+attnMeta(a.type).bg+';padding:3px 6px;border-radius:4px">'+attnMeta(a.type).tag+'</span>':'')+'</span>';
-    k.onclick=()=>goTo('plan',p.id,c.title);cas.appendChild(k);
-  });
-  ca.appendChild(cas);board.appendChild(ca);
-  const cb=el('<div data-column="backlog"></div>');
-  cb.appendChild(el('<div class="col-h"><span style="width:8px;height:8px;border-radius:50%;border:1.5px solid #c2b89f;box-sizing:border-box"></span><span class="lbl" style="color:#9a917f">Backlog</span><span class="n">'+backlog.length+'</span></div>'));
-  const cbs=el('<div class="colstack"></div>');
-  backlog.forEach(c=>{
-    const k=el('<button class="bcard" data-plan-id="'+esc(c.title)+'" data-status="backlog"></button>');
-    k.innerHTML='<span class="mono" style="font-size:12.5px;color:#5b5447;overflow-wrap:anywhere">'+esc(c.title)+'</span><span class="mono" style="display:block;font-size:10.5px;color:#aaa291;margin-top:5px">'+esc(c.repo||'')+'</span>';
-    k.onclick=()=>goTo('plan',p.id,c.title);cbs.appendChild(k);
-  });
-  cb.appendChild(cbs);board.appendChild(cb);
-  const cc=el('<div data-column="completed"></div>');
-  const head=el('<button style="all:unset;cursor:pointer;display:flex;align-items:center;gap:8px;margin-bottom:12px;width:100%"></button>');
-  head.innerHTML='<span style="font-size:10px;color:#9a917f;transform:rotate('+(STATE.doneOpen?'90deg':'0deg')+');transition:transform .2s">&#9654;</span><span class="lbl mono" style="color:#9a917f">Completed</span><span class="n">'+completed.length+'</span>';
-  head.onclick=()=>{STATE.doneOpen=!STATE.doneOpen;render();};
-  cc.appendChild(head);
-  if(STATE.doneOpen){
-    const cs=el('<div class="colstack" style="animation:fadeIn .2s ease"></div>');
-    completed.slice(0,12).forEach(c=>{
-      const k=el('<button class="ccard" data-plan-id="'+esc(c.title)+'" data-status="completed"></button>');
-      k.innerHTML='<span style="flex:none;width:14px;height:14px;border-radius:50%;background:#e3ebe2;color:#5d8a6f;display:inline-flex;align-items:center;justify-content:center;font-size:8px">&#10003;</span><span style="flex:1;min-width:0;font-family:\'IBM Plex Mono\',monospace;font-size:12px;color:#8a8273;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(c.title)+'</span>';
-      k.onclick=()=>goTo('plan',p.id,c.title);cs.appendChild(k);
+  const active=rplans.filter(c=>c.status==='active'),backlog=rplans.filter(c=>c.status==='backlog'),completed=rplans.filter(c=>c.status==='completed'||c.status==='done');
+  board.appendChild(kanbanCol('active',active,repoName));
+  board.appendChild(kanbanCol('backlog',backlog,repoName));
+  board.appendChild(kanbanCol('completed',completed,repoName));
+  sec.appendChild(board);
+
+  // worktrees (local-only)
+  const wts=worktrees().filter(w=>w.repo===repoName&&w.kind==='worktree');
+  if(wts.length){
+    const wbox=el('<div data-region="worktrees" data-visibility="local" style="margin-top:30px;border:1px dashed #ddd4c2;border-radius:8px;padding:14px 16px;background:#faf6ee"></div>');
+    wbox.appendChild(el('<div style="display:flex;align-items:center;gap:8px;margin-bottom:12px"><span class="mono" style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#a8916a">Worktrees</span><span style="font-size:11px;color:#aaa291;font-style:italic">local checkout state</span></div>'));
+    const stk=el('<div class="colstack" style="gap:8px"></div>');
+    wts.forEach(w=>{
+      const wm=wtMeta(w);
+      const row=el('<div data-worktree="'+attr(w.branch)+'" style="display:flex;align-items:center;gap:12px;padding:8px 10px;border-radius:6px"></div>');
+      row.innerHTML='<span class="mono" style="flex:1;min-width:0;font-size:12px;color:#5b5447;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(w.branch)+'</span>'
+        +'<span class="mono" style="flex:none;display:inline-flex;align-items:center;gap:6px;font-size:11px;color:'+wm.color+'"><span style="width:6px;height:6px;border-radius:50%;background:'+wm.dot+'"></span>'+wm.label+'</span>';
+      stk.appendChild(row);
     });
-    if(completed.length>12) cs.appendChild(el('<div class="mono" style="font-size:11px;color:#aaa291;padding:6px 12px">+ '+(completed.length-12)+' earlier</div>'));
-    cc.appendChild(cs);
+    wbox.appendChild(stk);sec.appendChild(wbox);
   }
-  board.appendChild(cc);
-  sec.appendChild(board);app.appendChild(sec);
+  app.appendChild(sec);
+}
+function wtMeta(w){
+  const f=w.flags||[];
+  if(f.includes('merged-but-not-removed')) return {label:'merged · not removed',color:'#a9762a',dot:'#cf962f'};
+  if((w.dirty_files||0)>0) return {label:(w.dirty_files)+' uncommitted',color:'#a8916a',dot:'#cbab6a'};
+  if(f.includes('stale')) return {label:'stale',color:'#9a917f',dot:'#c2b89f'};
+  return {label:'clean',color:'#5d8a6f',dot:'#7faa8c'};
+}
+function kanbanCol(kind,plans,repoName){
+  const col=el('<div data-column="'+kind+'"></div>');
+  if(kind==='active'){
+    col.appendChild(el('<div class="col-h"><span style="width:8px;height:8px;border-radius:50%;background:#6f9d80"></span><span class="lbl" style="color:#5e7d6a">Active</span><span class="n">'+plans.length+'</span></div>'));
+    const cs=el('<div class="colstack"></div>');
+    plans.forEach(c=>{
+      const w=worktreeForCard(c),pr=prMeta(w&&w.pr),a=cardAttention(c);
+      const k=el('<button class="kcard" data-plan-id="'+attr(c.title)+'" data-status="active" data-attention="'+(!!a)+'"></button>');
+      k.innerHTML='<span class="t">'+esc(c.title)+'</span><span class="kmeta">'
+        +'<span class="prpill" style="color:'+pr.color+'"><span class="d" style="background:'+pr.dot+'"></span>'+esc(pr.label)+'</span>'
+        +(a?'<span class="mono" style="font-size:9px;letter-spacing:.08em;text-transform:uppercase;color:'+attnMeta(a.type).color+';background:'+attnMeta(a.type).bg+';padding:3px 6px;border-radius:4px">'+attnMeta(a.type).tag+'</span>':'')+'</span>';
+      k.onclick=()=>goTo('plan',STATE.productId,c.title,repoName);cs.appendChild(k);
+    });
+    col.appendChild(cs);
+  }else if(kind==='backlog'){
+    col.appendChild(el('<div class="col-h"><span style="width:8px;height:8px;border-radius:50%;border:1.5px solid #c2b89f;box-sizing:border-box"></span><span class="lbl" style="color:#9a917f">Backlog</span><span class="n">'+plans.length+'</span></div>'));
+    const cs=el('<div class="colstack"></div>');
+    plans.forEach(c=>{
+      const k=el('<button class="bcard" data-plan-id="'+attr(c.title)+'" data-status="backlog"></button>');
+      k.innerHTML='<span class="mono" style="font-size:12.5px;color:#5b5447;overflow-wrap:anywhere">'+esc(c.title)+'</span>';
+      k.onclick=()=>goTo('plan',STATE.productId,c.title,repoName);cs.appendChild(k);
+    });
+    col.appendChild(cs);
+  }else{
+    const head=el('<button style="all:unset;cursor:pointer;display:flex;align-items:center;gap:8px;margin-bottom:12px;width:100%"></button>');
+    head.innerHTML='<span style="font-size:10px;color:#9a917f;transform:rotate('+(STATE.doneOpen?'90deg':'0deg')+');transition:transform .2s">&#9654;</span><span class="lbl mono" style="color:#9a917f">Completed</span><span class="n">'+plans.length+'</span>';
+    head.onclick=()=>{STATE.doneOpen=!STATE.doneOpen;render();};
+    col.appendChild(head);
+    if(STATE.doneOpen){
+      const cs=el('<div class="colstack" style="animation:fadeIn .2s ease"></div>');
+      plans.slice(0,12).forEach(c=>{
+        const k=el('<button class="ccard" data-plan-id="'+attr(c.title)+'" data-status="completed"></button>');
+        k.innerHTML='<span style="flex:none;width:14px;height:14px;border-radius:50%;background:#e3ebe2;color:#5d8a6f;display:inline-flex;align-items:center;justify-content:center;font-size:8px">&#10003;</span><span class="mono" style="flex:1;min-width:0;font-size:12px;color:#8a8273;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(c.title)+'</span>';
+        k.onclick=()=>goTo('plan',STATE.productId,c.title,repoName);cs.appendChild(k);
+      });
+      if(plans.length>12) cs.appendChild(el('<div class="mono" style="font-size:11px;color:#aaa291;padding:6px 12px">+ '+(plans.length-12)+' earlier</div>'));
+      col.appendChild(cs);
+    }
+  }
+  return col;
 }
 
-function renderUnaffiliated(app){
-  const sec=el('<section style="padding-top:30px"></section>');
-  sec.innerHTML='<div class="eyebrow">Unaffiliated</div><h1 class="title" style="font-style:italic;font-weight:400;font-size:clamp(26px,4vw,38px)">Repos without a product</h1><p class="lede">No active plans here. Assign one to a product when it earns a roadmap.</p>';
-  const list=el('<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:1px;background:#e6e0d5;border:1px solid #e6e0d5;border-radius:6px;overflow:hidden;margin-top:22px"></div>');
-  unaffiliated().forEach((r,i)=>{
-    const name=typeof r==='string'?r:(r.slug?r.slug.split('/').pop():(r.name||String(r)));
-    const row=el('<div data-repo="'+esc(name)+'" style="display:flex;align-items:center;justify-content:space-between;gap:10px;background:#fffdf9;padding:13px 15px"></div>');
-    row.innerHTML='<span class="mono" style="font-size:13px;color:#3b372f"><span style="color:#c2b89f;font-size:11px;margin-right:9px">'+String(i+1).padStart(2,'0')+'</span>'+esc(name)+'</span>';
-    list.appendChild(row);
-  });
-  sec.appendChild(list);app.appendChild(sec);
-}
-
+// ---------- L4 PLAN (feature hub) ----------
 function renderPlan(app){
   const p=products().find(x=>x.id===STATE.productId);
   const card=plansFor(STATE.productId).find(c=>c.title===STATE.planId);
   if(!card){app.appendChild(el('<p class="empty">Plan not found.</p>'));return;}
+  const repoName=STATE.repoId||repoForCard(card)||'product-level';
   const w=worktreeForCard(card),pr=prMeta(w&&w.pr),a=cardAttention(card);
-  const sm={active:{label:'Active',color:'#5e7d6a',bg:'#e6efe7'},backlog:{label:'Backlog',color:'#9a917f',bg:'#f0ebe0'},completed:{label:'Completed',color:'#7d8a7d',bg:'#e9efe9'},done:{label:'Completed',color:'#7d8a7d',bg:'#e9efe9'}}[card.status]||{label:card.status,color:'#9a917f',bg:'#f0ebe0'};
-  const sec=el('<section style="padding-top:30px"></section>');
-  sec.appendChild(el('<div class="planhead"><span class="statuspill" style="color:'+sm.color+';background:'+sm.bg+'">'+sm.label+'</span><span class="mono" style="font-size:11px;color:#a39c8c">'+esc(p?p.name:card.product)+' · '+esc(card.repo||'product-level')+'</span></div>'));
+  const pm=pathMeta(planPath(card));
+  const sm={active:{label:'Active',color:'#5e7d6a',bg:'#e6efe7'},backlog:{label:'Backlog',color:'#9a917f',bg:'#f0ebe0'},completed:{label:'Completed',color:'#7d8a7d',bg:'#e9efe9'},done:{label:'Completed',color:'#7d8a7d',bg:'#e9efe9'},blocked:{label:'Blocked',color:'#a85a39',bg:'#f4e3da'}}[card.status]||{label:card.status,color:'#9a917f',bg:'#f0ebe0'};
+  const sec=el('<section data-view="plan" data-plan-id="'+attr(card.title)+'" data-product="'+attr(STATE.productId)+'" data-status="'+attr(sm.label)+'" style="padding-top:30px"></section>');
+  sec.appendChild(el('<div class="planhead"><span class="statuspill" style="color:'+sm.color+';background:'+sm.bg+'">'+sm.label+'</span><span class="mono" style="font-size:11px;color:#a39c8c">'+esc(p?p.name:card.product)+' · '+esc(repoName)+'</span></div>'));
   sec.appendChild(el('<h1 data-plan-title="true" class="mono" style="font-weight:500;font-size:clamp(22px,3.4vw,32px);margin:14px 0 0;color:#2a2722;overflow-wrap:anywhere">'+esc(card.title)+'</h1>'));
   if(a) sec.appendChild(el('<div data-region="next-action" style="margin-top:18px;display:flex;align-items:center;gap:11px;background:linear-gradient(#fffdf6,#fdf6e7);border:1px solid #e7d3a6;border-radius:8px;padding:13px 16px"><span style="width:9px;height:9px;border-radius:50%;background:#cf962f;box-shadow:0 0 0 4px rgba(207,150,47,.16);flex:none"></span><span class="mono" style="font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#a9762a;flex:none">Next</span><span style="font-size:14px;color:#5b4a28">'+esc(attnMeta(a.type).action)+'</span></div>'));
-  // GOAL highlight (from the plan markdown)
-  if(card.goal) sec.appendChild(el('<div data-region="goal" style="margin-top:18px;border-left:3px solid #b08d4e;background:#fbf7ef;border-radius:0 6px 6px 0;padding:12px 16px"><div class="mono" style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#b08d4e;margin-bottom:5px">Goal</div><div style="font-size:15px;line-height:1.5;color:#4a443a">'+esc(card.goal)+'</div></div>'));
+
+  // GOAL + path tag
+  if(card.goal){
+    const g=el('<div data-region="goal" style="margin-top:18px;display:flex;align-items:flex-start;gap:12px"></div>');
+    g.innerHTML='<span class="pathtag" style="flex:none;margin-top:3px;color:'+pm.color+';background:'+pm.bg+'">'+pm.tag+'</span>'
+      +'<span class="serif" style="font-size:clamp(17px,2.4vw,21px);font-weight:400;line-height:1.4;color:#3b372f">'+esc(card.goal)+'</span>';
+    sec.appendChild(g);
+  }
+
+  // YOU ARE HERE
+  sec.appendChild(renderYouAreHere(card));
+
+  // grid: left work / right handoff
   const narrow=window.innerWidth<820;
   const grid=el('<div class="l3grid" style="grid-template-columns:'+(narrow?'1fr':'minmax(0,1.6fr) minmax(0,1fr)')+'"></div>');
   const left=el('<div></div>');
+
+  // work links
   const links=el('<div class="links" data-region="links" data-visibility="public"></div>');
   links.appendChild(el('<div class="mono" style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#a39c8c;padding:12px 16px 0">The work</div>'));
   const planHref=card.path?'file://'+card.path:'#';
-  links.appendChild(el('<a href="'+esc(planHref)+'" data-field="plan-doc" class="lrow"><span class="lk">plan</span><span class="lv">'+esc(card.path||'—')+'</span><span style="flex:none;color:#c2b89f">&#8599;</span></a>'));
+  links.appendChild(el('<a href="'+attr(planHref)+'" data-field="plan-doc" class="lrow"><span class="lk">plan</span><span class="lv">'+esc(card.path||'—')+'</span><span style="flex:none;color:#c2b89f">&#8599;</span></a>'));
   links.appendChild(el('<div data-field="issue" class="lrow"><span class="lk">issue</span><span class="lv muted">— (link inference: not wired yet)</span></div>'));
   if(w&&w.pr&&w.pr.number) links.appendChild(el('<div data-field="pr" class="lrow"><span class="lk">pr</span><span class="lv" style="display:flex;align-items:center;gap:7px;color:'+pr.color+'"><span style="width:7px;height:7px;border-radius:50%;background:'+pr.dot+';flex:none"></span>'+esc(pr.label)+'</span></div>'));
   else links.appendChild(el('<div data-field="pr" class="lrow"><span class="lk">pr</span><span class="lv muted">no PR</span></div>'));
   links.appendChild(el('<div data-field="branch" class="lrow"><span class="lk">branch</span><span class="lv">'+esc(w&&w.branch||'—')+'</span></div>'));
   left.appendChild(links);
+
+  // local only
   if(w){
     const lo=el('<div class="localonly" data-region="local-only" data-visibility="local"></div>');
     lo.innerHTML='<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><span class="mono" style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#a8916a">Local only</span><span style="font-size:11px;color:#aaa291;font-style:italic">stripped from any hosted build</span></div>'
       +'<div style="display:flex;flex-direction:column;gap:9px">'
       +'<div data-field="worktree-path" style="display:flex;gap:10px;align-items:baseline"><span class="mono" style="flex:none;width:64px;font-size:9.5px;text-transform:uppercase;color:#b3a98f">path</span><span class="mono" style="font-size:12px;color:#7a7263;overflow-wrap:anywhere">'+esc(w.path||'—')+'</span></div>'
+      +((w.dirty_files||0)>0?'<div data-field="dirty-files" style="display:flex;gap:10px;align-items:baseline"><span class="mono" style="flex:none;width:64px;font-size:9.5px;text-transform:uppercase;color:#b3a98f">dirty</span><span class="mono" style="font-size:12px;color:#a8916a">'+w.dirty_files+' file'+(w.dirty_files===1?'':'s')+' uncommitted</span></div>':'')
       +((w.flags&&w.flags.length)?'<div data-field="passive-flags" style="display:flex;gap:10px;align-items:baseline"><span class="mono" style="flex:none;width:64px;font-size:9.5px;text-transform:uppercase;color:#b3a98f">flags</span><span style="flex:1;display:flex;flex-wrap:wrap;gap:6px">'+w.flags.map(f=>'<span class="mono" style="font-size:11px;color:#9a917f;background:#f0ebe0;padding:2px 8px;border-radius:4px">'+esc(f)+'</span>').join('')+'</span></div>':'')
       +'</div>';
     left.appendChild(lo);
   }
   grid.appendChild(left);
+
+  // handoff
   const right=el('<div class="handoff" data-region="handoff"></div>');
   const prompt=buildPrompt(card,p);
   right.innerHTML='<div style="padding:16px 17px 0"><div class="mono" style="font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:#bda86f">Hand off to an agent</div><p style="font-size:13px;color:#bdb6a6;margin:8px 0 0;line-height:1.5">Copy a ready-to-paste prompt with the plan doc, branch and next action.</p></div><pre data-field="launch-prompt">'+esc(prompt)+'</pre><div style="padding:13px 17px 16px"><button class="copybtn" id="copybtn">Copy launch prompt</button></div>';
   grid.appendChild(right);
   sec.appendChild(grid);
-  // RENDERED PLAN MARKDOWN (the full detail, in-page — no leaving the hub)
+
+  // WHAT I BUILT — artifacts slot (always visible)
+  sec.appendChild(renderArtifacts(card));
+
+  // rendered plan markdown
   if(card.body){
-    const doc=el('<div data-region="plan-body" style="margin-top:26px;border:1px solid #e9e3d7;border-radius:8px;background:#fffdf9;padding:6px 24px 22px"></div>');
+    const doc=el('<div data-region="plan-body" style="margin-top:18px;border:1px solid #e9e3d7;border-radius:8px;background:#fffdf9;padding:6px 24px 22px"></div>');
     doc.appendChild(el('<div class="mono" style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#a39c8c;padding:14px 0 4px;border-bottom:1px solid #f1ece1;margin-bottom:14px">Plan</div>'));
-    const md=el('<div class="md"></div>'); md.innerHTML=mdToHtml(card.body); doc.appendChild(md);
+    const md=el('<div class="md"></div>');md.innerHTML=mdToHtml(card.body);doc.appendChild(md);
     sec.appendChild(doc);
   }
-  const back=el('<button class="backbtn">&#8592; back to '+esc(p?p.name:card.product)+'</button>');
-  back.onclick=()=>goTo('product',STATE.productId);sec.appendChild(back);
+
+  const back=el('<button class="backbtn">&#8592; back to '+esc(repoName)+'</button>');
+  back.onclick=()=>{ if(STATE.repoId||repoForCard(card)) goTo('repo',STATE.productId,null,repoName); else goTo('product',STATE.productId); };
+  sec.appendChild(back);
   app.appendChild(sec);
+
   const cbn=$('copybtn');
   if(cbn) cbn.onclick=()=>{try{navigator.clipboard.writeText(prompt);}catch(e){}cbn.textContent='Copied to clipboard ✓';setTimeout(()=>cbn.textContent='Copy launch prompt',2200);};
+}
+
+function renderYouAreHere(card){
+  const stg=planStage(card);
+  const order=STAGES.map(s=>s.key);
+  const ti=order.indexOf(stg.key);
+  const fillPct=(82*Math.max(0,ti)/(order.length-1))+'%';
+  const box=el('<div class="yah" data-region="you-are-here" data-plan="'+attr(card.title)+'"></div>');
+  box.appendChild(el('<div class="mono" style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#a39c8c;margin-bottom:20px">On the pipeline</div>'));
+  const rail=el('<div style="position:relative"></div>');
+  rail.appendChild(el('<div style="position:absolute;left:9%;right:9%;top:17px;height:3px;border-radius:3px;background:#e7ded0"></div>'));
+  rail.appendChild(el('<div style="position:absolute;left:9%;width:'+fillPct+';top:17px;height:3px;border-radius:3px;background:linear-gradient(90deg,#9fc0a8,#7faa8c)"></div>'));
+  const stops=el('<div style="position:relative;display:flex"></div>');
+  STAGES.forEach((s,i)=>{
+    const state=i<ti?'past':i===ti?'current':'future';
+    const dot=state==='current'?'19px':'13px';
+    const dotBg=state==='past'?'#7faa8c':'#fffdf9';
+    const ring=state==='current'?'#cf962f':state==='past'?'#7faa8c':'#d8cfbd';
+    const glow=state==='current'?'0 0 0 5px rgba(207,150,47,.16)':'none';
+    const label=state==='future'?'#b8af9c':(state==='current'?'#b07d24':'#5d8a6f');
+    const stop=el('<div data-stage="'+s.key+'" data-state="'+state+'" style="flex:1;display:flex;flex-direction:column;align-items:center;text-align:center"></div>');
+    stop.innerHTML='<div style="width:'+dot+';height:'+dot+';border-radius:50%;background:'+dotBg+';border:3px solid '+ring+';box-shadow:'+glow+'"></div>'
+      +'<div class="mono" style="margin-top:9px;font-size:10px;letter-spacing:.08em;text-transform:uppercase;white-space:nowrap;color:'+label+'">'+s.name+'</div>'
+      +(state==='current'?'<div class="mono" style="margin-top:7px;font-size:9px;color:#b07d24;border:1px solid #e7d3a6;background:#fdf6e7;padding:3px 7px;border-radius:20px;white-space:nowrap">you are here</div>':'');
+    stops.appendChild(stop);
+  });
+  rail.appendChild(stops);box.appendChild(rail);
+  return box;
+}
+
+function renderArtifacts(card){
+  // The docs/<slug>/ home for this feature's workflow HTML outputs.
+  const s=slug(card.title);
+  const docsBase='docs/'+s+'/';
+  const stg=planStage(card).key;
+  const produced=(stg==='review'||stg==='shipped'); // outputs exist once work has shipped/in review
+  const box=el('<div class="artifacts" data-region="artifacts" data-visibility="public" data-has="'+produced+'"></div>');
+  box.appendChild(el('<div style="display:flex;align-items:baseline;gap:9px;margin-bottom:12px"><span class="mono" style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#a39c8c">What I built</span><span style="font-size:11.5px;color:#aaa291">workflow HTML outputs · '+esc(docsBase)+'</span></div>'));
+  if(produced){
+    const narrow=window.innerWidth<820;
+    const g=el('<div style="display:grid;grid-template-columns:'+(narrow?'1fr':'1fr 1fr')+';gap:12px"></div>');
+    [{kind:'what-i-built',label:'what-i-built.html',desc:'design + explainer for this feature'},
+     {kind:'demo',label:'demo-output.html',desc:'rendered sample output'}].forEach(art=>{
+      const a=el('<a href="'+attr(docsBase+art.label)+'" data-artifact="'+art.kind+'" class="artcard"></a>');
+      a.innerHTML='<span style="flex:none;width:30px;height:30px;border-radius:6px;background:#efe7d2;color:#9a6f22;display:inline-flex;align-items:center;justify-content:center;font-family:\'IBM Plex Mono\',monospace;font-size:13px">&#9671;</span>'
+        +'<span style="flex:1;min-width:0"><span class="mono" style="display:block;font-size:12.5px;color:#33302a;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(art.label)+'</span><span style="display:block;font-size:11.5px;color:#8c8576;margin-top:2px">'+esc(art.desc)+'</span></span>'
+        +'<span style="flex:none;color:#c2b89f">&#8599;</span>';
+      g.appendChild(a);
+    });
+    box.appendChild(g);
+  }else{
+    // EXPLICIT placeholder slot — make it clear this is where workflow HTML goes
+    box.appendChild(el('<div class="artslot" data-artifact="placeholder">No outputs yet. As this plan ships, its workflow HTML — a <span class="mono" style="color:#9a6f22">what-i-built.html</span> explainer and any demo/output pages — will appear here, rendered from <span class="mono" style="color:#9a6f22">'+esc(docsBase)+'</span> in the repo. Each build step can drop an HTML artifact into that folder to make the result easy to grok.</div>'));
+  }
+  return box;
+}
+
+function renderUnaffiliated(app){
+  const sec=el('<section data-view="unaffiliated" style="padding-top:30px"></section>');
+  sec.innerHTML='<div class="eyebrow">Unaffiliated</div><h1 class="title" style="font-style:italic;font-weight:400;font-size:clamp(26px,4vw,38px)">Repos without a product</h1><p class="lede">No active plans here. Assign one to a product when it earns a roadmap.</p>';
+  const list=el('<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:1px;background:#e6e0d5;border:1px solid #e6e0d5;border-radius:6px;overflow:hidden;margin-top:22px"></div>');
+  unaffiliated().forEach((r,i)=>{
+    const name=typeof r==='string'?r:(r.name||(r.slug?r.slug.split('/').pop():String(r)));
+    const wts=(r&&r.worktrees)||[];
+    const behind=wts.some(w=>(w.flags||[]).includes('behind-origin'));
+    const dirty=wts.some(w=>(w.dirty_files||0)>0);
+    const note=behind?'behind origin':(dirty?'uncommitted':'clean');
+    const noteColor=(behind||dirty)?'#a8916a':'#bcb4a3';
+    const row=el('<div data-repo="'+attr(name)+'" style="display:flex;align-items:center;justify-content:space-between;gap:10px;background:#fffdf9;padding:13px 15px"></div>');
+    row.innerHTML='<span class="mono" style="font-size:13px;color:#3b372f"><span style="color:#c2b89f;font-size:11px;margin-right:9px">'+String(i+1).padStart(2,'0')+'</span>'+esc(name)+'</span>'
+      +'<span class="mono" style="font-size:11px;color:'+noteColor+'">'+note+'</span>';
+    list.appendChild(row);
+  });
+  sec.appendChild(list);app.appendChild(sec);
 }
 
 function render(){
@@ -376,9 +705,11 @@ function render(){
   if(!DATA){app.appendChild(el('<p class="empty">No data — run <code>python3 collector.py</code>.</p>'));return;}
   if(STATE.level==='fleet') renderFleet(app);
   else if(STATE.level==='product') renderProduct(app);
+  else if(STATE.level==='repo') renderRepo(app);
   else if(STATE.level==='plan') renderPlan(app);
 }
-window.addEventListener('resize',()=>{if(STATE.level!=='fleet')render();});
+let _rt;
+window.addEventListener('resize',()=>{clearTimeout(_rt);_rt=setTimeout(render,120);});
 render();
 </script>
 </body>
