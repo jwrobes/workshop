@@ -10,6 +10,21 @@ straight from `file://` — no server, no CORS).
 > **Alpha.** Built and used, not hardened — see the repo root README's "alpha"
 > convention. v1 scope is the **Magic Me** product, then fan out.
 
+## What ships here
+
+| File | Role |
+|------|------|
+| `collector.py` | walks the workspace → `status.json` + `dashboard.html` |
+| `template.html` | the rendered dashboard (4-level + pipeline map) |
+| `fleet.config.json` | machine-/account-specific config (products, member_repos, paths) |
+| `run.sh` | regenerate + open the dashboard (one command) |
+| `fleet-doctor.py` | **terminal** health check — flags reapable/stale/orphan worktrees + plans without worktrees. Report-only, copy-paste reap commands, never executes. |
+| `skills/new-plan/` | start new work in fleet format — plan card (+ a `build-<slug>` worktree for LOCAL work; card-only + launch prompt for CLOUD work). The front door that keeps the fleet from drifting. |
+
+**Keeping the fleet healthy is two moves, not a repeated cleanup chore:**
+1. **Start new work via `new-plan`** so it lands in-format (card the dashboard reads; worktree named so it auto-links).
+2. **Check state via the dashboard (`./run.sh`) or `fleet-doctor.py`** — both surface what's mergeable/stale/drifted. Reaps are proposed, you approve.
+
 ## Quick start (including on a fresh machine)
 
 ```bash
