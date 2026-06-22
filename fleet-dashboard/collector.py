@@ -304,9 +304,39 @@ def parse_frontmatter_title(text):
     return None
 
 
-def _card(level, product_id, repo_name, status, title, path):
+def _plan_goal(text):
+    """Extract a one-line goal/highlight from a plan's markdown: the first
+    non-empty prose line under a Goal/Summary/Overview/Purpose heading, else
+    the first prose paragraph after the title/frontmatter. Best-effort."""
+    if not text:
+        return None
+    body = text
+    if body.lstrip().startswith("---"):
+        parts = body.split("---", 2)
+        if len(parts) == 3:
+            body = parts[2]
+    lines = body.splitlines()
+    keys = ("goal", "summary", "overview", "purpose", "objective", "what", "why")
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if s.startswith("#"):
+            head = s.lstrip("#").strip().lower().rstrip(":")
+            if any(head == k or head.startswith(k) for k in keys):
+                for nxt in lines[i + 1:]:
+                    t = nxt.strip()
+                    if t and not t.startswith("#"):
+                        return t.lstrip("-*> ").strip()[:300]
+    for ln in lines:
+        t = ln.strip()
+        if t and t[0] not in "#-*>":
+            return t[:300]
+    return None
+
+
+def _card(level, product_id, repo_name, status, title, path, text=""):
     return {"level": level, "product": product_id, "repo": repo_name,
-            "status": status, "title": title, "path": str(path)}
+            "status": status, "title": title, "path": str(path),
+            "goal": _plan_goal(text), "body": text or ""}
 
 
 def _kanban_local(base_dir, columns, level, product_id, repo_name):
@@ -320,7 +350,7 @@ def _kanban_local(base_dir, columns, level, product_id, repo_name):
         for md in sorted(col_dir.glob("*.md")):
             text = md.read_text(errors="replace")
             title = parse_frontmatter_title(text) or md.stem
-            cards.append(_card(level, product_id, repo_name, column, title, md))
+            cards.append(_card(level, product_id, repo_name, column, title, md, text))
     return cards
 
 
@@ -343,7 +373,7 @@ def _kanban_via_forge(forge, repo_slug, plans_path, columns, level, product_id, 
             except NotImplementedError:
                 text = ""
             title = parse_frontmatter_title(text) or name[:-3]
-            cards.append(_card(level, product_id, repo_name, column, title, path))
+            cards.append(_card(level, product_id, repo_name, column, title, path, text))
     return cards
 
 
@@ -487,19 +517,36 @@ def build_product_tree(cfg, clones, forge=None, allow_forge=False):
                                 {"slug": slug, "name": slug.split("/")[-1],
                                  "worktrees": []})
 
-        if org:
-            for c in clones:
-                if (c.get("org") or "") != org:
-                    continue
-                key = (c.get("slug") or c["name"]).lower()
-                if key == coord:
-                    claimed.add(c["name"])  # coordinator clone: not a sub-repo card
-                    continue
-                node = repo_map.setdefault(key, {"slug": c.get("slug"),
-                                                 "name": c["name"], "worktrees": []})
-                node["worktrees"] = c["worktrees"]
-                node["slug"] = c.get("slug") or node.get("slug")
+        # Membership: if `member_repos` is set, it's the AUTHORITATIVE whitelist
+        # (the product claims ONLY those slugs — org is ignored for membership).
+        # Otherwise fall back to org-match (org = product boundary, decision #4).
+        # This lets multiple products share one org by listing members explicitly.
+        explicit = {s.lower() for s in (p.get("member_repos") or [])}
+        use_whitelist = bool(explicit)
+        for slug in explicit:
+            repo_map.setdefault(slug, {"slug": slug, "name": slug.split("/")[-1],
+                                       "worktrees": []})
+
+        for c in clones:
+            c_slug = (c.get("slug") or "").lower()
+            c_org = (c.get("org") or "")
+            key = (c.get("slug") or c["name"]).lower()
+            # The coordinator is always claimed by its product (it's the Kanban
+            # home, never a sub-repo card and never unaffiliated) — regardless of
+            # whitelist/org membership rules below.
+            if key == coord:
                 claimed.add(c["name"])
+                continue
+            if use_whitelist:
+                if c_slug not in explicit:
+                    continue
+            elif not (org and c_org == org):
+                continue
+            node = repo_map.setdefault(key, {"slug": c.get("slug"),
+                                             "name": c["name"], "worktrees": []})
+            node["worktrees"] = c["worktrees"]
+            node["slug"] = c.get("slug") or node.get("slug")
+            claimed.add(c["name"])
 
         pid = p.get("id") or p.get("forge_org") or "unknown"
         products_out.append({
@@ -610,6 +657,13 @@ def main():
             continue
         base = default_branch(repo)
         slug = remote_slug(repo)
+        # Skip worktree-bin folders: a `<repo>_workspace` dir with NO remote is a
+        # holder for a project's worktrees, not a standalone repo. Its worktrees
+        # already surface under the parent clone, so it must not appear as its own
+        # repo/unaffiliated entry. (A `*_workspace` WITH a remote — e.g. a
+        # coordinator like improve_ai_dev_workspace — is a real repo; keep it.)
+        if repo.name.endswith("_workspace") and not slug:
+            continue
         clone = {"name": repo.name, "slug": slug,
                  "org": (slug.split("/")[0].lower() if slug else None),
                  "worktrees": []}

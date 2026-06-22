@@ -9,7 +9,13 @@
       "name": "Magic Me",
       "forge_org": "Jwrobes-Magic",
       "coordinator_repo": "Jwrobes-Magic/magic-me-workbench",
-      "coordinator_plans_path": "workbench/plans"
+      "coordinator_plans_path": "workbench/plans",
+      "member_repos": [
+        "Jwrobes-Magic/claw-playbook",
+        "Jwrobes-Magic/Yogada",
+        "Jwrobes-Magic/yogada-shop",
+        "jwrobes/wizard"
+      ]
     }
   ]
 }

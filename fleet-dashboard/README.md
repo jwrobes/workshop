@@ -10,6 +10,38 @@ straight from `file://` — no server, no CORS).
 > **Alpha.** Built and used, not hardened — see the repo root README's "alpha"
 > convention. v1 scope is the **Magic Me** product, then fan out.
 
+## What ships here
+
+| File | Role |
+|------|------|
+| `collector.py` | walks the workspace → `status.json` + `dashboard.html` |
+| `template.html` | the rendered dashboard (4-level + pipeline map) |
+| `fleet.config.json` | machine-/account-specific config (products, member_repos, paths) |
+| `run.sh` | regenerate + open the dashboard (one command) |
+| `fleet-doctor.py` | **terminal** health check — flags reapable/stale/orphan worktrees + plans without worktrees. Report-only, copy-paste reap commands, never executes. |
+| `skills/new-plan/` | start new work in fleet format — plan card (+ a `build-<slug>` worktree for LOCAL work; card-only + launch prompt for CLOUD work). The front door that keeps the fleet from drifting. |
+
+**Keeping the fleet healthy is two moves, not a repeated cleanup chore:**
+1. **Start new work via `new-plan`** so it lands in-format (card the dashboard reads; worktree named so it auto-links).
+2. **Check state via the dashboard (`./run.sh`) or `fleet-doctor.py`** — both surface what's mergeable/stale/drifted. Reaps are proposed, you approve.
+
+## Quick start (including on a fresh machine)
+
+```bash
+# 1. you need: python3, git, and gh (GitHub CLI, authenticated: `gh auth login`)
+# 2. point fleet.config.json at THIS machine's setup:
+#    - workspace_root: the dir holding your git clones (default ~/workspace)
+#    - products[].member_repos: the repo slugs that belong to each product
+#    (config is machine-/account-specific — edit it, don't assume the defaults)
+# 3. run it:
+./run.sh                 # regenerate + open the dashboard (auto-falls back to --no-gh if gh is missing)
+# or directly:
+python3 collector.py --out ~/.fleet && open ~/.fleet/dashboard.html
+```
+
+No install step, no third-party Python deps. Everything the dashboard needs is
+inlined into `dashboard.html`, so it opens from `file://` with no server.
+
 ## Why
 
 It's the single gate before overnight scheduling: visibility before autonomy.
@@ -103,7 +135,8 @@ Writes `status.json`, a dated `status-YYYY-MM-DD.json`, and the self-contained
 | `workspace_root` | dir of local git clones to walk |
 | `repo_plans_path` | per-repo plans dir (relative to each clone) |
 | `plan_columns` | Kanban columns = status values (`completed` and `done` both fine) |
-| `products[]` | `id`, `name`, `forge_org`, `coordinator_repo`, `coordinator_plans_path` |
+| `products[]` | `id`, `name`, `forge_org`, `coordinator_repo`, `coordinator_plans_path`, `member_repos` |
+| `products[].member_repos` | **Authoritative whitelist** of repo slugs in this product. When set, the product claims ONLY these (org is ignored for membership) — so multiple products can share one org, and cross-org members work (e.g. `jwrobes/wizard` in a `Jwrobes-Magic` product). When omitted, membership falls back to `forge_org` match. Repos in no product → the unaffiliated bucket. |
 
 ## Output shape (`status.json`)
 
@@ -123,6 +156,26 @@ worktrees in a "Needs attention" block at the top.
 
 ## Known limitations
 
+- **Local-first: it does NOT show specs/PRs/issues that have no local footprint.**
+  This is the biggest gap. Today the collector sees (a) local `plans/*.md` files
+  and (b) worktrees + the PR for each worktree's branch (`gh pr list --head`). It
+  does **not** independently query GitHub for *all* open PRs/issues in your repos.
+  So it is **blind to:**
+  - a **cloud-build spec** an agent is working on the web (no local worktree),
+  - an **open PR** on a branch you don't have checked out locally,
+  - an **issue-as-spec** sitting on GitHub with no local plan file or worktree.
+  A spec only appears if it has a local file OR a local worktree. (E.g. a closed
+  spec-PR shows only while its worktree still exists; reap the worktree and it
+  vanishes from the view even though the PR record lives on GitHub.)
+  **Fix (planned):** wire the forge-only data path — list PRs/issues per repo via
+  `gh` independent of local files, and surface any with no local match (this also
+  catches orphan PRs and cloud-initiated work). Tracked as the next initiative.
+- **Per-plan issue links + cloud/local path tags are inferred/stubbed.** Issue
+  links show "not wired yet"; the path tag (cloud/local) is best-effort from
+  branch/PR signals, not authoritative. Same forge-wiring task addresses these.
+- **Comprehension artifacts (the "what I built" slot) aren't auto-discovered.**
+  The L4 slot always renders (so it's clear where workflow HTML belongs), but the
+  collector doesn't yet scan `docs/` for actual artifacts.
 - **Offline `unprotected` is approximate.** Under `--no-gh` the collector can't
   know PR state, so a dirty/ahead-unmerged worktree may be flagged `unprotected`
   even when an open PR protects it. Faithful to the v1 engine.
