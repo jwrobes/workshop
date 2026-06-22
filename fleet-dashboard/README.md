@@ -10,6 +10,23 @@ straight from `file://` — no server, no CORS).
 > **Alpha.** Built and used, not hardened — see the repo root README's "alpha"
 > convention. v1 scope is the **Magic Me** product, then fan out.
 
+## Quick start (including on a fresh machine)
+
+```bash
+# 1. you need: python3, git, and gh (GitHub CLI, authenticated: `gh auth login`)
+# 2. point fleet.config.json at THIS machine's setup:
+#    - workspace_root: the dir holding your git clones (default ~/workspace)
+#    - products[].member_repos: the repo slugs that belong to each product
+#    (config is machine-/account-specific — edit it, don't assume the defaults)
+# 3. run it:
+./run.sh                 # regenerate + open the dashboard (auto-falls back to --no-gh if gh is missing)
+# or directly:
+python3 collector.py --out ~/.fleet && open ~/.fleet/dashboard.html
+```
+
+No install step, no third-party Python deps. Everything the dashboard needs is
+inlined into `dashboard.html`, so it opens from `file://` with no server.
+
 ## Why
 
 It's the single gate before overnight scheduling: visibility before autonomy.
@@ -103,7 +120,8 @@ Writes `status.json`, a dated `status-YYYY-MM-DD.json`, and the self-contained
 | `workspace_root` | dir of local git clones to walk |
 | `repo_plans_path` | per-repo plans dir (relative to each clone) |
 | `plan_columns` | Kanban columns = status values (`completed` and `done` both fine) |
-| `products[]` | `id`, `name`, `forge_org`, `coordinator_repo`, `coordinator_plans_path` |
+| `products[]` | `id`, `name`, `forge_org`, `coordinator_repo`, `coordinator_plans_path`, `member_repos` |
+| `products[].member_repos` | **Authoritative whitelist** of repo slugs in this product. When set, the product claims ONLY these (org is ignored for membership) — so multiple products can share one org, and cross-org members work (e.g. `jwrobes/wizard` in a `Jwrobes-Magic` product). When omitted, membership falls back to `forge_org` match. Repos in no product → the unaffiliated bucket. |
 
 ## Output shape (`status.json`)
 
