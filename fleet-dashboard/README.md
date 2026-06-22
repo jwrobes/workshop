@@ -156,6 +156,26 @@ worktrees in a "Needs attention" block at the top.
 
 ## Known limitations
 
+- **Local-first: it does NOT show specs/PRs/issues that have no local footprint.**
+  This is the biggest gap. Today the collector sees (a) local `plans/*.md` files
+  and (b) worktrees + the PR for each worktree's branch (`gh pr list --head`). It
+  does **not** independently query GitHub for *all* open PRs/issues in your repos.
+  So it is **blind to:**
+  - a **cloud-build spec** an agent is working on the web (no local worktree),
+  - an **open PR** on a branch you don't have checked out locally,
+  - an **issue-as-spec** sitting on GitHub with no local plan file or worktree.
+  A spec only appears if it has a local file OR a local worktree. (E.g. a closed
+  spec-PR shows only while its worktree still exists; reap the worktree and it
+  vanishes from the view even though the PR record lives on GitHub.)
+  **Fix (planned):** wire the forge-only data path — list PRs/issues per repo via
+  `gh` independent of local files, and surface any with no local match (this also
+  catches orphan PRs and cloud-initiated work). Tracked as the next initiative.
+- **Per-plan issue links + cloud/local path tags are inferred/stubbed.** Issue
+  links show "not wired yet"; the path tag (cloud/local) is best-effort from
+  branch/PR signals, not authoritative. Same forge-wiring task addresses these.
+- **Comprehension artifacts (the "what I built" slot) aren't auto-discovered.**
+  The L4 slot always renders (so it's clear where workflow HTML belongs), but the
+  collector doesn't yet scan `docs/` for actual artifacts.
 - **Offline `unprotected` is approximate.** Under `--no-gh` the collector can't
   know PR state, so a dirty/ahead-unmerged worktree may be flagged `unprotected`
   even when an open PR protects it. Faithful to the v1 engine.
