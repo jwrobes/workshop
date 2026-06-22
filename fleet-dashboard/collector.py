@@ -79,6 +79,24 @@ def remote_slug(repo):
     return m.group(1) if m else None
 
 
+def _find_clone_by_slug(workspace_root, slug):
+    """Return the local clone dir whose git remote matches `slug`
+    (case-insensitive), or None. Maps a repo to its on-disk folder by its
+    durable git identity, not by folder name (which may differ from the repo
+    name). Mirrors how the repo-level Kanban reader attributes by remote org.
+    """
+    if not slug:
+        return None
+    target = slug.lower()
+    workspace_root = Path(workspace_root)
+    if not workspace_root.is_dir():
+        return None
+    for d in sorted(workspace_root.iterdir()):
+        if (d / ".git").is_dir() and (remote_slug(d) or "").lower() == target:
+            return d
+    return None
+
+
 def dirty_count(path):
     code, out = git(path, "status", "--porcelain")
     return len(out.splitlines()) if code == 0 and out else 0
@@ -373,8 +391,16 @@ def collect_kanban(cfg, workspace_root, forge=None, use_forge=False):
             cards += _kanban_via_forge(forge, coord_repo, coord_path, columns,
                                        "product", p["id"], None)
         else:
-            coord_name = coord_repo.split("/")[-1]
-            base = workspace_root / coord_name / coord_path
+            # Resolve the coordinator's LOCAL dir by matching its git remote
+            # slug to coordinator_repo — NOT by assuming the folder name equals
+            # the repo name. A local checkout is often named differently from
+            # its repo (the on-disk folder vs the remote slug), so a
+            # name-equality assumption silently reads zero product-level cards.
+            # The repo-level reader below already maps by remote; do the same here.
+            coord_dir = _find_clone_by_slug(workspace_root, coord_repo)
+            if coord_dir is None:
+                coord_dir = workspace_root / coord_repo.split("/")[-1]  # fallback
+            base = coord_dir / coord_path
             cards += _kanban_local(base, columns, "product", p["id"], None)
 
     # Repo level — each member repo's plans.
