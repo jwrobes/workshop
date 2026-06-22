@@ -304,9 +304,39 @@ def parse_frontmatter_title(text):
     return None
 
 
-def _card(level, product_id, repo_name, status, title, path):
+def _plan_goal(text):
+    """Extract a one-line goal/highlight from a plan's markdown: the first
+    non-empty prose line under a Goal/Summary/Overview/Purpose heading, else
+    the first prose paragraph after the title/frontmatter. Best-effort."""
+    if not text:
+        return None
+    body = text
+    if body.lstrip().startswith("---"):
+        parts = body.split("---", 2)
+        if len(parts) == 3:
+            body = parts[2]
+    lines = body.splitlines()
+    keys = ("goal", "summary", "overview", "purpose", "objective", "what", "why")
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if s.startswith("#"):
+            head = s.lstrip("#").strip().lower().rstrip(":")
+            if any(head == k or head.startswith(k) for k in keys):
+                for nxt in lines[i + 1:]:
+                    t = nxt.strip()
+                    if t and not t.startswith("#"):
+                        return t.lstrip("-*> ").strip()[:300]
+    for ln in lines:
+        t = ln.strip()
+        if t and t[0] not in "#-*>":
+            return t[:300]
+    return None
+
+
+def _card(level, product_id, repo_name, status, title, path, text=""):
     return {"level": level, "product": product_id, "repo": repo_name,
-            "status": status, "title": title, "path": str(path)}
+            "status": status, "title": title, "path": str(path),
+            "goal": _plan_goal(text), "body": text or ""}
 
 
 def _kanban_local(base_dir, columns, level, product_id, repo_name):
@@ -320,7 +350,7 @@ def _kanban_local(base_dir, columns, level, product_id, repo_name):
         for md in sorted(col_dir.glob("*.md")):
             text = md.read_text(errors="replace")
             title = parse_frontmatter_title(text) or md.stem
-            cards.append(_card(level, product_id, repo_name, column, title, md))
+            cards.append(_card(level, product_id, repo_name, column, title, md, text))
     return cards
 
 
@@ -343,7 +373,7 @@ def _kanban_via_forge(forge, repo_slug, plans_path, columns, level, product_id, 
             except NotImplementedError:
                 text = ""
             title = parse_frontmatter_title(text) or name[:-3]
-            cards.append(_card(level, product_id, repo_name, column, title, path))
+            cards.append(_card(level, product_id, repo_name, column, title, path, text))
     return cards
 
 

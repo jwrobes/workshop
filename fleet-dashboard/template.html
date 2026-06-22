@@ -1,172 +1,385 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Fleet Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Spectral:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
-  :root { color-scheme: light dark; --line:#8884; --muted:#888; --accent:#1976d2; }
-  * { box-sizing: border-box; }
-  body { font-family: system-ui, -apple-system, sans-serif; max-width: 1000px;
-         margin: 0 auto; padding: 1rem 1rem 4rem; line-height: 1.45; }
-  h1 { margin: 0 0 .15rem; font-size: 1.4rem; }
-  .meta { color: var(--muted); font-size: .85rem; margin-bottom: 1rem; }
-  .badge { display:inline-block; font-size:.7rem; padding:.05rem .45rem; border-radius:999px;
-           background:#1976d222; color:var(--accent); margin-left:.4rem; vertical-align:middle; }
-  .counts { display:flex; flex-wrap:wrap; gap:.5rem 1.2rem; font-size:.85rem; margin-bottom:1.2rem; }
-  .counts b { font-size:1.05rem; }
-  h2 { margin: 1.8rem 0 .5rem; font-size: 1.15rem; border-bottom: 2px solid var(--line); padding-bottom:.25rem; }
-  h3 { margin: 1.1rem 0 .35rem; font-size: 1rem; }
-  h3 .slug { color: var(--muted); font-weight: 400; font-size: .8rem; }
-  .repo { border-left: 3px solid var(--line); padding-left: .8rem; margin: .6rem 0 1rem; }
-  table { border-collapse: collapse; width: 100%; font-size: .85rem; }
-  th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
-  th { font-weight: 600; color: var(--muted); font-size:.78rem; text-transform:uppercase; letter-spacing:.03em; }
-  code { font-family: ui-monospace, monospace; font-size: .9em; }
-  .flag { display:inline-block; background:#c0392b22; color:#c0392b; border-radius:3px;
-          padding:0 .35rem; margin:0 .2rem .15rem 0; font-size:.74rem; white-space:nowrap; }
-  .flag.merged-but-not-removed { background:#8e44ad22; color:#8e44ad; }
-  .flag.stale { background:#e67e2222; color:#e67e22; }
-  .flag.behind-origin { background:#16a08522; color:#16a085; }
-  .card { display:inline-block; background:#2e7d3222; color:#2e7d32; border-radius:3px;
-          padding:0 .4rem; font-size:.78rem; }
-  .col { display:inline-block; font-size:.7rem; color:var(--muted); border:1px solid var(--line);
-         border-radius:3px; padding:0 .3rem; margin-left:.3rem; text-transform:uppercase; }
-  .kanban { display:flex; flex-wrap:wrap; gap:.4rem; margin:.25rem 0 .5rem; }
-  .kcard { font-size:.8rem; border:1px solid var(--line); border-radius:4px; padding:.15rem .5rem; }
-  .kcard .st { color:var(--muted); font-size:.7rem; text-transform:uppercase; margin-left:.35rem; }
-  .kcard.unlinked { border-style:dashed; }
-  .empty { color: var(--muted); font-style: italic; font-size:.85rem; }
-  .attention { background:#c0392b11; border:1px solid #c0392b44; border-radius:6px; padding:.6rem .8rem; margin-bottom:1.2rem; }
-  .attention h2 { border:0; margin:.1rem 0 .4rem; font-size:1rem; color:#c0392b; }
-  .attention li { font-size:.85rem; margin:.15rem 0; }
-  a { color: var(--accent); }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{background:#f7f4ee;color:#23211c;font-family:'IBM Plex Sans',system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+  @keyframes viewIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+  @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+  ::-webkit-scrollbar{height:9px;width:9px}
+  ::-webkit-scrollbar-thumb{background:#d8d0c2;border-radius:6px}
+  ::-webkit-scrollbar-track{background:transparent}
+  a{color:inherit}
+  .mono{font-family:'IBM Plex Mono',monospace}
+  .serif{font-family:'Spectral',serif}
+  .wrap{width:100%;max-width:1080px;margin:0 auto;padding:0 20px 80px}
+  header.top{display:flex;align-items:baseline;justify-content:space-between;gap:16px;padding:26px 0 22px;border-bottom:1px solid #e6e0d5;flex-wrap:wrap}
+  .crumbs{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+  .crumb{all:unset;cursor:pointer;font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.06em;white-space:nowrap}
+  .crumb.root{letter-spacing:.18em;text-transform:uppercase;color:#9a9384}
+  .sep{color:#cabfa9;font-size:12px}
+  .stamp{font-family:'IBM Plex Mono',monospace;font-size:11px;color:#a8a191;letter-spacing:.04em}
+  section{animation:viewIn .3s ease}
+  .eyebrow{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:#b08d4e;margin-bottom:12px}
+  h1.title{font-family:'Spectral',serif;font-weight:400;font-size:clamp(30px,5vw,46px);line-height:1.05;margin:0;letter-spacing:-.01em}
+  .lede{font-size:15px;color:#736c5e;margin:14px 0 0;max-width:52ch;line-height:1.5}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(248px,1fr));gap:16px;margin-top:30px}
+  .pcard{all:unset;cursor:pointer;position:relative;display:flex;flex-direction:column;justify-content:space-between;min-height:172px;background:#fffdf9;border:1px solid #e9e3d7;border-radius:6px;padding:20px;box-shadow:0 1px 2px rgba(60,50,30,.03);transition:transform .15s,box-shadow .15s,border-color .15s}
+  .pcard:hover{border-color:#d8cfbd;box-shadow:0 6px 20px rgba(60,50,30,.07);transform:translateY(-2px)}
+  .edge{position:absolute;left:0;top:18px;bottom:18px;width:3px;border-radius:0 3px 3px 0}
+  .pname{font-family:'Spectral',serif;font-size:23px;font-weight:500;line-height:1.12;letter-spacing:-.01em}
+  .prepo{font-family:'IBM Plex Mono',monospace;font-size:11px;color:#a39c8c;margin-top:7px}
+  .pbig{font-family:'Spectral',serif;font-size:30px;font-weight:500;line-height:1}
+  .pfoot{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-top:18px}
+  .clear{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;color:#5d8a6f;font-family:'IBM Plex Mono',monospace}
+  .clear .ring{width:15px;height:15px;border-radius:50%;border:1.5px solid #7faa8c;display:inline-flex;align-items:center;justify-content:center;font-size:9px}
+  .attn{display:inline-flex;align-items:center;gap:6px;font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:#a9762a}
+  .attn .dot{width:8px;height:8px;border-radius:50%;background:#cf962f;box-shadow:0 0 0 4px rgba(207,150,47,.15)}
+  .ubucket{all:unset;cursor:pointer;display:flex;flex-direction:column;justify-content:space-between;min-height:172px;background:transparent;border:1px dashed #d3cab8;border-radius:6px;padding:20px;transition:background .15s,border-color .15s}
+  .ubucket:hover{background:#faf6ee;border-color:#c2b89f}
+  .na{margin-top:26px;border:1px solid #e7d3a6;background:linear-gradient(#fffdf6,#fdf7e9);border-radius:8px;overflow:hidden}
+  .na-h{display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid #efe0bd}
+  .na-item{all:unset;cursor:pointer;display:flex;align-items:center;gap:14px;width:100%;box-sizing:border-box;padding:13px 18px;border-bottom:1px solid #f1e6c9}
+  .na-item:hover{background:#fdf6e4}
+  .tag{flex:none;width:78px;font-family:'IBM Plex Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;padding:4px 7px;border-radius:4px;text-align:center}
+  .board{margin-top:34px;display:grid;gap:16px;align-items:start}
+  .col-h{display:flex;align-items:baseline;gap:8px;margin-bottom:12px}
+  .col-h .lbl{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.14em;text-transform:uppercase}
+  .col-h .n{font-family:'IBM Plex Mono',monospace;font-size:11px;color:#b3ab9b}
+  .kcard{all:unset;cursor:pointer;position:relative;display:block;background:#fffdf9;border:1px solid #e7e0d2;border-radius:6px;padding:13px 14px;box-shadow:0 1px 2px rgba(60,50,30,.03);transition:box-shadow .12s,border-color .12s}
+  .kcard:hover{border-color:#d4cab8;box-shadow:0 5px 16px rgba(60,50,30,.07)}
+  .kcard .t{display:block;font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:#33302a;line-height:1.35;overflow-wrap:anywhere}
+  .kmeta{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:9px}
+  .prpill{display:inline-flex;align-items:center;gap:6px;font-family:'IBM Plex Mono',monospace;font-size:10.5px}
+  .prpill .d{width:6px;height:6px;border-radius:50%}
+  .bcard{all:unset;cursor:pointer;display:block;background:#faf6ee;border:1px dashed #ddd4c2;border-radius:6px;padding:12px 13px}
+  .bcard:hover{background:#fffdf9;border-color:#c7bca6}
+  .ccard{all:unset;cursor:pointer;display:flex;align-items:center;gap:9px;padding:9px 12px;border-radius:6px;border:1px solid #ece5d8;background:#fbf8f2}
+  .ccard:hover{border-color:#dcd3c2;background:#fff}
+  .colstack{display:flex;flex-direction:column;gap:10px}
+  .planhead{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .statuspill{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.12em;text-transform:uppercase;padding:4px 9px;border-radius:5px}
+  .l3grid{display:grid;gap:22px;margin-top:26px;align-items:start}
+  .links{border:1px solid #e9e3d7;border-radius:8px;overflow:hidden;background:#fffdf9}
+  .lrow{display:flex;align-items:center;gap:13px;text-decoration:none;color:inherit;padding:13px 16px;border-bottom:1px solid #f1ece1}
+  .lrow:last-child{border-bottom:none}
+  .lk{flex:none;width:64px;font-family:'IBM Plex Mono',monospace;font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;color:#9a917f}
+  .lv{flex:1;min-width:0;font-family:'IBM Plex Mono',monospace;font-size:13px;color:#3b372f;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .localonly{margin-top:14px;border:1px dashed #ddd4c2;border-radius:8px;padding:14px 16px;background:#faf6ee}
+  .handoff{border:1px solid #e1d8c6;border-radius:8px;background:linear-gradient(#2c2a24,#262420);color:#efe9dd;overflow:hidden}
+  .handoff pre{margin:14px 0 0;padding:14px 17px;font-family:'IBM Plex Mono',monospace;font-size:11px;line-height:1.55;color:#d8d1c2;white-space:pre-wrap;word-break:break-word;border-top:1px solid #3a3730;background:#211f1b;max-height:260px;overflow:auto}
+  .copybtn{all:unset;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;width:100%;box-sizing:border-box;background:#d7a23f;color:#241f12;font-family:'IBM Plex Mono',monospace;font-size:12px;letter-spacing:.04em;padding:11px;border-radius:6px;font-weight:500}
+  .copybtn:hover{background:#e2b256}
+  .backbtn{all:unset;cursor:pointer;display:inline-flex;align-items:center;gap:8px;margin-top:26px;font-family:'IBM Plex Mono',monospace;font-size:12px;color:#8c8576}
+  .backbtn:hover{color:#3b372f}
+  .empty{color:#8c8576;padding:60px 0;text-align:center}
+  .muted{color:#a39c8c}
+  .md{font-size:14.5px;line-height:1.65;color:#3a352d;max-width:70ch}
+  .md .md-h{font-family:'Spectral',serif;font-weight:600;line-height:1.25;margin:22px 0 8px;color:#2a2722}
+  .md h1.md-h{font-size:24px} .md h2.md-h{font-size:19px} .md h3.md-h{font-size:16px}
+  .md h4.md-h,.md h5.md-h,.md h6.md-h{font-size:14px;text-transform:uppercase;letter-spacing:.04em;color:#6e6757}
+  .md .md-p{margin:9px 0}
+  .md .md-ul{margin:9px 0;padding-left:22px} .md .md-ul li{margin:4px 0}
+  .md code{font-family:'IBM Plex Mono',monospace;font-size:.88em;background:#f0ebe0;padding:.1em .35em;border-radius:4px}
+  .md .md-pre{background:#262420;color:#e4ddcf;border-radius:6px;padding:13px 15px;overflow:auto;font-size:12.5px;line-height:1.5}
+  .md .md-pre code{background:none;padding:0;color:inherit}
+  .md a{color:#9a6f22;text-decoration:underline}
 </style>
 </head>
 <body>
-<h1>Fleet Dashboard <span class="badge" id="mode"></span></h1>
-<p class="meta" id="meta"></p>
-<div class="counts" id="counts"></div>
-<div id="attention"></div>
-<div id="app"></div>
+<div class="wrap">
+  <header class="top">
+    <div class="crumbs" id="crumbs"></div>
+    <div class="stamp" id="stamp"></div>
+  </header>
+  <div id="app"></div>
+</div>
 
 <script>
-// Self-contained: the collector replaces the token below with the status JSON,
-// so this page works from file:// with no fetch / no CORS.
 const DATA = /*__DATA__*/null;
 
-(function () {
-  const $ = (id) => document.getElementById(id);
-  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g,
-    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-  if (!DATA) { $("app").innerHTML = '<p class="empty">No data — run <code>python3 collector.py</code>.</p>'; return; }
+function el(html){const t=document.createElement('template');t.innerHTML=html.trim();return t.content.firstChild;}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+// tiny, safe markdown -> html (escapes first, then applies a minimal subset)
+function mdToHtml(src){
+  if(!src) return '';
+  let s=src;
+  // strip leading frontmatter
+  if(s.replace(/^\s+/,'').startsWith('---')){const p=s.split('---');if(p.length>=3){s=p.slice(2).join('---');}}
+  s=esc(s);
+  const lines=s.split('\n');const out=[];let inCode=false,inList=false;
+  const inline=t=>t
+    .replace(/`([^`]+)`/g,'<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>')
+    .replace(/(^|[^*])\*([^*]+)\*/g,'$1<em>$2</em>')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
+  for(let raw of lines){
+    if(raw.trim().startsWith('```')){ if(inList){out.push('</ul>');inList=false;} inCode=!inCode; out.push(inCode?'<pre class="md-pre"><code>':'</code></pre>'); continue; }
+    if(inCode){ out.push(raw); continue; }
+    const h=raw.match(/^(#{1,6})\s+(.*)$/);
+    if(h){ if(inList){out.push('</ul>');inList=false;} const lvl=h[1].length; out.push('<h'+lvl+' class="md-h">'+inline(h[2])+'</h'+lvl+'>'); continue; }
+    const li=raw.match(/^\s*[-*]\s+(.*)$/);
+    if(li){ if(!inList){out.push('<ul class="md-ul">');inList=true;} out.push('<li>'+inline(li[1])+'</li>'); continue; }
+    if(raw.trim()===''){ if(inList){out.push('</ul>');inList=false;} continue; }
+    if(inList){out.push('</ul>');inList=false;}
+    out.push('<p class="md-p">'+inline(raw)+'</p>');
+  }
+  if(inList)out.push('</ul>'); if(inCode)out.push('</code></pre>');
+  return out.join('\n');
+}
+function $(id){return document.getElementById(id);}
 
-  const products = DATA.products || [];
-  const unaffiliated = DATA.unaffiliated || [];
-  const kanban = DATA.kanban || [];
-  const worktrees = DATA.worktrees || [];
+const STATE={level:'fleet',productId:null,planId:null,doneOpen:false};
 
-  // ---- header ----
-  $("mode").textContent = DATA.mode || "local";
-  const repoCount = products.reduce((n, p) => n + (p.repos || []).length, 0) + unaffiliated.length;
-  const flagged = worktrees.filter((w) => (w.flags || []).length);
-  const counts = [
-    ["Products", products.length], ["Repos", repoCount],
-    ["Worktrees", worktrees.length], ["Plan cards", kanban.length],
-    ["Flagged", flagged.length],
-  ];
-  $("meta").textContent = "Generated " + (DATA.generated_at || "");
-  $("counts").innerHTML = counts.map(([k, v]) => `<span><b>${v}</b> ${k}</span>`).join("");
+function products(){return (DATA&&DATA.products)||[];}
+function kanban(){return (DATA&&DATA.kanban)||[];}
+function worktrees(){return (DATA&&DATA.worktrees)||[];}
+function unaffiliated(){return (DATA&&DATA.unaffiliated)||[];}
+function plansFor(pid){return kanban().filter(c=>c.product===pid);}
 
-  // ---- needs-attention triage ----
-  if (flagged.length) {
-    const items = flagged.map((w) =>
-      `<li><code>${esc(w.repo)}</code> / <code>${esc(w.branch)}</code> ${flagHtml(w.flags)}</li>`).join("");
-    $("attention").innerHTML =
-      `<div class="attention"><h2>⚠ Needs attention (${flagged.length})</h2><ul>${items}</ul></div>`;
+function worktreeForCard(card){
+  const t=(card.title||'').toLowerCase();
+  if(!t) return null;
+  for(const w of worktrees()){
+    const hay=((w.branch||'')+' '+(w.path||'')+' '+(w.card||'')).toLowerCase();
+    if(hay.includes(t)) return w;
   }
+  return null;
+}
+function cardAttention(card){
+  if(card.status==='blocked') return {type:'blocked'};
+  const w=worktreeForCard(card);
+  if(w){
+    if(w.pr&&w.pr.state==='OPEN') return {type:'pr-review',w};
+    if((w.flags||[]).includes('merged-but-not-removed')) return {type:'worktree',w};
+  }
+  return null;
+}
+function productActive(pid){return plansFor(pid).filter(c=>c.status==='active').length;}
+function productAttention(pid){return plansFor(pid).filter(c=>cardAttention(c)).length;}
 
-  // ---- kanban helpers ----
-  function cardsFor(level, productId, repoName) {
-    return kanban.filter((c) => c.level === level && c.product === productId
-      && (repoName == null || c.repo === repoName));
-  }
-  function kanbanHtml(cards) {
-    if (!cards.length) return "";
-    return `<div class="kanban">` + cards.map((c) =>
-      `<span class="kcard ${c.has_worktree ? "" : "unlinked"}">${esc(c.title)}`
-      + `<span class="st">${esc(c.status)}</span></span>`).join("") + `</div>`;
-  }
-  function flagHtml(flags) {
-    return (flags || []).map((f) => `<span class="flag ${esc(f)}">${esc(f)}</span>`).join("");
-  }
+function prMeta(pr){
+  if(!pr||!pr.state) return {label:'no PR',color:'#a39c8c',dot:'#cabfa9'};
+  if(pr.state==='OPEN') return {label:'PR #'+pr.number+' open',color:'#9a6f22',dot:'#cf962f'};
+  if(pr.state==='MERGED') return {label:'PR #'+pr.number+' merged',color:'#5d8a6f',dot:'#7faa8c'};
+  if(pr.state==='CLOSED') return {label:'PR #'+pr.number+' closed',color:'#a39c8c',dot:'#cabfa9'};
+  return {label:'PR',color:'#6e6757',dot:'#b9b0a0'};
+}
+function attnMeta(type){
+  if(type==='pr-review') return {tag:'review',color:'#9a6f22',bg:'#f6ecd6',action:'Review & merge the open PR'};
+  if(type==='blocked') return {tag:'blocked',color:'#a85a39',bg:'#f4e3da',action:'Unblock this plan'};
+  return {tag:'worktree',color:'#7a6a3f',bg:'#efe7d2',action:'Remove the merged worktree'};
+}
 
-  // ---- worktree / PR table per repo ----
-  function worktreeTable(repo) {
-    const wts = (repo.worktrees || []).filter((w) => w.kind === "worktree");
-    if (wts.length) {
-      const body = wts.map((w) => `<tr>
-        <td><code>${esc(w.branch)}</code></td>
-        <td>${w.merged === true ? "✓" : ""} ${fmtAheadBehind(w)}</td>
-        <td>${w.card ? `<span class="card">${esc(w.card.title)}</span>` : '<span class="empty">no card</span>'}</td>
-        <td>${prHtml(w.pr)}</td>
-        <td>${flagHtml(w.flags)}</td>
-      </tr>`).join("");
-      return `<table><thead><tr><th>Worktree</th><th>State</th><th>Plan card</th><th>PR</th><th>Flags</th></tr></thead><tbody>${body}</tbody></table>`;
-    }
-    if (repo.prs && repo.prs.length) {  // forge-only mode: show PRs
-      const body = repo.prs.map((p) => `<tr><td>#${esc(p.number)}</td><td>${esc(p.state)}</td></tr>`).join("");
-      return `<table><thead><tr><th>PR</th><th>State</th></tr></thead><tbody>${body}</tbody></table>`;
-    }
-    return `<p class="empty">no worktrees</p>`;
-  }
-  function fmtAheadBehind(w) {
-    const bits = [];
-    if (w.ahead) bits.push("↑" + w.ahead);
-    if (w.behind) bits.push("↓" + w.behind);
-    return bits.join(" ");
-  }
-  function prHtml(pr) {
-    if (!pr) return "";
-    return `<code>#${esc(pr.number)}</code> ${esc(pr.state)}`;
-  }
+function buildPrompt(card,prod){
+  const w=worktreeForCard(card),L=[];
+  L.push('Pick up and continue this plan autonomously.');L.push('');
+  L.push('Plan: '+card.title);
+  L.push('Product: '+(prod?prod.name:card.product)+'  ·  Repo: '+(card.repo||'(product-level)'));
+  if(card.path) L.push('Plan doc: '+card.path);
+  if(w){L.push('Branch: '+(w.branch||'—'));if(w.path)L.push('Worktree: '+w.path);if(w.pr&&w.pr.number)L.push('PR: #'+w.pr.number+' ('+(w.pr.state||'').toLowerCase()+')');}
+  const a=cardAttention(card);if(a)L.push('Next action: '+attnMeta(a.type).action);
+  L.push('');L.push('Read the plan doc first, then continue the work. Keep commits small. Open or update the PR when ready and report back.');
+  return L.join('\n');
+}
 
-  // ---- repo block ----
-  function repoBlock(productId, repo) {
-    const cards = productId ? cardsFor("repo", productId, repo.name) : [];
-    return `<div class="repo"><h3><code>${esc(repo.name)}</code>`
-      + (repo.slug ? ` <span class="slug">${esc(repo.slug)}</span>` : "") + `</h3>`
-      + kanbanHtml(cards) + worktreeTable(repo) + `</div>`;
-  }
+function goTo(level,productId,planId){STATE.level=level;STATE.productId=productId??null;STATE.planId=planId??null;STATE.doneOpen=false;window.scrollTo({top:0});render();}
 
-  // ---- render products ----
-  let html = "";
-  for (const p of products) {
-    html += `<h2>${esc(p.name)}</h2>`;
-    const prodCards = cardsFor("product", p.id, null);
-    if (prodCards.length) html += `<div><strong>Product plans</strong>${kanbanHtml(prodCards)}</div>`;
-    if (p.coordinator_repo) html += `<p class="meta">Kanban home: <code>${esc(p.coordinator_repo)}</code></p>`;
-    const repos = p.repos || [];
-    html += repos.length ? repos.map((r) => repoBlock(p.id, r)).join("")
-                         : `<p class="empty">no member repos</p>`;
+function renderCrumbs(){
+  const c=$('crumbs');c.innerHTML='';
+  const root=el('<button class="crumb root">fleet</button>');root.onclick=()=>goTo('fleet');c.appendChild(root);
+  if(STATE.level!=='fleet'){
+    const pid=STATE.productId;
+    const pname=pid==='unaffiliated'?'unaffiliated':((products().find(p=>p.id===pid)||{}).name||pid);
+    c.appendChild(el('<span class="sep">/</span>'));
+    const pb=el('<button class="crumb" style="color:'+(STATE.level==='product'?'#23211c':'#9a9384')+'">'+esc(pname)+'</button>');
+    pb.onclick=()=>goTo('product',pid);c.appendChild(pb);
+    if(STATE.level==='plan'){c.appendChild(el('<span class="sep">/</span>'));c.appendChild(el('<button class="crumb" style="color:#23211c">'+esc(STATE.planId)+'</button>'));}
   }
+}
 
-  if (unaffiliated.length) {
-    html += `<h2>Unaffiliated <span class="col">no product</span></h2>`;
-    html += unaffiliated.map((r) => repoBlock(null, r)).join("");
+function renderFleet(app){
+  const ps=products();
+  const totalActive=ps.reduce((n,p)=>n+productActive(p.id),0);
+  const totalAttn=ps.reduce((n,p)=>n+productAttention(p.id),0);
+  const sec=el('<section></section>');
+  sec.innerHTML='<div style="padding:34px 0 8px"><div class="eyebrow">The fleet</div>'
+    +'<h1 class="title">Where things stand</h1>'
+    +'<p class="lede">'+totalActive+' plans in flight across '+ps.length+' products. '
+    +(totalAttn===0?'Everything is healthy.':totalAttn+' item'+(totalAttn===1?'':'s')+' want a decision from you — everything else is healthy.')+'</p></div>';
+  const grid=el('<div class="grid"></div>');
+  ps.forEach(p=>{
+    const ac=productActive(p.id),at=productAttention(p.id),edge=at>0?'#d7a23f':'#7faa8c';
+    const repoLine=(p.repos||[]).length+' repo'+((p.repos||[]).length===1?'':'s');
+    const card=el('<button class="pcard" data-product="'+esc(p.id)+'" data-active-plans="'+ac+'" data-attention="'+at+'"></button>');
+    card.innerHTML='<span class="edge" style="background:'+edge+'"></span>'
+      +'<div><span class="pname">'+esc(p.name)+'</span><div class="prepo">'+esc(repoLine)+'</div></div>'
+      +'<div class="pfoot"><div style="display:flex;align-items:baseline;gap:7px"><span class="pbig">'+ac+'</span>'
+      +'<span style="font-size:12px;color:#8c8576">'+(ac===1?'active plan':'active plans')+'</span></div>'
+      +(at>0?'<span class="attn"><span class="dot"></span>'+at+' to clear</span>':'<span class="clear"><span class="ring">&#10003;</span>clear</span>')
+      +'</div>';
+    card.onclick=()=>goTo('product',p.id);grid.appendChild(card);
+  });
+  const u=el('<button class="ubucket" data-product="unaffiliated"></button>');
+  u.innerHTML='<div><span class="serif" style="font-size:21px;font-weight:500;font-style:italic;color:#6e6757">unaffiliated</span><div class="prepo">no product yet</div></div>'
+    +'<div style="display:flex;align-items:baseline;gap:7px"><span class="pbig" style="color:#6e6757">'+unaffiliated().length+'</span><span style="font-size:12px;color:#8c8576">repos</span></div>';
+  u.onclick=()=>goTo('product','unaffiliated');grid.appendChild(u);
+  sec.appendChild(grid);app.appendChild(sec);
+}
+
+function renderProduct(app){
+  if(STATE.productId==='unaffiliated') return renderUnaffiliated(app);
+  const p=products().find(x=>x.id===STATE.productId)||{repos:[]};
+  const sec=el('<section style="padding-top:30px"></section>');
+  const repoNames=(p.repos||[]).map(r=>(r.slug||'').split('/').pop()).join(' · ');
+  sec.innerHTML='<div class="eyebrow" style="color:#a39c8c;letter-spacing:.16em">'+esc(repoNames)+'</div><h1 class="title" style="font-weight:500">'+esc(p.name)+'</h1>';
+  const plans=plansFor(p.id);
+  const attnPlans=plans.filter(c=>cardAttention(c));
+  if(attnPlans.length){
+    const na=el('<div class="na" data-region="needs-attention" data-count="'+attnPlans.length+'"></div>');
+    na.appendChild(el('<div class="na-h"><span style="width:9px;height:9px;border-radius:50%;background:#cf962f;box-shadow:0 0 0 4px rgba(207,150,47,.16)"></span>'
+      +'<span class="mono" style="font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#a9762a">Needs attention</span>'
+      +'<span class="mono" style="font-size:11px;color:#bca06a">'+attnPlans.length+' item'+(attnPlans.length===1?'':'s')+' need a decision</span></div>'));
+    attnPlans.forEach(c=>{
+      const a=cardAttention(c),m=attnMeta(a.type);
+      const it=el('<button class="na-item" data-attn-type="'+esc(a.type)+'"></button>');
+      it.innerHTML='<span class="tag" style="color:'+m.color+';background:'+m.bg+'">'+m.tag+'</span>'
+        +'<span style="flex:1;min-width:0"><span style="display:block" class="mono">'+esc(m.action)+'</span>'
+        +'<span style="display:block;font-size:12px;color:#8c8576;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(c.title)+'</span></span>'
+        +'<span style="flex:none;color:#c9a960;font-size:15px">&#8594;</span>';
+      it.onclick=()=>goTo('plan',p.id,c.title);na.appendChild(it);
+    });
+    sec.appendChild(na);
+  }else{
+    sec.appendChild(el('<div style="margin-top:24px;display:flex;align-items:center;gap:10px;color:#5d8a6f" class="mono"><span style="width:16px;height:16px;border-radius:50%;border:1.5px solid #7faa8c;display:inline-flex;align-items:center;justify-content:center;font-size:10px">&#10003;</span>Nothing needs you here. All plans are healthy.</div>'));
   }
-
-  // ---- cards with no worktree (graceful unmatched) ----
-  const orphanCards = kanban.filter((c) => !c.has_worktree);
-  if (orphanCards.length) {
-    html += `<h2>Plan cards without a worktree (${orphanCards.length})</h2>`;
-    html += `<div class="kanban">` + orphanCards.map((c) =>
-      `<span class="kcard unlinked">${esc(c.title)}<span class="st">${esc(c.status)}`
-      + ` · ${esc(c.repo || c.product)}</span></span>`).join("") + `</div>`;
+  const narrow=window.innerWidth<760;
+  const board=el('<div class="board" data-region="board" style="grid-template-columns:'+(narrow?'1fr':'1fr 1fr 1fr')+'"></div>');
+  const active=plans.filter(c=>c.status==='active'),backlog=plans.filter(c=>c.status==='backlog'),completed=plans.filter(c=>c.status==='completed'||c.status==='done');
+  const ca=el('<div data-column="active"></div>');
+  ca.appendChild(el('<div class="col-h"><span style="width:8px;height:8px;border-radius:50%;background:#6f9d80"></span><span class="lbl" style="color:#5e7d6a">Active</span><span class="n">'+active.length+'</span></div>'));
+  const cas=el('<div class="colstack"></div>');
+  active.forEach(c=>{
+    const w=worktreeForCard(c),pr=prMeta(w&&w.pr),a=cardAttention(c);
+    const k=el('<button class="kcard" data-plan-id="'+esc(c.title)+'" data-status="active"></button>');
+    k.innerHTML='<span class="t">'+esc(c.title)+'</span><span class="kmeta">'
+      +'<span class="prpill" style="color:'+pr.color+'"><span class="d" style="background:'+pr.dot+'"></span>'+esc(pr.label)+'</span>'
+      +(a?'<span class="mono" style="font-size:9px;letter-spacing:.08em;text-transform:uppercase;color:'+attnMeta(a.type).color+';background:'+attnMeta(a.type).bg+';padding:3px 6px;border-radius:4px">'+attnMeta(a.type).tag+'</span>':'')+'</span>';
+    k.onclick=()=>goTo('plan',p.id,c.title);cas.appendChild(k);
+  });
+  ca.appendChild(cas);board.appendChild(ca);
+  const cb=el('<div data-column="backlog"></div>');
+  cb.appendChild(el('<div class="col-h"><span style="width:8px;height:8px;border-radius:50%;border:1.5px solid #c2b89f;box-sizing:border-box"></span><span class="lbl" style="color:#9a917f">Backlog</span><span class="n">'+backlog.length+'</span></div>'));
+  const cbs=el('<div class="colstack"></div>');
+  backlog.forEach(c=>{
+    const k=el('<button class="bcard" data-plan-id="'+esc(c.title)+'" data-status="backlog"></button>');
+    k.innerHTML='<span class="mono" style="font-size:12.5px;color:#5b5447;overflow-wrap:anywhere">'+esc(c.title)+'</span><span class="mono" style="display:block;font-size:10.5px;color:#aaa291;margin-top:5px">'+esc(c.repo||'')+'</span>';
+    k.onclick=()=>goTo('plan',p.id,c.title);cbs.appendChild(k);
+  });
+  cb.appendChild(cbs);board.appendChild(cb);
+  const cc=el('<div data-column="completed"></div>');
+  const head=el('<button style="all:unset;cursor:pointer;display:flex;align-items:center;gap:8px;margin-bottom:12px;width:100%"></button>');
+  head.innerHTML='<span style="font-size:10px;color:#9a917f;transform:rotate('+(STATE.doneOpen?'90deg':'0deg')+');transition:transform .2s">&#9654;</span><span class="lbl mono" style="color:#9a917f">Completed</span><span class="n">'+completed.length+'</span>';
+  head.onclick=()=>{STATE.doneOpen=!STATE.doneOpen;render();};
+  cc.appendChild(head);
+  if(STATE.doneOpen){
+    const cs=el('<div class="colstack" style="animation:fadeIn .2s ease"></div>');
+    completed.slice(0,12).forEach(c=>{
+      const k=el('<button class="ccard" data-plan-id="'+esc(c.title)+'" data-status="completed"></button>');
+      k.innerHTML='<span style="flex:none;width:14px;height:14px;border-radius:50%;background:#e3ebe2;color:#5d8a6f;display:inline-flex;align-items:center;justify-content:center;font-size:8px">&#10003;</span><span style="flex:1;min-width:0;font-family:\'IBM Plex Mono\',monospace;font-size:12px;color:#8a8273;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(c.title)+'</span>';
+      k.onclick=()=>goTo('plan',p.id,c.title);cs.appendChild(k);
+    });
+    if(completed.length>12) cs.appendChild(el('<div class="mono" style="font-size:11px;color:#aaa291;padding:6px 12px">+ '+(completed.length-12)+' earlier</div>'));
+    cc.appendChild(cs);
   }
+  board.appendChild(cc);
+  sec.appendChild(board);app.appendChild(sec);
+}
 
-  $("app").innerHTML = html || '<p class="empty">Nothing to show.</p>';
-})();
+function renderUnaffiliated(app){
+  const sec=el('<section style="padding-top:30px"></section>');
+  sec.innerHTML='<div class="eyebrow">Unaffiliated</div><h1 class="title" style="font-style:italic;font-weight:400;font-size:clamp(26px,4vw,38px)">Repos without a product</h1><p class="lede">No active plans here. Assign one to a product when it earns a roadmap.</p>';
+  const list=el('<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:1px;background:#e6e0d5;border:1px solid #e6e0d5;border-radius:6px;overflow:hidden;margin-top:22px"></div>');
+  unaffiliated().forEach((r,i)=>{
+    const name=typeof r==='string'?r:(r.slug?r.slug.split('/').pop():(r.name||String(r)));
+    const row=el('<div data-repo="'+esc(name)+'" style="display:flex;align-items:center;justify-content:space-between;gap:10px;background:#fffdf9;padding:13px 15px"></div>');
+    row.innerHTML='<span class="mono" style="font-size:13px;color:#3b372f"><span style="color:#c2b89f;font-size:11px;margin-right:9px">'+String(i+1).padStart(2,'0')+'</span>'+esc(name)+'</span>';
+    list.appendChild(row);
+  });
+  sec.appendChild(list);app.appendChild(sec);
+}
+
+function renderPlan(app){
+  const p=products().find(x=>x.id===STATE.productId);
+  const card=plansFor(STATE.productId).find(c=>c.title===STATE.planId);
+  if(!card){app.appendChild(el('<p class="empty">Plan not found.</p>'));return;}
+  const w=worktreeForCard(card),pr=prMeta(w&&w.pr),a=cardAttention(card);
+  const sm={active:{label:'Active',color:'#5e7d6a',bg:'#e6efe7'},backlog:{label:'Backlog',color:'#9a917f',bg:'#f0ebe0'},completed:{label:'Completed',color:'#7d8a7d',bg:'#e9efe9'},done:{label:'Completed',color:'#7d8a7d',bg:'#e9efe9'}}[card.status]||{label:card.status,color:'#9a917f',bg:'#f0ebe0'};
+  const sec=el('<section style="padding-top:30px"></section>');
+  sec.appendChild(el('<div class="planhead"><span class="statuspill" style="color:'+sm.color+';background:'+sm.bg+'">'+sm.label+'</span><span class="mono" style="font-size:11px;color:#a39c8c">'+esc(p?p.name:card.product)+' · '+esc(card.repo||'product-level')+'</span></div>'));
+  sec.appendChild(el('<h1 data-plan-title="true" class="mono" style="font-weight:500;font-size:clamp(22px,3.4vw,32px);margin:14px 0 0;color:#2a2722;overflow-wrap:anywhere">'+esc(card.title)+'</h1>'));
+  if(a) sec.appendChild(el('<div data-region="next-action" style="margin-top:18px;display:flex;align-items:center;gap:11px;background:linear-gradient(#fffdf6,#fdf6e7);border:1px solid #e7d3a6;border-radius:8px;padding:13px 16px"><span style="width:9px;height:9px;border-radius:50%;background:#cf962f;box-shadow:0 0 0 4px rgba(207,150,47,.16);flex:none"></span><span class="mono" style="font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#a9762a;flex:none">Next</span><span style="font-size:14px;color:#5b4a28">'+esc(attnMeta(a.type).action)+'</span></div>'));
+  // GOAL highlight (from the plan markdown)
+  if(card.goal) sec.appendChild(el('<div data-region="goal" style="margin-top:18px;border-left:3px solid #b08d4e;background:#fbf7ef;border-radius:0 6px 6px 0;padding:12px 16px"><div class="mono" style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#b08d4e;margin-bottom:5px">Goal</div><div style="font-size:15px;line-height:1.5;color:#4a443a">'+esc(card.goal)+'</div></div>'));
+  const narrow=window.innerWidth<820;
+  const grid=el('<div class="l3grid" style="grid-template-columns:'+(narrow?'1fr':'minmax(0,1.6fr) minmax(0,1fr)')+'"></div>');
+  const left=el('<div></div>');
+  const links=el('<div class="links" data-region="links" data-visibility="public"></div>');
+  links.appendChild(el('<div class="mono" style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#a39c8c;padding:12px 16px 0">The work</div>'));
+  const planHref=card.path?'file://'+card.path:'#';
+  links.appendChild(el('<a href="'+esc(planHref)+'" data-field="plan-doc" class="lrow"><span class="lk">plan</span><span class="lv">'+esc(card.path||'—')+'</span><span style="flex:none;color:#c2b89f">&#8599;</span></a>'));
+  links.appendChild(el('<div data-field="issue" class="lrow"><span class="lk">issue</span><span class="lv muted">— (link inference: not wired yet)</span></div>'));
+  if(w&&w.pr&&w.pr.number) links.appendChild(el('<div data-field="pr" class="lrow"><span class="lk">pr</span><span class="lv" style="display:flex;align-items:center;gap:7px;color:'+pr.color+'"><span style="width:7px;height:7px;border-radius:50%;background:'+pr.dot+';flex:none"></span>'+esc(pr.label)+'</span></div>'));
+  else links.appendChild(el('<div data-field="pr" class="lrow"><span class="lk">pr</span><span class="lv muted">no PR</span></div>'));
+  links.appendChild(el('<div data-field="branch" class="lrow"><span class="lk">branch</span><span class="lv">'+esc(w&&w.branch||'—')+'</span></div>'));
+  left.appendChild(links);
+  if(w){
+    const lo=el('<div class="localonly" data-region="local-only" data-visibility="local"></div>');
+    lo.innerHTML='<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><span class="mono" style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#a8916a">Local only</span><span style="font-size:11px;color:#aaa291;font-style:italic">stripped from any hosted build</span></div>'
+      +'<div style="display:flex;flex-direction:column;gap:9px">'
+      +'<div data-field="worktree-path" style="display:flex;gap:10px;align-items:baseline"><span class="mono" style="flex:none;width:64px;font-size:9.5px;text-transform:uppercase;color:#b3a98f">path</span><span class="mono" style="font-size:12px;color:#7a7263;overflow-wrap:anywhere">'+esc(w.path||'—')+'</span></div>'
+      +((w.flags&&w.flags.length)?'<div data-field="passive-flags" style="display:flex;gap:10px;align-items:baseline"><span class="mono" style="flex:none;width:64px;font-size:9.5px;text-transform:uppercase;color:#b3a98f">flags</span><span style="flex:1;display:flex;flex-wrap:wrap;gap:6px">'+w.flags.map(f=>'<span class="mono" style="font-size:11px;color:#9a917f;background:#f0ebe0;padding:2px 8px;border-radius:4px">'+esc(f)+'</span>').join('')+'</span></div>':'')
+      +'</div>';
+    left.appendChild(lo);
+  }
+  grid.appendChild(left);
+  const right=el('<div class="handoff" data-region="handoff"></div>');
+  const prompt=buildPrompt(card,p);
+  right.innerHTML='<div style="padding:16px 17px 0"><div class="mono" style="font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:#bda86f">Hand off to an agent</div><p style="font-size:13px;color:#bdb6a6;margin:8px 0 0;line-height:1.5">Copy a ready-to-paste prompt with the plan doc, branch and next action.</p></div><pre data-field="launch-prompt">'+esc(prompt)+'</pre><div style="padding:13px 17px 16px"><button class="copybtn" id="copybtn">Copy launch prompt</button></div>';
+  grid.appendChild(right);
+  sec.appendChild(grid);
+  // RENDERED PLAN MARKDOWN (the full detail, in-page — no leaving the hub)
+  if(card.body){
+    const doc=el('<div data-region="plan-body" style="margin-top:26px;border:1px solid #e9e3d7;border-radius:8px;background:#fffdf9;padding:6px 24px 22px"></div>');
+    doc.appendChild(el('<div class="mono" style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#a39c8c;padding:14px 0 4px;border-bottom:1px solid #f1ece1;margin-bottom:14px">Plan</div>'));
+    const md=el('<div class="md"></div>'); md.innerHTML=mdToHtml(card.body); doc.appendChild(md);
+    sec.appendChild(doc);
+  }
+  const back=el('<button class="backbtn">&#8592; back to '+esc(p?p.name:card.product)+'</button>');
+  back.onclick=()=>goTo('product',STATE.productId);sec.appendChild(back);
+  app.appendChild(sec);
+  const cbn=$('copybtn');
+  if(cbn) cbn.onclick=()=>{try{navigator.clipboard.writeText(prompt);}catch(e){}cbn.textContent='Copied to clipboard ✓';setTimeout(()=>cbn.textContent='Copy launch prompt',2200);};
+}
+
+function render(){
+  $('stamp').textContent=DATA?('synced '+((DATA.generated_at||'').replace('T',' ').slice(0,16))+'  ·  '+(DATA.mode||'local')):'';
+  renderCrumbs();
+  const app=$('app');app.innerHTML='';
+  if(!DATA){app.appendChild(el('<p class="empty">No data — run <code>python3 collector.py</code>.</p>'));return;}
+  if(STATE.level==='fleet') renderFleet(app);
+  else if(STATE.level==='product') renderProduct(app);
+  else if(STATE.level==='plan') renderPlan(app);
+}
+window.addEventListener('resize',()=>{if(STATE.level!=='fleet')render();});
+render();
 </script>
 </body>
 </html>
