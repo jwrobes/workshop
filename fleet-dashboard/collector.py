@@ -517,19 +517,36 @@ def build_product_tree(cfg, clones, forge=None, allow_forge=False):
                                 {"slug": slug, "name": slug.split("/")[-1],
                                  "worktrees": []})
 
-        if org:
-            for c in clones:
-                if (c.get("org") or "") != org:
-                    continue
-                key = (c.get("slug") or c["name"]).lower()
-                if key == coord:
-                    claimed.add(c["name"])  # coordinator clone: not a sub-repo card
-                    continue
-                node = repo_map.setdefault(key, {"slug": c.get("slug"),
-                                                 "name": c["name"], "worktrees": []})
-                node["worktrees"] = c["worktrees"]
-                node["slug"] = c.get("slug") or node.get("slug")
+        # Membership: if `member_repos` is set, it's the AUTHORITATIVE whitelist
+        # (the product claims ONLY those slugs — org is ignored for membership).
+        # Otherwise fall back to org-match (org = product boundary, decision #4).
+        # This lets multiple products share one org by listing members explicitly.
+        explicit = {s.lower() for s in (p.get("member_repos") or [])}
+        use_whitelist = bool(explicit)
+        for slug in explicit:
+            repo_map.setdefault(slug, {"slug": slug, "name": slug.split("/")[-1],
+                                       "worktrees": []})
+
+        for c in clones:
+            c_slug = (c.get("slug") or "").lower()
+            c_org = (c.get("org") or "")
+            key = (c.get("slug") or c["name"]).lower()
+            # The coordinator is always claimed by its product (it's the Kanban
+            # home, never a sub-repo card and never unaffiliated) — regardless of
+            # whitelist/org membership rules below.
+            if key == coord:
                 claimed.add(c["name"])
+                continue
+            if use_whitelist:
+                if c_slug not in explicit:
+                    continue
+            elif not (org and c_org == org):
+                continue
+            node = repo_map.setdefault(key, {"slug": c.get("slug"),
+                                             "name": c["name"], "worktrees": []})
+            node["worktrees"] = c["worktrees"]
+            node["slug"] = c.get("slug") or node.get("slug")
+            claimed.add(c["name"])
 
         pid = p.get("id") or p.get("forge_org") or "unknown"
         products_out.append({
@@ -640,6 +657,13 @@ def main():
             continue
         base = default_branch(repo)
         slug = remote_slug(repo)
+        # Skip worktree-bin folders: a `<repo>_workspace` dir with NO remote is a
+        # holder for a project's worktrees, not a standalone repo. Its worktrees
+        # already surface under the parent clone, so it must not appear as its own
+        # repo/unaffiliated entry. (A `*_workspace` WITH a remote — e.g. a
+        # coordinator like improve_ai_dev_workspace — is a real repo; keep it.)
+        if repo.name.endswith("_workspace") and not slug:
+            continue
         clone = {"name": repo.name, "slug": slug,
                  "org": (slug.split("/")[0].lower() if slug else None),
                  "worktrees": []}
