@@ -19,10 +19,15 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 
 
-def load_status(status_path, refresh, workspace):
+def load_status(status_path, refresh, workspace, no_gh=False):
     if refresh:
-        cmd = [sys.executable, str(HERE / "collector.py"), "--no-gh",
+        # Refresh WITH gh by default — the GitHub items (remote-only/dangling
+        # specs) are exactly what the health check + dedup need. Pass --no-gh
+        # only when explicitly requested (offline).
+        cmd = [sys.executable, str(HERE / "collector.py"),
                "--out", str(status_path.parent)]
+        if no_gh:
+            cmd.append("--no-gh")
         if workspace:
             cmd += ["--workspace", workspace]
         subprocess.run(cmd, check=True)
@@ -121,11 +126,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--status", default=str(Path.home() / ".fleet" / "status.json"))
     ap.add_argument("--refresh", action="store_true",
-                    help="run the collector (--no-gh) before checking")
+                    help="run the collector (WITH gh) before checking")
+    ap.add_argument("--no-gh", action="store_true",
+                    help="with --refresh, regenerate offline (skip GitHub) — "
+                         "faster but drops remote-only/dangling items")
     ap.add_argument("--workspace", default=None)
     args = ap.parse_args()
 
-    d = load_status(Path(args.status).expanduser(), args.refresh, args.workspace)
+    d = load_status(Path(args.status).expanduser(), args.refresh,
+                    args.workspace, no_gh=args.no_gh)
     wts = [w for w in d.get("worktrees", []) if w.get("kind") == "worktree"]
 
     # categorize
