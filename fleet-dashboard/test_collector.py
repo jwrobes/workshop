@@ -526,6 +526,42 @@ class ProductTreeTests(unittest.TestCase):
             self.CFG, [], forge=BoomForge(), allow_forge=False)
         self.assertEqual(products[0]["repos"], [])
 
+    # --- member_repos is the AUTHORITATIVE whitelist (no forge-org union) ---
+    WL_CFG = {
+        "products": [{
+            "id": "magic-me", "name": "Magic Me", "forge_org": "Jwrobes-Magic",
+            "coordinator_repo": "Jwrobes-Magic/magic-me-workbench",
+            "member_repos": ["Jwrobes-Magic/claw-playbook", "jwrobes/wizard"],
+        }],
+    }
+
+    def test_whitelist_ignores_forge_org_members(self):
+        # When member_repos is set, Forge.list_repos() org members must NOT leak
+        # in (e.g. an unrelated org repo or the coordinator clone).
+        class FakeForge(collector.Forge):
+            def list_repos(self, product):
+                return ["Jwrobes-Magic/improve_ai_dev_workspace",
+                        "Jwrobes-Magic/some-other-repo"]
+            def list_prs(self, s, branch=None): return []
+            def read_dir(self, s, p): return []
+            def get_file(self, s, p): return None
+        products, _ = collector.build_product_tree(
+            self.WL_CFG, [], forge=FakeForge(), allow_forge=True)
+        names = sorted(r["name"] for r in products[0]["repos"])
+        self.assertEqual(names, ["claw-playbook", "wizard"])  # exactly the whitelist
+
+    def test_whitelist_dedups_repo_by_name_across_slugs(self):
+        # `jwrobes/wizard` (whitelisted) and a local clone `Jwrobes-Magic/wizard`
+        # are the same repo NAME -> one card, not two.
+        clones = [self._clone("wizard", "Jwrobes-Magic", [{"branch": "build-w"}]),
+                  self._clone("claw-playbook", "Jwrobes-Magic")]
+        products, unaff = collector.build_product_tree(self.WL_CFG, clones)
+        names = sorted(r["name"] for r in products[0]["repos"])
+        self.assertEqual(names, ["claw-playbook", "wizard"])  # wizard once
+        wiz = [r for r in products[0]["repos"] if r["name"] == "wizard"][0]
+        self.assertEqual(wiz["worktrees"], [{"branch": "build-w"}])  # local worktrees kept
+        self.assertEqual(unaff, [])
+
 
 class ProductTreeE2ETests(unittest.TestCase):
     """Leaf 3 AC: works for Magic Me end to end (local, --no-gh)."""
@@ -669,6 +705,86 @@ class LinkInferenceTests(unittest.TestCase):
                   "path": "plans/active/main.md"}]
         collector.link_worktrees_to_cards(rows, cards)
         self.assertIsNone(rows[0]["card"])
+
+
+class PairingGoalTests(unittest.TestCase):
+    """Local-pairing: the worktree's card snapshot carries the card's goal so the
+    worktree shows real context, not just the branch name."""
+
+    def test_paired_card_includes_goal(self):
+        rows = [{"kind": "worktree", "branch": "build-venmo",
+                 "path": "/ws/claw-venmo", "repo": "claw"}]
+        cards = [{"title": "Venmo", "status": "active", "level": "repo",
+                  "repo": "claw", "path": "plans/active/venmo.md",
+                  "goal": "Categorize Venmo exports automatically."}]
+        collector.link_worktrees_to_cards(rows, cards)
+        self.assertEqual(rows[0]["card"]["goal"],
+                         "Categorize Venmo exports automatically.")
+
+    def test_paired_card_goal_none_when_absent(self):
+        rows = [{"kind": "worktree", "branch": "build-x",
+                 "path": "/ws/r-x", "repo": "r"}]
+        cards = [{"title": "X", "status": "active", "level": "repo",
+                  "repo": "r", "path": "plans/active/x.md"}]  # no goal key
+        collector.link_worktrees_to_cards(rows, cards)
+        self.assertIsNone(rows[0]["card"]["goal"])
+
+
+class WorkSubstanceTests(unittest.TestCase):
+    """Local work substance: unmerged commit subjects + dirty file names.
+    Builds a real git repo with a branch ahead of origin/main + dirty files."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.origin = root / "origin.git"
+        self.work = root / "work"
+        _git(root, "init", "--bare", str(self.origin))
+        _git(root, "clone", str(self.origin), str(self.work))
+        env = ["-c", "user.email=t@t", "-c", "user.name=t"]
+        (self.work / "a.txt").write_text("a\n")
+        _git(self.work, "add", "a.txt")
+        _git(self.work, *env, "commit", "-m", "init")
+        _git(self.work, "branch", "-M", "main")
+        _git(self.work, "push", "origin", "main")
+        # branch with two commits not on origin/main
+        _git(self.work, "checkout", "-b", "build-feature")
+        (self.work / "b.txt").write_text("b\n")
+        _git(self.work, "add", "b.txt")
+        _git(self.work, *env, "commit", "-m", "first feature commit")
+        (self.work / "c.txt").write_text("c\n")
+        _git(self.work, "add", "c.txt")
+        _git(self.work, *env, "commit", "-m", "second feature commit")
+        _git(self.work, "fetch", "origin")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_unmerged_subjects_lists_branch_commits(self):
+        subs, total = collector.unmerged_subjects(self.work, "build-feature", "main")
+        self.assertEqual(total, 2)
+        self.assertEqual(set(subs),
+                         {"first feature commit", "second feature commit"})
+
+    def test_unmerged_subjects_empty_for_base_branch(self):
+        subs, total = collector.unmerged_subjects(self.work, "main", "main")
+        self.assertEqual((subs, total), ([], 0))
+
+    def test_unmerged_subjects_cap(self):
+        subs, total = collector.unmerged_subjects(self.work, "build-feature", "main", cap=1)
+        self.assertEqual(len(subs), 1)
+        self.assertEqual(total, 2)  # full count still reported for "+N more"
+
+    def test_dirty_files_lists_names_and_total(self):
+        (self.work / "dirty1.txt").write_text("x\n")
+        (self.work / "dirty2.txt").write_text("y\n")
+        names, total = collector.dirty_files(self.work)
+        self.assertEqual(total, 2)
+        self.assertEqual(set(names), {"dirty1.txt", "dirty2.txt"})
+
+    def test_dirty_files_clean_is_empty(self):
+        names, total = collector.dirty_files(self.work)
+        self.assertEqual((names, total), ([], 0))
 
 
 class NoLocalModeTests(unittest.TestCase):
@@ -855,6 +971,236 @@ class SmokeRunTests(unittest.TestCase):
         self.assertIn("generated_at", html)
         self.assertIn("products", html)     # product->repo->worktree tree inlined
         self.assertIn("Fleet Dashboard", html)
+
+
+class FolderFormPlanTests(unittest.TestCase):
+    """Repo plan reader accepts a flat <slug>.md OR a folder <slug>/README.md."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name) / "plans"
+        (self.base / "active").mkdir(parents=True)
+        # flat file form
+        (self.base / "active" / "flat-plan.md").write_text(
+            "---\ntitle: Flat Plan\n---\nthe flat goal line\n")
+        # folder form (slug = dir name; content from README.md)
+        folder = self.base / "active" / "folder-plan"
+        folder.mkdir()
+        (folder / "README.md").write_text(
+            "---\ntitle: Folder Plan\n---\nthe folder goal line\n")
+        (folder / "diagram.txt").write_text("resource")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_reads_both_forms(self):
+        cards = collector._kanban_local(self.base, ["active"], "repo", "p", "r")
+        by = {c["title"]: c for c in cards}
+        self.assertIn("Flat Plan", by)
+        self.assertIn("Folder Plan", by)
+        # folder-form slug is the DIR name, not 'README'
+        self.assertEqual(by["Folder Plan"]["slug"], "folder-plan")
+        self.assertEqual(by["Flat Plan"]["slug"], "flat-plan")
+        self.assertEqual(by["Folder Plan"]["goal"], "the folder goal line")
+
+
+class WorkbenchReaderTests(unittest.TestCase):
+    """collect_workbench() walks <repo>_workspace/workbench/<slug>/ (active at
+    root, completed/ subdir) and reads README content."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        bench = self.ws / "claw-playbook_workspace" / "workbench"
+        (bench / "cot_trip_matcher").mkdir(parents=True)
+        (bench / "cot_trip_matcher" / "README.md").write_text(
+            "---\ntitle: COT Trip Matcher\n---\nmatch trips to receipts\n")
+        (bench / "completed" / "reminder_revive").mkdir(parents=True)
+        (bench / "completed" / "reminder_revive" / "README.md").write_text("done work\n")
+        # a no-README folder still counts (title = dir name)
+        (bench / "venmo_enrichment").mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_reads_active_and_completed(self):
+        entries = collector.collect_workbench(self.ws)
+        by = {e["slug"]: e for e in entries}
+        self.assertEqual(by["cot_trip_matcher"]["status"], "active")
+        self.assertEqual(by["cot_trip_matcher"]["repo"], "claw-playbook")
+        self.assertEqual(by["cot_trip_matcher"]["title"], "COT Trip Matcher")
+        self.assertTrue(by["cot_trip_matcher"]["has_readme"])
+        self.assertEqual(by["reminder_revive"]["status"], "completed")
+        # no-README folder: present, title falls back to dir name
+        self.assertIn("venmo_enrichment", by)
+        self.assertFalse(by["venmo_enrichment"]["has_readme"])
+
+
+class MergeWorkbenchTests(unittest.TestCase):
+    """merge_workbench_into_cards: enrich matching repo plan; surface
+    workbench-only initiatives; match across _/- normalization."""
+
+    def _plan_card(self, repo, slug, status="active"):
+        c = collector._card("repo", "p", repo, status, slug, f"/plans/{slug}.md", "body")
+        return c
+
+    def test_enriches_matching_plan_normalized(self):
+        # repo plan slug uses hyphens; workbench folder uses underscores
+        cards = [self._plan_card("claw-playbook", "cot-trip-matcher")]
+        wb = [{"repo": "claw-playbook", "slug": "cot_trip_matcher",
+               "status": "active", "path": "/ws/cot_trip_matcher",
+               "title": "X", "goal": None, "body": "", "has_readme": True}]
+        merged = collector.merge_workbench_into_cards(cards, wb)
+        self.assertEqual(len(merged), 1)  # enriched, not duplicated
+        self.assertIsNotNone(merged[0]["workbench"])
+        self.assertEqual(merged[0]["workbench"]["path"], "/ws/cot_trip_matcher")
+
+    def test_workbench_only_becomes_card(self):
+        cards = []
+        wb = [{"repo": "ableton-mcp", "slug": "mcp_exploration",
+               "status": "active", "path": "/ws/mcp_exploration",
+               "title": "MCP Exploration", "goal": "g", "body": "b",
+               "has_readme": True}]
+        merged = collector.merge_workbench_into_cards(cards, wb)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["source"], "workbench-only")
+        self.assertEqual(merged[0]["title"], "MCP Exploration")
+        self.assertEqual(merged[0]["repo"], "ableton-mcp")
+        self.assertIsNotNone(merged[0]["workbench"])
+
+    def test_different_repo_same_slug_not_merged(self):
+        # same slug in two repos must NOT cross-merge
+        cards = [self._plan_card("yogada", "homepage")]
+        wb = [{"repo": "yogada-shop", "slug": "homepage", "status": "active",
+               "path": "/ws/homepage", "title": "H", "goal": None,
+               "body": "", "has_readme": False}]
+        merged = collector.merge_workbench_into_cards(cards, wb)
+        self.assertEqual(len(merged), 2)  # yogada plan + yogada-shop workbench-only
+
+
+class ForgeListItemsTests(unittest.TestCase):
+    """list_open_prs / list_issues parse the forge response; GitLab stub raises."""
+
+    def test_github_list_open_prs_parses(self):
+        sample = json.dumps([
+            {"number": 88, "title": "Build Spec 007", "headRefName": "bosque/build-spec-007",
+             "labels": [{"name": "build-spec"}], "createdAt": "2026-06-08T00:00:00Z",
+             "isDraft": False, "url": "https://x/pull/88"}])
+        import unittest.mock as mock
+        with mock.patch.object(collector, "run", return_value=(0, sample)):
+            prs = collector.GitHubForge().list_open_prs("org/repo")
+        self.assertEqual(len(prs), 1)
+        self.assertEqual(prs[0]["number"], 88)
+        self.assertEqual(prs[0]["labels"], ["build-spec"])  # flattened from {name}
+        self.assertEqual(prs[0]["headRefName"], "bosque/build-spec-007")
+
+    def test_github_list_issues_parses(self):
+        sample = json.dumps([{"number": 5, "title": "An issue", "labels": [],
+                              "createdAt": "2026-06-01T00:00:00Z", "url": "u"}])
+        import unittest.mock as mock
+        with mock.patch.object(collector, "run", return_value=(0, sample)):
+            iss = collector.GitHubForge().list_issues("org/repo")
+        self.assertEqual(iss[0]["number"], 5)
+
+    def test_github_list_open_prs_no_slug(self):
+        self.assertEqual(collector.GitHubForge().list_open_prs(None), [])
+
+    def test_gitlab_stub_raises(self):
+        with self.assertRaises(NotImplementedError):
+            collector.GitLabForge().list_open_prs("g/r")
+        with self.assertRaises(NotImplementedError):
+            collector.GitLabForge().list_issues("g/r")
+
+    def test_base_forge_defaults_empty(self):
+        # A Forge subclass that doesn't override gets safe [] defaults.
+        class Bare(collector.Forge):
+            def list_repos(self, p): return []
+            def list_prs(self, s, branch=None): return []
+            def read_dir(self, s, p): return []
+            def get_file(self, s, p): return None
+        self.assertEqual(Bare().list_open_prs("r"), [])
+        self.assertEqual(Bare().list_issues("r"), [])
+
+
+class BranchSlugCandidateTests(unittest.TestCase):
+    def test_strips_owner_and_spec_prefixes(self):
+        cands = collector.branch_slug_candidates("bosque/build-spec-007")
+        self.assertIn("build-spec-007", cands)
+        self.assertIn("007", cands)  # build-spec- prefix stripped, then norm
+
+    def test_underscore_normalized(self):
+        cands = collector.branch_slug_candidates("feature/cot_trip_matcher")
+        self.assertIn("cot-trip-matcher", cands)
+
+
+class ForgeReconcileTests(unittest.TestCase):
+    """4th source: GitHub items attach to a matching card, else become
+    remote-only; ambiguous never false-merges; dangling-spec flagged."""
+
+    NOW = collector.datetime.datetime(2026, 6, 23, tzinfo=collector.datetime.timezone.utc)
+
+    def _card(self, repo, slug, title, status="active"):
+        return {"level": "repo", "product": "p", "repo": repo, "status": status,
+                "title": title, "path": f"/x/{slug}.md", "slug": slug,
+                "goal": None, "body": "", "workbench": None}
+
+    def _item(self, **kw):
+        base = {"repo": "claw-playbook", "kind": "pr", "number": 1, "title": "T",
+                "branch": "feature/x", "labels": [], "createdAt": "2026-06-01T00:00:00Z",
+                "isDraft": False, "url": "u", "has_impl_pr": False}
+        base.update(kw); return base
+
+    def test_branch_slug_match_attaches(self):
+        cards = [self._card("claw-playbook", "venmo-enrichment", "Venmo")]
+        items = [self._item(branch="build-venmo-enrichment", number=42)]
+        out = collector.merge_forge_items_into_cards(cards, items, self.NOW)
+        self.assertEqual(len(out), 1)               # no new card
+        self.assertEqual(out[0]["github"]["number"], 42)
+
+    def test_title_match_attaches(self):
+        cards = [self._card("claw-playbook", "x", "Cot Trip Matcher")]
+        items = [self._item(title="cot trip matcher", branch=None, number=7)]
+        out = collector.merge_forge_items_into_cards(cards, items, self.NOW)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["github"]["number"], 7)
+
+    def test_no_match_becomes_remote_only_and_dangling(self):
+        cards = []
+        items = [self._item(branch="bosque/build-spec-007", number=88,
+                            title="Build Spec 007", labels=["build-spec"],
+                            createdAt="2026-06-08T00:00:00Z")]
+        out = collector.merge_forge_items_into_cards(cards, items, self.NOW)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["source"], "remote-only")
+        self.assertIn("dangling-spec", out[0]["flags"])  # build-spec, no impl, old
+
+    def test_ambiguous_match_does_not_false_merge(self):
+        # two cards with the same title -> ambiguous -> remote-only, not attached
+        cards = [self._card("claw-playbook", "a", "Same"),
+                 self._card("claw-playbook", "b", "Same")]
+        items = [self._item(title="same", branch=None, number=9)]
+        out = collector.merge_forge_items_into_cards(cards, items, self.NOW)
+        self.assertEqual(len(out), 3)               # 2 originals + 1 remote-only
+        self.assertEqual(out[-1]["source"], "remote-only")
+        self.assertTrue(out[-1]["ambiguous_match"])
+        self.assertNotIn("github", cards[0])        # neither original got attached
+        self.assertNotIn("github", cards[1])
+
+    def test_recent_build_spec_not_dangling(self):
+        cards = []
+        items = [self._item(branch="bosque/build-spec-009", number=99,
+                            title="Build Spec 009", labels=["build-spec"],
+                            createdAt="2026-06-22T00:00:00Z")]  # 1 day old
+        out = collector.merge_forge_items_into_cards(cards, items, self.NOW)
+        self.assertNotIn("dangling-spec", out[0]["flags"])
+
+    def test_build_spec_with_impl_not_dangling(self):
+        cards = []
+        items = [self._item(branch="bosque/build-spec-007", number=88,
+                            title="Build Spec 007", labels=["build-spec"],
+                            createdAt="2026-06-01T00:00:00Z", has_impl_pr=True)]
+        out = collector.merge_forge_items_into_cards(cards, items, self.NOW)
+        self.assertNotIn("dangling-spec", out[0]["flags"])
 
 
 if __name__ == "__main__":

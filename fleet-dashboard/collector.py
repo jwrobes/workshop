@@ -84,6 +84,31 @@ def dirty_count(path):
     return len(out.splitlines()) if code == 0 and out else 0
 
 
+def dirty_files(path, cap=10):
+    """Return (names, total): the uncommitted file paths in a worktree (porcelain),
+    capped to `cap` names. `total` is the full count (so the UI can say "+N more")."""
+    code, out = git(path, "status", "--porcelain")
+    if code != 0 or not out:
+        return [], 0
+    lines = out.splitlines()
+    # porcelain lines are "XY <path>" (rename shows "old -> new"); take the path tail.
+    names = [ln[3:].split(" -> ")[-1].strip() for ln in lines if len(ln) > 3]
+    return names[:cap], len(names)
+
+
+def unmerged_subjects(path, branch, base, cap=10):
+    """Return (subjects, total): commit subjects on `branch` not yet on
+    origin/<base> — the actual in-flight work. Capped to `cap`; `total` is the
+    full count. ([], 0) when not computable (detached, missing base, etc.)."""
+    if not base or branch in ("(detached)", "(unknown)") or branch == base:
+        return [], 0
+    code, out = git(path, "log", "--format=%s", f"origin/{base}..{branch}")
+    if code != 0 or not out:
+        return [], 0
+    subjects = [ln for ln in out.splitlines() if ln.strip()]
+    return subjects[:cap], len(subjects)
+
+
 def last_commit_iso(path):
     code, out = git(path, "log", "-1", "--format=%cI")
     return out if code == 0 and out else None
@@ -170,13 +195,33 @@ class Forge(ABC):
         """Return the decoded text of a file in a repo's default branch,
         or None when missing/unavailable."""
 
+    # --- Forge-only items: ALL open PRs / issues for a repo (no branch filter).
+    # Concrete no-op defaults so existing Forge subclasses (and offline mode)
+    # keep working; GitHubForge overrides these, GitLabForge raises.
+    def list_open_prs(self, repo_slug):
+        """Return a list of open-PR dicts for repo_slug:
+        {number, title, headRefName, labels:[str], createdAt, isDraft, url}.
+        [] when none/forge unavailable. Used to surface GitHub-only work that
+        has no local footprint (the forge-only data path)."""
+        return []
+
+    def list_issues(self, repo_slug):
+        """Return a list of open-issue dicts for repo_slug:
+        {number, title, labels:[str], createdAt, url}. [] when none/unavailable."""
+        return []
+
 
 class GitHubForge(Forge):
     """GitHub forge wrapping the `gh` CLI. This is the ONLY place `gh` is
     invoked — the collector body routes all forge calls through here."""
 
     def list_repos(self, product):
-        org = product["forge_org"]
+        # A product may define members only via `member_repos` (no forge_org);
+        # then there's no org to enumerate — return [] and let the whitelist
+        # supply members.
+        org = product.get("forge_org")
+        if not org:
+            return []
         code, out = run(["gh", "repo", "list", org,
                          "--json", "nameWithOwner", "--limit", "200"], timeout=30)
         if code != 0 or not out:
@@ -231,6 +276,48 @@ class GitHubForge(Forge):
         except (ValueError, TypeError):
             return None
 
+    @staticmethod
+    def _label_names(item):
+        """Normalize gh's labels (list of {name}) to a list of label strings."""
+        return [l.get("name") for l in (item.get("labels") or []) if l.get("name")]
+
+    def list_open_prs(self, repo_slug):
+        if not repo_slug:
+            return []
+        code, out = run(["gh", "pr", "list", "--repo", repo_slug,
+                         "--state", "open", "--limit", "100", "--json",
+                         "number,title,headRefName,labels,createdAt,isDraft,url"],
+                        timeout=30)
+        if code != 0 or not out:
+            return []
+        try:
+            prs = json.loads(out)
+        except json.JSONDecodeError:
+            return []
+        return [{"number": p.get("number"), "title": p.get("title") or "",
+                 "headRefName": p.get("headRefName") or "",
+                 "labels": self._label_names(p), "createdAt": p.get("createdAt"),
+                 "isDraft": bool(p.get("isDraft")), "url": p.get("url")}
+                for p in prs]
+
+    def list_issues(self, repo_slug):
+        if not repo_slug:
+            return []
+        # `gh issue list` excludes PRs by default (good — PRs come from list_open_prs).
+        code, out = run(["gh", "issue", "list", "--repo", repo_slug,
+                         "--state", "open", "--limit", "100", "--json",
+                         "number,title,labels,createdAt,url"], timeout=30)
+        if code != 0 or not out:
+            return []
+        try:
+            issues = json.loads(out)
+        except json.JSONDecodeError:
+            return []
+        return [{"number": i.get("number"), "title": i.get("title") or "",
+                 "labels": self._label_names(i), "createdAt": i.get("createdAt"),
+                 "url": i.get("url")}
+                for i in issues]
+
 
 class GitLabForge(Forge):
     """STUB — not yet implemented. GitLab mapping for a future port:
@@ -262,6 +349,14 @@ class GitLabForge(Forge):
     def get_file(self, repo_slug, path):
         raise NotImplementedError(
             "GitLabForge.get_file: use `glab api projects/:id/repository/files/<path>/raw`")
+
+    def list_open_prs(self, repo_slug):
+        raise NotImplementedError(
+            "GitLabForge.list_open_prs: PR->MR; use `glab mr list -R <repo> --state opened -F json`")
+
+    def list_issues(self, repo_slug):
+        raise NotImplementedError(
+            "GitLabForge.list_issues: use `glab issue list -R <repo> --state opened -F json`")
 
 
 FORGES = {"github": GitHubForge, "gitlab": GitLabForge}
@@ -333,24 +428,57 @@ def _plan_goal(text):
     return None
 
 
-def _card(level, product_id, repo_name, status, title, path, text=""):
+def _slug_from_path(path):
+    """Derive an initiative slug from a plan/card path. Handles both the flat
+    `<slug>.md` form (stem = slug) and the folder `<slug>/README.md` form
+    (the parent dir name is the slug, not 'README')."""
+    p = Path(path)
+    if p.name.lower() == "readme.md":
+        return p.parent.name
+    return p.stem
+
+
+def _card(level, product_id, repo_name, status, title, path, text="", slug=None):
     return {"level": level, "product": product_id, "repo": repo_name,
             "status": status, "title": title, "path": str(path),
-            "goal": _plan_goal(text), "body": text or ""}
+            "slug": slug or _slug_from_path(path),
+            "goal": _plan_goal(text), "body": text or "",
+            "workbench": None}
+
+
+def _read_plan_entry(entry):
+    """Given a plan entry that is EITHER a flat `<slug>.md` file OR a folder
+    `<slug>/README.md`, return (slug, path_to_render, text). The two forms are
+    equivalent (a richer plan gets a folder); the slug is the file stem or the
+    dir name. Returns None if the entry isn't a recognizable plan."""
+    if entry.is_file() and entry.suffix == ".md":
+        return entry.stem, entry, entry.read_text(errors="replace")
+    if entry.is_dir():
+        readme = entry / "README.md"
+        text = readme.read_text(errors="replace") if readme.is_file() else ""
+        # A folder is a plan if it has a README (content) — else treat as a
+        # plain folder card keyed by its dir name with no body.
+        return entry.name, (readme if readme.is_file() else entry), text
+    return None
 
 
 def _kanban_local(base_dir, columns, level, product_id, repo_name):
-    """Read cards from <base_dir>/<column>/*.md on the local filesystem."""
+    """Read cards from <base_dir>/<column>/ on the local filesystem. Each entry
+    may be a flat `<slug>.md` file OR a folder `<slug>/README.md` — both forms
+    produce one card (the folder form mirrors the workbench shape)."""
     cards = []
     base = Path(base_dir)
     for column in columns:
         col_dir = base / column
         if not col_dir.is_dir():
             continue
-        for md in sorted(col_dir.glob("*.md")):
-            text = md.read_text(errors="replace")
-            title = parse_frontmatter_title(text) or md.stem
-            cards.append(_card(level, product_id, repo_name, column, title, md, text))
+        for entry in sorted(col_dir.iterdir()):
+            parsed = _read_plan_entry(entry)
+            if parsed is None:
+                continue
+            slug, path, text = parsed
+            title = parse_frontmatter_title(text) or slug
+            cards.append(_card(level, product_id, repo_name, column, title, path, text))
     return cards
 
 
@@ -443,6 +571,255 @@ def collect_kanban(cfg, workspace_root, forge=None, use_forge=False):
 
 
 # --------------------------------------------------------------------------
+# Workbench reader (the LOCAL working surface, mirror of repo plans)
+#
+# An initiative's local working folder lives at
+# <repo>_workspace/workbench/<slug>/ (README + resources + .code-workspace).
+# Root-level dirs = active; a `completed/` subdir holds done initiatives. This
+# is the enrichment half of the mirror: repo/plans is the durable record,
+# workbench is the local working copy. Keyed by the same normalized slug.
+# --------------------------------------------------------------------------
+
+def collect_workbench(workspace_root):
+    """Walk every `<repo>_workspace/workbench/<slug>/` initiative folder and
+    return entries {repo, slug, status, path, title, goal, body, has_readme}.
+
+    `repo` is the parent repo name (the `<repo>` of `<repo>_workspace`). Root
+    dirs are `active`; dirs under a `completed/` subdir are `completed`. README
+    content (if present) supplies title/goal/body."""
+    entries = []
+    workspace_root = Path(workspace_root)
+    if not workspace_root.is_dir():
+        return entries
+    for ws in sorted(workspace_root.iterdir()):
+        if not ws.is_dir() or not ws.name.endswith("_workspace"):
+            continue
+        repo = ws.name[: -len("_workspace")]
+        bench = ws / "workbench"
+        if not bench.is_dir():
+            continue
+        # (status, base_dir) pairs: active = bench root, completed = bench/completed
+        scopes = [("active", bench), ("completed", bench / "completed")]
+        for status, base in scopes:
+            if not base.is_dir():
+                continue
+            for d in sorted(base.iterdir()):
+                if not d.is_dir() or d.name == "completed":
+                    continue
+                readme = d / "README.md"
+                has_readme = readme.is_file()
+                text = readme.read_text(errors="replace") if has_readme else ""
+                title = parse_frontmatter_title(text) or d.name
+                entries.append({
+                    "repo": repo, "slug": d.name, "status": status,
+                    "path": str(d), "title": title,
+                    "goal": _plan_goal(text), "body": text,
+                    "has_readme": has_readme,
+                })
+    return entries
+
+
+def merge_workbench_into_cards(cards, workbench_entries):
+    """Merge workbench folders into the kanban cards by (repo, normalized slug).
+
+    - A workbench entry whose slug matches a repo plan card ENRICHES that card
+      (attaches `workbench` = {path, has_readme, status}). The repo plan stays
+      authoritative for status/goal/body.
+    - A workbench entry with NO matching repo plan becomes its own card (a
+      local-only initiative not yet committed to the repo); its body/goal come
+      from the workbench README.
+    Returns the (possibly extended) card list."""
+    index = {}
+    for c in cards:
+        index[(norm(c.get("repo") or ""), norm(c.get("slug") or ""))] = c
+    for wb in workbench_entries:
+        key = (norm(wb["repo"]), norm(wb["slug"]))
+        card = index.get(key)
+        wb_attach = {"path": wb["path"], "has_readme": wb["has_readme"],
+                     "status": wb["status"]}
+        if card is not None:
+            card["workbench"] = wb_attach
+        else:
+            # Local-only initiative: workbench stands in as the card.
+            new = _card("repo", None, wb["repo"], wb["status"], wb["title"],
+                        wb["path"], wb["body"], slug=wb["slug"])
+            new["workbench"] = wb_attach
+            new["source"] = "workbench-only"
+            cards.append(new)
+            index[key] = new
+    return cards
+
+
+# --------------------------------------------------------------------------
+# Forge-only data path (the 4th source: GitHub PRs/issues with no local footprint)
+#
+# Surfaces work that exists ONLY on the forge — a cloud-build spec with no local
+# worktree, an orphan PR, an issue-as-spec — so the dashboard isn't local-first
+# blind. Reconciles each GitHub item against the already-merged local cards
+# (repo plan + workbench + worktree) by normalized slug or title; a match
+# ATTACHES (no duplicate card), no match becomes a `remote-only` card. When
+# uncertain we prefer remote-only over a wrong merge. build-spec items with no
+# downstream implementation PR (and/or stale) are flagged `dangling-spec`.
+# --------------------------------------------------------------------------
+
+# A build-spec PR/issue open longer than this (and lacking an impl PR) is "stuck".
+DANGLING_SPEC_DAYS = 7
+
+
+def branch_slug_candidates(branch):
+    """Candidate normalized slugs for a head branch like `bosque/build-spec-007`:
+    the last path segment, with common build-/spec- prefixes also stripped.
+    Returns a set of normalized slugs to match against card slugs."""
+    if not branch:
+        return set()
+    tail = branch.split("/")[-1]
+    cands = {norm(tail)}
+    for pref in ("build-spec-", "build-", "spec-"):
+        if tail.lower().startswith(pref):
+            cands.add(norm(tail[len(pref):]))
+    return {c for c in cands if c}
+
+
+def _is_build_spec(labels, title):
+    """Heuristic: a build-spec item carries a build-spec label or its title/
+    branch reads like a build spec."""
+    lab = {(l or "").lower() for l in (labels or [])}
+    if "build-spec" in lab or "build_spec" in lab:
+        return True
+    return bool(re.search(r"\bbuild[\s_-]?spec\b", (title or ""), re.I))
+
+
+def _age_days(created_iso, now):
+    if not created_iso:
+        return None
+    try:
+        return (now - datetime.datetime.fromisoformat(
+            created_iso.replace("Z", "+00:00"))).days
+    except ValueError:
+        return None
+
+
+def merge_forge_items_into_cards(cards, forge_items, now, repo_to_product=None):
+    """Reconcile GitHub items (PRs + issues) against the local cards.
+
+    `forge_items` is a list of dicts: {repo, kind:'pr'|'issue', number, title,
+    branch, labels, createdAt, isDraft, url, has_impl_pr}. Each is matched to a
+    local card in the SAME repo by branch-slug or normalized title:
+      - match  -> attach `github` to that card (no duplicate).
+      - no match -> a new `remote-only` card (source='remote-only').
+      - ambiguous (matches >1 card) -> remote-only (never false-merge).
+    A build-spec item that is open, has no impl PR, and (if datable) is older
+    than DANGLING_SPEC_DAYS is flagged `dangling-spec` and parked at 'spec'd'.
+
+    `repo_to_product` maps a repo name (lowercased) -> product id, so a
+    remote-only card is attributed to the SAME product its repo belongs to (a
+    claw-playbook PR lands under Magic Me, not product=None). Repos in no
+    configured product get product=None (the unaffiliated bucket).
+    Returns the (possibly extended) card list."""
+    repo_to_product = repo_to_product or {}
+    # Index local cards by (repo, normalized slug) and (repo, normalized title).
+    by_slug, by_title = {}, {}
+    for c in cards:
+        rk = norm(c.get("repo") or "")
+        by_slug.setdefault((rk, norm(c.get("slug") or "")), []).append(c)
+        by_title.setdefault((rk, norm(c.get("title") or "")), []).append(c)
+
+    for it in forge_items:
+        rk = norm(it.get("repo") or "")
+        # Collect candidate matches: branch-slug first, then title.
+        matches = []
+        for cand in branch_slug_candidates(it.get("branch")):
+            matches += by_slug.get((rk, cand), [])
+        if not matches:
+            matches += by_title.get((rk, norm(it.get("title") or "")), [])
+        # De-dupe candidate cards (a card could match by both slug and title).
+        uniq = []
+        for m in matches:
+            if m not in uniq:
+                uniq.append(m)
+
+        gh = {"kind": it.get("kind"), "number": it.get("number"),
+              "title": it.get("title"), "url": it.get("url"),
+              "state": "OPEN", "labels": it.get("labels") or [],
+              "isDraft": bool(it.get("isDraft")), "createdAt": it.get("createdAt")}
+
+        if len(uniq) == 1:
+            # Unambiguous match -> attach (no duplicate card).
+            uniq[0]["github"] = gh
+        else:
+            # No match, OR ambiguous (>1) -> remote-only card (never false-merge).
+            age = _age_days(it.get("createdAt"), now)
+            is_spec = _is_build_spec(it.get("labels"), it.get("title"))
+            dangling = bool(is_spec and not it.get("has_impl_pr")
+                            and (age is None or age >= DANGLING_SPEC_DAYS))
+            slug = (next(iter(branch_slug_candidates(it.get("branch"))), None)
+                    or norm(it.get("title") or "")) or str(it.get("number"))
+            ref = f"{it.get('repo')}#{it.get('number')}"
+            card = {
+                "level": "repo",
+                "product": repo_to_product.get(norm(it.get("repo") or "")),
+                "repo": it.get("repo"),
+                "status": "spec" if is_spec else "open",
+                "title": it.get("title") or ref, "path": it.get("url") or "",
+                "slug": slug, "goal": None, "body": "", "workbench": None,
+                "source": "remote-only", "github": gh,
+                "flags": (["dangling-spec"] if dangling else []),
+                "age_days": age, "ambiguous_match": len(uniq) > 1,
+            }
+            cards.append(card)
+            by_slug.setdefault((rk, slug), []).append(card)
+    return cards
+
+
+def collect_forge_items(cfg, forge, products_out):
+    """Gather open PRs + issues for every product member repo, via the Forge.
+    Returns a flat list of normalized item dicts (see merge_forge_items_into_cards).
+    `has_impl_pr` marks a build-spec that has a SEPARATE non-spec PR referencing
+    it (so the spec isn't 'dangling'); heuristically, any non-spec open PR in the
+    repo whose branch slug matches the spec's slug counts as its impl."""
+    items = []
+    seen_repos = set()
+    for prod in products_out:
+        for repo in prod.get("repos", []):
+            slug = repo.get("slug")
+            if not slug or slug in seen_repos:
+                continue
+            seen_repos.add(slug)
+            try:
+                prs = forge.list_open_prs(slug)
+                issues = forge.list_issues(slug)
+            except NotImplementedError:
+                continue
+            # impl-PR detection: slugs of non-build-spec open PRs in this repo.
+            impl_slugs = set()
+            for p in prs:
+                if not _is_build_spec(p.get("labels"), p.get("title")):
+                    impl_slugs |= branch_slug_candidates(p.get("headRefName"))
+            for p in prs:
+                spec_slugs = branch_slug_candidates(p.get("headRefName"))
+                has_impl = bool(_is_build_spec(p.get("labels"), p.get("title"))
+                                and (spec_slugs & impl_slugs))
+                items.append({
+                    "repo": repo.get("name") or slug.split("/")[-1],
+                    "kind": "pr", "number": p.get("number"),
+                    "title": p.get("title"), "branch": p.get("headRefName"),
+                    "labels": p.get("labels"), "createdAt": p.get("createdAt"),
+                    "isDraft": p.get("isDraft"), "url": p.get("url"),
+                    "has_impl_pr": has_impl,
+                })
+            for i in issues:
+                items.append({
+                    "repo": repo.get("name") or slug.split("/")[-1],
+                    "kind": "issue", "number": i.get("number"),
+                    "title": i.get("title"), "branch": None,
+                    "labels": i.get("labels"), "createdAt": i.get("createdAt"),
+                    "isDraft": False, "url": i.get("url"),
+                    "has_impl_pr": False,
+                })
+    return items
+
+
+# --------------------------------------------------------------------------
 # PR selection (collector-side, forge-agnostic)
 #
 # v1's gh_pr() both fetched and ranked PRs. Fetching now lives in the Forge;
@@ -504,28 +881,37 @@ def build_product_tree(cfg, clones, forge=None, allow_forge=False):
         coord = (p.get("coordinator_repo") or "").lower()
         repo_map = {}  # keyed by slug-or-name (lower) -> repo node
 
-        member_slugs = []
-        if allow_forge and forge is not None:
+        # Membership: if `member_repos` is set, it's the AUTHORITATIVE whitelist
+        # — the product claims ONLY those slugs. The forge org-member list is
+        # IGNORED entirely (no union), so org members like a coordinator clone or
+        # an unrelated org repo don't leak in. Otherwise fall back to org-match
+        # (org = product boundary). This lets multiple products share one org.
+        explicit = {s.lower() for s in (p.get("member_repos") or [])}
+        use_whitelist = bool(explicit)
+
+        if use_whitelist:
+            for slug in explicit:
+                if slug == coord:
+                    continue  # coordinator is product-level, not a repo card
+                repo_map.setdefault(slug, {"slug": slug,
+                                           "name": slug.split("/")[-1],
+                                           "worktrees": []})
+        elif allow_forge and forge is not None:
             try:
                 member_slugs = forge.list_repos(p)
             except NotImplementedError:
                 member_slugs = []
-        for slug in member_slugs:
-            if slug.lower() == coord:
-                continue  # coordinator is product-level, not a repo card
-            repo_map.setdefault(slug.lower(),
-                                {"slug": slug, "name": slug.split("/")[-1],
-                                 "worktrees": []})
+            for slug in member_slugs:
+                if slug.lower() == coord:
+                    continue  # coordinator is product-level, not a repo card
+                repo_map.setdefault(slug.lower(),
+                                    {"slug": slug, "name": slug.split("/")[-1],
+                                     "worktrees": []})
 
-        # Membership: if `member_repos` is set, it's the AUTHORITATIVE whitelist
-        # (the product claims ONLY those slugs — org is ignored for membership).
-        # Otherwise fall back to org-match (org = product boundary, decision #4).
-        # This lets multiple products share one org by listing members explicitly.
-        explicit = {s.lower() for s in (p.get("member_repos") or [])}
-        use_whitelist = bool(explicit)
-        for slug in explicit:
-            repo_map.setdefault(slug, {"slug": slug, "name": slug.split("/")[-1],
-                                       "worktrees": []})
+        # Names already in the whitelist (so a local clone matches a whitelisted
+        # member even when its remote slug differs by owner — e.g. whitelist
+        # `owner-a/foo` vs the clone's remote `owner-b/foo`).
+        explicit_names = {s.split("/")[-1].lower() for s in explicit}
 
         for c in clones:
             c_slug = (c.get("slug") or "").lower()
@@ -538,7 +924,8 @@ def build_product_tree(cfg, clones, forge=None, allow_forge=False):
                 claimed.add(c["name"])
                 continue
             if use_whitelist:
-                if c_slug not in explicit:
+                # match by exact slug OR by repo name (cross-owner same repo)
+                if c_slug not in explicit and (c.get("name") or "").lower() not in explicit_names:
                     continue
             elif not (org and c_org == org):
                 continue
@@ -549,10 +936,28 @@ def build_product_tree(cfg, clones, forge=None, allow_forge=False):
             claimed.add(c["name"])
 
         pid = p.get("id") or p.get("forge_org") or "unknown"
+        # De-dupe repos by normalized NAME so the same repo reached via two
+        # different slugs (e.g. a whitelisted `owner-a/foo` plus the same repo
+        # `owner-b/foo` discovered from a local clone's remote) collapses to one
+        # card. Prefer the node that carries local worktrees when merging.
+        by_name = {}
+        for k in sorted(repo_map):
+            node = repo_map[k]
+            nk = norm(node.get("name") or "")
+            cur = by_name.get(nk)
+            if cur is None:
+                by_name[nk] = node
+                continue
+            # Merge duplicate (same name, different slug): keep worktrees from
+            # whichever node has them, and prefer a non-empty slug.
+            if node.get("worktrees") and not cur.get("worktrees"):
+                cur["worktrees"] = node["worktrees"]
+            if not cur.get("slug") and node.get("slug"):
+                cur["slug"] = node["slug"]
         products_out.append({
             "id": pid, "name": p.get("name") or pid,
             "coordinator_repo": p.get("coordinator_repo"),
-            "repos": [repo_map[k] for k in sorted(repo_map)],
+            "repos": [by_name[k] for k in sorted(by_name)],
         })
 
     unaffiliated = [{"slug": c.get("slug"), "name": c["name"],
@@ -589,7 +994,10 @@ def link_worktrees_to_cards(rows, cards):
     index = {}
     for c in cards:
         c.setdefault("has_worktree", False)
-        index.setdefault((norm(c.get("repo") or ""), norm(Path(c["path"]).stem)), c)
+        # Key by the card's slug (robust to folder-form plans whose path ends in
+        # README.md), falling back to the path stem for older cards.
+        slug = c.get("slug") or _slug_from_path(c["path"])
+        index.setdefault((norm(c.get("repo") or ""), norm(slug)), c)
     for row in rows:
         row["card"] = None
         if row.get("kind") != "worktree":
@@ -597,8 +1005,11 @@ def link_worktrees_to_cards(rows, cards):
         card = index.get((norm(row.get("repo") or ""), worktree_card_key(row)))
         if card:
             card["has_worktree"] = True
+            # Snapshot the card's goal too, so a worktree card can show real
+            # context (what the work *is*) instead of just the branch name.
             row["card"] = {"title": card["title"], "status": card["status"],
-                           "level": card["level"], "path": card["path"]}
+                           "level": card["level"], "path": card["path"],
+                           "goal": card.get("goal")}
 
 
 def main():
@@ -678,6 +1089,14 @@ def main():
             branch = e.get("branch", "(unknown)")
             dirty = dirty_count(path)
             last = last_commit_iso(path)
+            # Local work substance: the dirty file names and the unmerged commit
+            # subjects (work on this branch not yet on main). Only meaningful for
+            # worktrees; clones don't carry in-flight branch work here.
+            dirty_names, dirty_total = ([], 0)
+            unmerged, unmerged_total = ([], 0)
+            if kind == "worktree":
+                dirty_names, dirty_total = dirty_files(path)
+                unmerged, unmerged_total = unmerged_subjects(path, branch, base)
             merged = None
             ahead = behind = None
             if base and branch not in ("(detached)", "(unknown)"):
@@ -731,6 +1150,10 @@ def main():
                 "branch": branch, "dirty_files": dirty, "last_commit": last,
                 "ahead": ahead, "behind": behind, "merged": merged,
                 "pr": pr,
+                # local work substance (worktrees): dirty file names + unmerged
+                # commit subjects, each capped with a *_total for "+N more".
+                "dirty_files_names": dirty_names, "dirty_files_total": dirty_total,
+                "unmerged_commits": unmerged, "unmerged_total": unmerged_total,
                 "initiative": ini["name"] if ini else None,
                 "initiative_state": ini["state"] if ini else None,
                 "flags": flags,
@@ -757,6 +1180,29 @@ def main():
                         repo["prs"] = forge.list_prs(repo["slug"])
                     except NotImplementedError:
                         repo["prs"] = []
+
+    # Merge the LOCAL workbench folders into the kanban (enrich matching repo
+    # plans; surface workbench-only initiatives as their own cards). Local mode
+    # only — workbench is a filesystem store, absent in forge-only runs.
+    if local:
+        workbench_entries = collect_workbench(workspace_root)
+        merge_workbench_into_cards(kanban, workbench_entries)
+
+    # Forge-only data path (4th source): open PRs/issues with no local footprint.
+    # Reconcile against the local cards — matches attach, the rest become
+    # `remote-only` cards (e.g. a dangling build-spec). Needs `gh`; skipped
+    # under --no-gh. Runs in both local and forge-only modes.
+    if not args.no_gh:
+        forge_items = collect_forge_items(cfg, forge, products_out)
+        # repo name -> product id, so remote-only cards inherit their repo's
+        # product (a claw-playbook PR shows under Magic Me, not product=None).
+        repo_to_product = {}
+        for p in products_out:
+            for r in p.get("repos", []):
+                rn = (r.get("name") or (r.get("slug") or "").split("/")[-1])
+                if rn:
+                    repo_to_product[norm(rn)] = p.get("id")
+        merge_forge_items_into_cards(kanban, forge_items, now, repo_to_product)
 
     # Link inference: pair worktrees to plan cards by naming; unmatched stays
     # visible (worktree with card=None, card with has_worktree=False).

@@ -189,6 +189,10 @@ function repoForCard(card){
   return w&&w.repo?w.repo:null;
 }
 function cardAttention(card){
+  // A dangling build-spec (stuck in the pipeline) needs attention — must be
+  // consistent with the pipeline map's "N stuck" count so the health summary
+  // never contradicts it.
+  if(isDangling(card)) return {type:'dangling'};
   if(card.status==='blocked') return {type:'blocked'};
   const w=worktreeForCard(card);
   if(w){
@@ -210,10 +214,12 @@ function prMeta(pr){
 function attnMeta(type){
   if(type==='pr-review') return {tag:'review',color:'#9a6f22',bg:'#f6ecd6',action:'Review & merge the open PR'};
   if(type==='blocked') return {tag:'blocked',color:'#a85a39',bg:'#f4e3da',action:'Unblock this plan'};
+  if(type==='dangling') return {tag:'stuck',color:'#c0392b',bg:'#f6e3e0',action:'Stuck spec — launch or close it'};
   return {tag:'worktree',color:'#7a6a3f',bg:'#efe7d2',action:'Remove the merged worktree'};
 }
 // path inference (single helper, easy to swap later)
 function planPath(card){
+  if(card.source==='remote-only') return 'remote';
   const w=worktreeForCard(card);
   if(w&&((w.branch||'').includes('build-spec')||w.pr)) return 'cloud';
   if(w) return 'local';
@@ -223,6 +229,7 @@ function pathMeta(path){
   if(path==='cloud') return {tag:'cloud',color:'#9a7b3f',bg:'#f2e9d6'};
   if(path==='local') return {tag:'local',color:'#5f7d68',bg:'#e6efe7'};
   if(path==='openclaw') return {tag:'openclaw',color:'#9a6048',bg:'#f0e1d9'};
+  if(path==='remote') return {tag:'remote',color:'#4a6b8a',bg:'#e2ebf2'};
   return {tag:'unrouted',color:'#8c8576',bg:'#efeae0'};
 }
 // pipeline stages
@@ -233,7 +240,15 @@ const STAGES=[
   {key:'review',name:'in-review',color:'#c07f33'},
   {key:'shipped',name:'shipped',color:'#7faa8c'},
 ];
+function isRemoteOnly(c){return c.source==='remote-only';}
+function isDangling(c){return (c.flags||[]).indexOf('dangling-spec')>=0;}
 function planStage(card){
+  // Remote-only items (GitHub PR/issue, no local footprint) sit early in the
+  // pipeline; a dangling build-spec is "stuck" at spec'd.
+  if(isRemoteOnly(card)){
+    if(isDangling(card)) return {key:'spec',stuck:(card.age_days!=null?card.age_days+'d':'stuck')};
+    return {key:'spec',stuck:null};
+  }
   if(card.status==='completed'||card.status==='done') return {key:'shipped',stuck:null};
   if(card.status==='blocked') return {key:'executing',stuck:'6d'};
   if(card.status==='backlog') return {key:'spec',stuck:null};
@@ -258,6 +273,13 @@ function buildPrompt(card,prod){
 function goTo(level,productId,planId,repoId){
   STATE.level=level;STATE.productId=productId??null;STATE.planId=planId??null;STATE.repoId=repoId??null;
   STATE.doneOpen=false;STATE.mapExpanded={};STATE.mapAll=false;
+  // When opening a plan, resolve its real product/repo up front so crumbs +
+  // back-link are correct even when navigated from the fleet map (null product).
+  if(level==='plan'){
+    const c=findCard(STATE.productId,STATE.repoId,STATE.planId);
+    if(c){ if(STATE.productId==null&&c.product!=null) STATE.productId=c.product;
+           if(STATE.repoId==null){const r=repoForCard(c);if(r)STATE.repoId=r;} }
+  }
   window.scrollTo({top:0});render();
 }
 
@@ -279,21 +301,27 @@ function renderCrumbs(){
 }
 
 // ---------- PIPELINE MAP (shared) ----------
-function inFlight(plans){return plans.filter(c=>c.status==='active'||c.status==='backlog'||c.status==='blocked');}
+function inFlight(plans){return plans.filter(c=>c.status==='active'||c.status==='backlog'||c.status==='blocked'||isRemoteOnly(c));}
 function mapChip(card,prod){
   const pm=pathMeta(planPath(card)),stg=planStage(card),w=worktreeForCard(card),pr=(w&&w.pr)||{};
   const a=cardAttention(card);
-  const accent=stg.stuck?'#d99a2c':(a?'#cf962f':pm.color);
-  const chip=el('<button class="pmchip" data-plan="'+attr(card.title)+'" data-path="'+pm.tag+'" data-stuck="'+(!!stg.stuck)+'" title="'+attr(card.title)+'"></button>');
+  const accent=isDangling(card)?'#c0392b':(stg.stuck?'#d99a2c':(a?'#cf962f':pm.color));
+  const chip=el('<button class="pmchip" data-plan="'+attr(card.title)+'" data-path="'+pm.tag+'" data-stuck="'+(!!stg.stuck)+'" data-remote="'+isRemoteOnly(card)+'" data-dangling="'+isDangling(card)+'" title="'+attr(card.title)+'"></button>');
   let meta='<div style="display:flex;align-items:center;gap:5px;margin-top:6px;flex-wrap:wrap">'
     +'<span class="mono" style="font-size:8.5px;color:'+pm.color+';background:'+pm.bg+';padding:1px 5px;border-radius:4px">'+pm.tag+'</span>';
   if(pr.number) meta+='<span class="mono" style="font-size:8.5px;color:#9a6f22">PR #'+pr.number+'</span>';
+  if(card.github&&card.github.number) meta+='<span class="mono" style="font-size:8.5px;color:#4a6b8a">'+(card.github.kind==='issue'?'issue':'PR')+' #'+card.github.number+'</span>';
+  if(isDangling(card)) meta+='<span class="mono" style="display:inline-flex;align-items:center;gap:3px;font-size:8.5px;color:#c0392b;background:#f6e3e0;padding:1px 5px;border-radius:4px">⚠ dangling spec</span>';
   if(stg.stuck) meta+='<span class="mono" style="display:inline-flex;align-items:center;gap:3px;font-size:8.5px;color:#b5701f"><span style="width:5px;height:5px;border-radius:50%;background:#d99a2c;animation:pulseAmber 1.8s ease-in-out infinite"></span>stuck '+stg.stuck+'</span>';
   if(a) meta+='<span style="width:6px;height:6px;border-radius:50%;background:#cf962f;box-shadow:0 0 0 2.5px rgba(207,150,47,.16)"></span>';
   meta+='</div>';
   chip.style.borderLeft='3px solid '+accent;
   chip.innerHTML='<div class="mono" style="font-size:10.5px;color:#33302a;line-height:1.25;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(card.title)+'</div>'+meta;
-  chip.onclick=()=>goTo('plan',prod?prod.id:STATE.productId,card.title,repoForCard(card));
+  // Navigate with the card's OWN product/repo so it opens correctly even from
+  // the fleet-level map (where STATE.productId is null). Fall back to the card's
+  // product field, then the scope's product.
+  const pid=(prod&&prod.id)||card.product||STATE.productId;
+  chip.onclick=()=>goTo('plan',pid,card.title,repoForCard(card));
   return chip;
 }
 function pipelineGroups(plans){
@@ -544,10 +572,29 @@ function kanbanCol(kind,plans,repoName){
 }
 
 // ---------- L4 PLAN (feature hub) ----------
+function findCard(productId,repoId,planId){
+  // Prefer a card scoped to the current product + repo (titles can collide
+  // across repos/products). Fall back to ALL cards by title so a plan opened
+  // from the fleet-level map (productId may be null) still resolves.
+  const all=kanban();
+  let pool=all.filter(c=>c.title===planId);
+  if(pool.length>1 && productId!=null){
+    const scoped=pool.filter(c=>c.product===productId);
+    if(scoped.length) pool=scoped;
+  }
+  if(pool.length>1 && repoId){
+    const r=pool.filter(c=>repoForCard(c)===repoId);
+    if(r.length) pool=r;
+  }
+  return pool[0]||null;
+}
 function renderPlan(app){
-  const p=products().find(x=>x.id===STATE.productId);
-  const card=plansFor(STATE.productId).find(c=>c.title===STATE.planId);
+  const card=findCard(STATE.productId,STATE.repoId,STATE.planId);
   if(!card){app.appendChild(el('<p class="empty">Plan not found.</p>'));return;}
+  // Backfill STATE from the resolved card so breadcrumbs/back-link are correct
+  // even when we arrived from the fleet map with a null product.
+  if(STATE.productId==null && card.product!=null) STATE.productId=card.product;
+  const p=products().find(x=>x.id===STATE.productId);
   const repoName=STATE.repoId||repoForCard(card)||'product-level';
   const w=worktreeForCard(card),pr=prMeta(w&&w.pr),a=cardAttention(card);
   const pm=pathMeta(planPath(card));
@@ -576,11 +623,22 @@ function renderPlan(app){
   // work links
   const links=el('<div class="links" data-region="links" data-visibility="public"></div>');
   links.appendChild(el('<div class="mono" style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#a39c8c;padding:12px 16px 0">The work</div>'));
-  const planHref=card.path?'file://'+card.path:'#';
-  links.appendChild(el('<a href="'+attr(planHref)+'" data-field="plan-doc" class="lrow"><span class="lk">plan</span><span class="lv">'+esc(card.path||'—')+'</span><span style="flex:none;color:#c2b89f">&#8599;</span></a>'));
-  links.appendChild(el('<div data-field="issue" class="lrow"><span class="lk">issue</span><span class="lv muted">— (link inference: not wired yet)</span></div>'));
+  // plan row: a remote-only card's path IS its GitHub URL (link it as such);
+  // a local card's path is a file on disk.
+  const gh=card.github;
+  const remotePlan=!!(card.path&&/^https?:\/\//.test(card.path));
+  const planHref=remotePlan?card.path:(card.path?'file://'+card.path:'#');
+  links.appendChild(el('<a href="'+attr(planHref)+'"'+(remotePlan?' target="_blank" rel="noopener"':'')+' data-field="plan-doc" class="lrow"><span class="lk">'+(remotePlan?'source':'plan')+'</span><span class="lv">'+esc(card.path||'—')+'</span><span style="flex:none;color:#c2b89f">&#8599;</span></a>'));
+  // issue / PR: wire the GitHub ref+url when the card carries one.
+  if(gh&&gh.number){
+    const kind=gh.kind==='issue'?'issue':'pr';
+    const lbl=(gh.kind==='issue'?'issue #':'PR #')+gh.number+(gh.title?' — '+gh.title:'');
+    links.appendChild(el('<a href="'+attr(gh.url||'#')+'" target="_blank" rel="noopener" data-field="'+kind+'" class="lrow"><span class="lk">'+kind+'</span><span class="lv">'+esc(lbl)+'</span><span style="flex:none;color:#c2b89f">&#8599;</span></a>'));
+  } else {
+    links.appendChild(el('<div data-field="issue" class="lrow"><span class="lk">issue</span><span class="lv muted">—</span></div>'));
+  }
   if(w&&w.pr&&w.pr.number) links.appendChild(el('<div data-field="pr" class="lrow"><span class="lk">pr</span><span class="lv" style="display:flex;align-items:center;gap:7px;color:'+pr.color+'"><span style="width:7px;height:7px;border-radius:50%;background:'+pr.dot+';flex:none"></span>'+esc(pr.label)+'</span></div>'));
-  else links.appendChild(el('<div data-field="pr" class="lrow"><span class="lk">pr</span><span class="lv muted">no PR</span></div>'));
+  else if(!(gh&&gh.kind==='pr')) links.appendChild(el('<div data-field="pr" class="lrow"><span class="lk">pr</span><span class="lv muted">no PR</span></div>'));
   links.appendChild(el('<div data-field="branch" class="lrow"><span class="lk">branch</span><span class="lv">'+esc(w&&w.branch||'—')+'</span></div>'));
   left.appendChild(links);
 
@@ -595,6 +653,37 @@ function renderPlan(app){
       +'</div>';
     left.appendChild(lo);
   }
+
+  // IN FLIGHT — the actual local work substance: unmerged commits + dirty files.
+  // This is what makes a worktree card rich instead of a bare branch name.
+  if(w && ((w.unmerged_commits&&w.unmerged_commits.length) || (w.dirty_files_names&&w.dirty_files_names.length))){
+    const inflight=el('<div class="inflight" data-region="in-flight" data-visibility="local" style="margin-top:14px;border:1px solid #e9e3d7;border-radius:8px;background:#fffdf9;padding:14px 16px"></div>');
+    let h='<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><span class="mono" style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#5e7d6a">In flight</span><span style="font-size:11px;color:#aaa291;font-style:italic">work on this branch, not yet on main</span></div>';
+    if(w.unmerged_commits&&w.unmerged_commits.length){
+      h+='<div style="margin-bottom:'+((w.dirty_files_names&&w.dirty_files_names.length)?'10px':'0')+'"><div class="mono" style="font-size:9.5px;text-transform:uppercase;color:#b3a98f;margin-bottom:5px">unmerged commits ('+(w.unmerged_total||w.unmerged_commits.length)+')</div><ul style="margin:0;padding-left:16px;list-style:none">'
+        +w.unmerged_commits.map(s=>'<li style="display:flex;gap:8px;align-items:baseline;margin:3px 0"><span style="flex:none;color:#7faa8c">•</span><span class="mono" style="font-size:12px;color:#3b372f;overflow-wrap:anywhere">'+esc(s)+'</span></li>').join('')
+        +'</ul>'+((w.unmerged_total||0)>w.unmerged_commits.length?'<div class="mono" style="font-size:11px;color:#aaa291;margin-top:3px;padding-left:16px">+ '+(w.unmerged_total-w.unmerged_commits.length)+' more</div>':'')+'</div>';
+    }
+    if(w.dirty_files_names&&w.dirty_files_names.length){
+      h+='<div><div class="mono" style="font-size:9.5px;text-transform:uppercase;color:#b3a98f;margin-bottom:5px">uncommitted files ('+(w.dirty_files_total||w.dirty_files_names.length)+')</div><ul style="margin:0;padding-left:16px;list-style:none">'
+        +w.dirty_files_names.map(f=>'<li style="display:flex;gap:8px;align-items:baseline;margin:3px 0"><span style="flex:none;color:#cbab6a">•</span><span class="mono" style="font-size:12px;color:#a8916a;overflow-wrap:anywhere">'+esc(f)+'</span></li>').join('')
+        +'</ul>'+((w.dirty_files_total||0)>w.dirty_files_names.length?'<div class="mono" style="font-size:11px;color:#aaa291;margin-top:3px;padding-left:16px">+ '+(w.dirty_files_total-w.dirty_files_names.length)+' more</div>':'')+'</div>';
+    }
+    inflight.innerHTML=h;
+    left.appendChild(inflight);
+  }
+
+  // LOCAL WORKING CONTEXT — the paired workbench folder (the local working
+  // surface that mirrors the durable repo plan).
+  if(card.workbench){
+    const wb=card.workbench;
+    const box=el('<div class="workbench" data-region="workbench" data-visibility="local" style="margin-top:14px;border:1px dashed #cdbf9e;border-radius:8px;background:#fbf7ef;padding:13px 16px"></div>');
+    box.innerHTML='<div class="mono" style="font-size:9.5px;text-transform:uppercase;letter-spacing:.12em;color:#a8916a;margin-bottom:6px">local working context · workbench</div>'
+      +'<div class="mono" style="font-size:12px;color:#6e6757;overflow-wrap:anywhere">'+esc(wb.path)+'</div>'
+      +'<div class="mono" style="font-size:11px;color:#aaa291;margin-top:5px">'+(wb.has_readme?'README + resources':'folder')+' · '+esc(wb.status)+'</div>';
+    left.appendChild(box);
+  }
+
   grid.appendChild(left);
 
   // handoff
