@@ -11,6 +11,7 @@ Usage:
 """
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -35,6 +36,85 @@ def worktree_dirty(path):
     r = subprocess.run(["git", "-C", path, "status", "--porcelain"],
                        capture_output=True, text=True)
     return r.returncode == 0 and bool(r.stdout.strip())
+
+
+# --------------------------------------------------------------------------
+# Duplicate-card detection: same initiative living unmerged across sources.
+#
+# The collector merges cards by EXACT normalized slug. Cards that are really
+# the same initiative but whose slugs differ (e.g. plan `venmo-enrichment.md`,
+# workbench `venmo_enrichment/`, PR branch `bosque/...venmo...`) stay separate.
+# This finds those likely-same pairs (fuzzy, within a repo, across sources) and
+# proposes the slug alignment to merge them. Report-only.
+# --------------------------------------------------------------------------
+
+def _slug_norm(s):
+    return re.sub(r"[-_\s]+", "-", (s or "").lower()).strip("-")
+
+
+def _tokens(s):
+    # word tokens from slug/title, dropping noise words that don't disambiguate.
+    stop = {"the", "a", "an", "and", "or", "for", "to", "of", "plan", "spec",
+            "build", "system", "v1", "v2", "v3", "2026", "bosque"}
+    words = re.split(r"[-_\s:]+", (s or "").lower())
+    return {w for w in words if w and w not in stop and not w.isdigit()}
+
+
+def _similarity(a, b):
+    """Jaccard token overlap between two card identities (slug+title)."""
+    ta = _tokens(a.get("slug") or "") | _tokens(a.get("title") or "")
+    tb = _tokens(b.get("slug") or "") | _tokens(b.get("title") or "")
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def _source_of(c):
+    return c.get("source") or "repo-plan"
+
+
+def find_duplicate_cards(cards, threshold=0.5):
+    """Return likely-same-initiative pairs from DIFFERENT sources in the SAME
+    product/repo that did NOT auto-merge (their normalized slugs differ).
+    Each pair: (a, b, score, shared_tokens). Sorted strongest-first."""
+    pairs = []
+    n = len(cards)
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = cards[i], cards[j]
+            if _source_of(a) == _source_of(b):
+                continue  # same source can't be a cross-source duplicate
+            # same product (and repo when both have one)
+            if (a.get("product") or None) != (b.get("product") or None):
+                continue
+            if a.get("repo") and b.get("repo") and a.get("repo") != b.get("repo"):
+                continue
+            if _slug_norm(a.get("slug")) == _slug_norm(b.get("slug")):
+                continue  # would have already auto-merged
+            score = _similarity(a, b)
+            if score >= threshold:
+                shared = (_tokens(a.get("slug") or "") | _tokens(a.get("title") or "")) & \
+                         (_tokens(b.get("slug") or "") | _tokens(b.get("title") or ""))
+                pairs.append((a, b, round(score, 2), sorted(shared)))
+    pairs.sort(key=lambda p: p[2], reverse=True)
+    return pairs
+
+
+def _align_suggestion(a, b):
+    """Propose the concrete move to unify a pair: align the more-malleable
+    source's slug to the durable repo-plan's slug. Returns a human string."""
+    order = {"repo-plan": 0, "workbench-only": 1, "remote-only": 2}
+    keep, change = sorted([a, b], key=lambda c: order.get(_source_of(c), 9))
+    target = keep.get("slug") or _slug_norm(keep.get("title"))
+    src = _source_of(change)
+    if src == "workbench-only":
+        return (f"rename workbench dir → '{target}' (match the repo plan slug) "
+                f"so they merge   [{change.get('path')}]")
+    if src == "remote-only":
+        gh = change.get("github") or {}
+        return (f"align PR/issue {('#'+str(gh.get('number'))) if gh.get('number') else ''} "
+                f"branch/title to slug '{target}', or add a repo plan with that slug")
+    return f"align slug to '{target}'"
 
 
 def main():
@@ -65,12 +145,15 @@ def main():
     no_wt = [c for c in d.get("kanban", [])
              if c.get("status") in ("active",) and not c.get("has_worktree")]
 
+    # likely-duplicate cards: same initiative unmerged across sources
+    dups = find_duplicate_cards(d.get("kanban", []))
+
     # ---- print report ----
     print(f"\n  FLEET DOCTOR  ·  {len(wts)} worktrees  ·  generated {d.get('generated_at','?')[:16]}")
     print("  " + "-" * 60)
     print(f"  {len(reapable)} reapable   {len(stale)} stale   "
           f"{len(orphan)} orphan   {len(behind)} behind-origin   "
-          f"{len(no_wt)} active-plan-without-worktree")
+          f"{len(no_wt)} active-plan-without-worktree   {len(dups)} likely-duplicate")
     print()
 
     if reapable:
@@ -101,8 +184,18 @@ def main():
         if len(no_wt) > 12:
             print(f"      … +{len(no_wt)-12} more")
         print()
+    if dups:
+        print("  · LIKELY THE SAME INITIATIVE (unmerged across sources) — align to merge:")
+        for a, b, score, shared in dups[:15]:
+            sa, sb = _source_of(a), _source_of(b)
+            print(f"      [{score}] {a.get('title')[:38]!r} ({sa})")
+            print(f"            ↔  {b.get('title')[:38]!r} ({sb})   shared: {', '.join(shared)}")
+            print(f"            → {_align_suggestion(a, b)}")
+        if len(dups) > 15:
+            print(f"      … +{len(dups)-15} more pairs")
+        print()
 
-    healthy = not (reapable or stale or orphan)
+    healthy = not (reapable or stale or orphan or dups)
     print("  " + ("✓ nothing to reap; fleet is in a healthy state."
                   if healthy else "→ review the items above. Nothing was changed (report only)."))
     print()
