@@ -937,5 +937,110 @@ class SmokeRunTests(unittest.TestCase):
         self.assertIn("Fleet Dashboard", html)
 
 
+class FolderFormPlanTests(unittest.TestCase):
+    """Repo plan reader accepts a flat <slug>.md OR a folder <slug>/README.md."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name) / "plans"
+        (self.base / "active").mkdir(parents=True)
+        # flat file form
+        (self.base / "active" / "flat-plan.md").write_text(
+            "---\ntitle: Flat Plan\n---\nthe flat goal line\n")
+        # folder form (slug = dir name; content from README.md)
+        folder = self.base / "active" / "folder-plan"
+        folder.mkdir()
+        (folder / "README.md").write_text(
+            "---\ntitle: Folder Plan\n---\nthe folder goal line\n")
+        (folder / "diagram.txt").write_text("resource")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_reads_both_forms(self):
+        cards = collector._kanban_local(self.base, ["active"], "repo", "p", "r")
+        by = {c["title"]: c for c in cards}
+        self.assertIn("Flat Plan", by)
+        self.assertIn("Folder Plan", by)
+        # folder-form slug is the DIR name, not 'README'
+        self.assertEqual(by["Folder Plan"]["slug"], "folder-plan")
+        self.assertEqual(by["Flat Plan"]["slug"], "flat-plan")
+        self.assertEqual(by["Folder Plan"]["goal"], "the folder goal line")
+
+
+class WorkbenchReaderTests(unittest.TestCase):
+    """collect_workbench() walks <repo>_workspace/workbench/<slug>/ (active at
+    root, completed/ subdir) and reads README content."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        bench = self.ws / "claw-playbook_workspace" / "workbench"
+        (bench / "cot_trip_matcher").mkdir(parents=True)
+        (bench / "cot_trip_matcher" / "README.md").write_text(
+            "---\ntitle: COT Trip Matcher\n---\nmatch trips to receipts\n")
+        (bench / "completed" / "reminder_revive").mkdir(parents=True)
+        (bench / "completed" / "reminder_revive" / "README.md").write_text("done work\n")
+        # a no-README folder still counts (title = dir name)
+        (bench / "venmo_enrichment").mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_reads_active_and_completed(self):
+        entries = collector.collect_workbench(self.ws)
+        by = {e["slug"]: e for e in entries}
+        self.assertEqual(by["cot_trip_matcher"]["status"], "active")
+        self.assertEqual(by["cot_trip_matcher"]["repo"], "claw-playbook")
+        self.assertEqual(by["cot_trip_matcher"]["title"], "COT Trip Matcher")
+        self.assertTrue(by["cot_trip_matcher"]["has_readme"])
+        self.assertEqual(by["reminder_revive"]["status"], "completed")
+        # no-README folder: present, title falls back to dir name
+        self.assertIn("venmo_enrichment", by)
+        self.assertFalse(by["venmo_enrichment"]["has_readme"])
+
+
+class MergeWorkbenchTests(unittest.TestCase):
+    """merge_workbench_into_cards: enrich matching repo plan; surface
+    workbench-only initiatives; match across _/- normalization."""
+
+    def _plan_card(self, repo, slug, status="active"):
+        c = collector._card("repo", "p", repo, status, slug, f"/plans/{slug}.md", "body")
+        return c
+
+    def test_enriches_matching_plan_normalized(self):
+        # repo plan slug uses hyphens; workbench folder uses underscores
+        cards = [self._plan_card("claw-playbook", "cot-trip-matcher")]
+        wb = [{"repo": "claw-playbook", "slug": "cot_trip_matcher",
+               "status": "active", "path": "/ws/cot_trip_matcher",
+               "title": "X", "goal": None, "body": "", "has_readme": True}]
+        merged = collector.merge_workbench_into_cards(cards, wb)
+        self.assertEqual(len(merged), 1)  # enriched, not duplicated
+        self.assertIsNotNone(merged[0]["workbench"])
+        self.assertEqual(merged[0]["workbench"]["path"], "/ws/cot_trip_matcher")
+
+    def test_workbench_only_becomes_card(self):
+        cards = []
+        wb = [{"repo": "ableton-mcp", "slug": "mcp_exploration",
+               "status": "active", "path": "/ws/mcp_exploration",
+               "title": "MCP Exploration", "goal": "g", "body": "b",
+               "has_readme": True}]
+        merged = collector.merge_workbench_into_cards(cards, wb)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["source"], "workbench-only")
+        self.assertEqual(merged[0]["title"], "MCP Exploration")
+        self.assertEqual(merged[0]["repo"], "ableton-mcp")
+        self.assertIsNotNone(merged[0]["workbench"])
+
+    def test_different_repo_same_slug_not_merged(self):
+        # same slug in two repos must NOT cross-merge
+        cards = [self._plan_card("yogada", "homepage")]
+        wb = [{"repo": "yogada-shop", "slug": "homepage", "status": "active",
+               "path": "/ws/homepage", "title": "H", "goal": None,
+               "body": "", "has_readme": False}]
+        merged = collector.merge_workbench_into_cards(cards, wb)
+        self.assertEqual(len(merged), 2)  # yogada plan + yogada-shop workbench-only
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

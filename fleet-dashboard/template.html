@@ -614,6 +614,18 @@ function renderPlan(app){
     inflight.innerHTML=h;
     left.appendChild(inflight);
   }
+
+  // LOCAL WORKING CONTEXT — the paired workbench folder (the local working
+  // surface that mirrors the durable repo plan).
+  if(card.workbench){
+    const wb=card.workbench;
+    const box=el('<div class="workbench" data-region="workbench" data-visibility="local" style="margin-top:14px;border:1px dashed #cdbf9e;border-radius:8px;background:#fbf7ef;padding:13px 16px"></div>');
+    box.innerHTML='<div class="mono" style="font-size:9.5px;text-transform:uppercase;letter-spacing:.12em;color:#a8916a;margin-bottom:6px">local working context · workbench</div>'
+      +'<div class="mono" style="font-size:12px;color:#6e6757;overflow-wrap:anywhere">'+esc(wb.path)+'</div>'
+      +'<div class="mono" style="font-size:11px;color:#aaa291;margin-top:5px">'+(wb.has_readme?'README + resources':'folder')+' · '+esc(wb.status)+'</div>';
+    left.appendChild(box);
+  }
+
   grid.appendChild(left);
 
   // handoff

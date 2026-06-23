@@ -358,24 +358,57 @@ def _plan_goal(text):
     return None
 
 
-def _card(level, product_id, repo_name, status, title, path, text=""):
+def _slug_from_path(path):
+    """Derive an initiative slug from a plan/card path. Handles both the flat
+    `<slug>.md` form (stem = slug) and the folder `<slug>/README.md` form
+    (the parent dir name is the slug, not 'README')."""
+    p = Path(path)
+    if p.name.lower() == "readme.md":
+        return p.parent.name
+    return p.stem
+
+
+def _card(level, product_id, repo_name, status, title, path, text="", slug=None):
     return {"level": level, "product": product_id, "repo": repo_name,
             "status": status, "title": title, "path": str(path),
-            "goal": _plan_goal(text), "body": text or ""}
+            "slug": slug or _slug_from_path(path),
+            "goal": _plan_goal(text), "body": text or "",
+            "workbench": None}
+
+
+def _read_plan_entry(entry):
+    """Given a plan entry that is EITHER a flat `<slug>.md` file OR a folder
+    `<slug>/README.md`, return (slug, path_to_render, text). The two forms are
+    equivalent (a richer plan gets a folder); the slug is the file stem or the
+    dir name. Returns None if the entry isn't a recognizable plan."""
+    if entry.is_file() and entry.suffix == ".md":
+        return entry.stem, entry, entry.read_text(errors="replace")
+    if entry.is_dir():
+        readme = entry / "README.md"
+        text = readme.read_text(errors="replace") if readme.is_file() else ""
+        # A folder is a plan if it has a README (content) — else treat as a
+        # plain folder card keyed by its dir name with no body.
+        return entry.name, (readme if readme.is_file() else entry), text
+    return None
 
 
 def _kanban_local(base_dir, columns, level, product_id, repo_name):
-    """Read cards from <base_dir>/<column>/*.md on the local filesystem."""
+    """Read cards from <base_dir>/<column>/ on the local filesystem. Each entry
+    may be a flat `<slug>.md` file OR a folder `<slug>/README.md` — both forms
+    produce one card (the folder form mirrors the workbench shape)."""
     cards = []
     base = Path(base_dir)
     for column in columns:
         col_dir = base / column
         if not col_dir.is_dir():
             continue
-        for md in sorted(col_dir.glob("*.md")):
-            text = md.read_text(errors="replace")
-            title = parse_frontmatter_title(text) or md.stem
-            cards.append(_card(level, product_id, repo_name, column, title, md, text))
+        for entry in sorted(col_dir.iterdir()):
+            parsed = _read_plan_entry(entry)
+            if parsed is None:
+                continue
+            slug, path, text = parsed
+            title = parse_frontmatter_title(text) or slug
+            cards.append(_card(level, product_id, repo_name, column, title, path, text))
     return cards
 
 
@@ -465,6 +498,86 @@ def collect_kanban(cfg, workspace_root, forge=None, use_forge=False):
         seen.add(c["path"])
         unique.append(c)
     return unique
+
+
+# --------------------------------------------------------------------------
+# Workbench reader (the LOCAL working surface, mirror of repo plans)
+#
+# An initiative's local working folder lives at
+# <repo>_workspace/workbench/<slug>/ (README + resources + .code-workspace).
+# Root-level dirs = active; a `completed/` subdir holds done initiatives. This
+# is the enrichment half of the mirror: repo/plans is the durable record,
+# workbench is the local working copy. Keyed by the same normalized slug.
+# --------------------------------------------------------------------------
+
+def collect_workbench(workspace_root):
+    """Walk every `<repo>_workspace/workbench/<slug>/` initiative folder and
+    return entries {repo, slug, status, path, title, goal, body, has_readme}.
+
+    `repo` is the parent repo name (the `<repo>` of `<repo>_workspace`). Root
+    dirs are `active`; dirs under a `completed/` subdir are `completed`. README
+    content (if present) supplies title/goal/body."""
+    entries = []
+    workspace_root = Path(workspace_root)
+    if not workspace_root.is_dir():
+        return entries
+    for ws in sorted(workspace_root.iterdir()):
+        if not ws.is_dir() or not ws.name.endswith("_workspace"):
+            continue
+        repo = ws.name[: -len("_workspace")]
+        bench = ws / "workbench"
+        if not bench.is_dir():
+            continue
+        # (status, base_dir) pairs: active = bench root, completed = bench/completed
+        scopes = [("active", bench), ("completed", bench / "completed")]
+        for status, base in scopes:
+            if not base.is_dir():
+                continue
+            for d in sorted(base.iterdir()):
+                if not d.is_dir() or d.name == "completed":
+                    continue
+                readme = d / "README.md"
+                has_readme = readme.is_file()
+                text = readme.read_text(errors="replace") if has_readme else ""
+                title = parse_frontmatter_title(text) or d.name
+                entries.append({
+                    "repo": repo, "slug": d.name, "status": status,
+                    "path": str(d), "title": title,
+                    "goal": _plan_goal(text), "body": text,
+                    "has_readme": has_readme,
+                })
+    return entries
+
+
+def merge_workbench_into_cards(cards, workbench_entries):
+    """Merge workbench folders into the kanban cards by (repo, normalized slug).
+
+    - A workbench entry whose slug matches a repo plan card ENRICHES that card
+      (attaches `workbench` = {path, has_readme, status}). The repo plan stays
+      authoritative for status/goal/body.
+    - A workbench entry with NO matching repo plan becomes its own card (a
+      local-only initiative not yet committed to the repo); its body/goal come
+      from the workbench README.
+    Returns the (possibly extended) card list."""
+    index = {}
+    for c in cards:
+        index[(norm(c.get("repo") or ""), norm(c.get("slug") or ""))] = c
+    for wb in workbench_entries:
+        key = (norm(wb["repo"]), norm(wb["slug"]))
+        card = index.get(key)
+        wb_attach = {"path": wb["path"], "has_readme": wb["has_readme"],
+                     "status": wb["status"]}
+        if card is not None:
+            card["workbench"] = wb_attach
+        else:
+            # Local-only initiative: workbench stands in as the card.
+            new = _card("repo", None, wb["repo"], wb["status"], wb["title"],
+                        wb["path"], wb["body"], slug=wb["slug"])
+            new["workbench"] = wb_attach
+            new["source"] = "workbench-only"
+            cards.append(new)
+            index[key] = new
+    return cards
 
 
 # --------------------------------------------------------------------------
@@ -614,7 +727,10 @@ def link_worktrees_to_cards(rows, cards):
     index = {}
     for c in cards:
         c.setdefault("has_worktree", False)
-        index.setdefault((norm(c.get("repo") or ""), norm(Path(c["path"]).stem)), c)
+        # Key by the card's slug (robust to folder-form plans whose path ends in
+        # README.md), falling back to the path stem for older cards.
+        slug = c.get("slug") or _slug_from_path(c["path"])
+        index.setdefault((norm(c.get("repo") or ""), norm(slug)), c)
     for row in rows:
         row["card"] = None
         if row.get("kind") != "worktree":
@@ -797,6 +913,13 @@ def main():
                         repo["prs"] = forge.list_prs(repo["slug"])
                     except NotImplementedError:
                         repo["prs"] = []
+
+    # Merge the LOCAL workbench folders into the kanban (enrich matching repo
+    # plans; surface workbench-only initiatives as their own cards). Local mode
+    # only — workbench is a filesystem store, absent in forge-only runs.
+    if local:
+        workbench_entries = collect_workbench(workspace_root)
+        merge_workbench_into_cards(kanban, workbench_entries)
 
     # Link inference: pair worktrees to plan cards by naming; unmatched stays
     # visible (worktree with card=None, card with has_worktree=False).
