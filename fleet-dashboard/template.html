@@ -595,6 +595,25 @@ function renderPlan(app){
       +'</div>';
     left.appendChild(lo);
   }
+
+  // IN FLIGHT — the actual local work substance: unmerged commits + dirty files.
+  // This is what makes a worktree card rich instead of a bare branch name.
+  if(w && ((w.unmerged_commits&&w.unmerged_commits.length) || (w.dirty_files_names&&w.dirty_files_names.length))){
+    const inflight=el('<div class="inflight" data-region="in-flight" data-visibility="local" style="margin-top:14px;border:1px solid #e9e3d7;border-radius:8px;background:#fffdf9;padding:14px 16px"></div>');
+    let h='<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><span class="mono" style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#5e7d6a">In flight</span><span style="font-size:11px;color:#aaa291;font-style:italic">work on this branch, not yet on main</span></div>';
+    if(w.unmerged_commits&&w.unmerged_commits.length){
+      h+='<div style="margin-bottom:'+((w.dirty_files_names&&w.dirty_files_names.length)?'10px':'0')+'"><div class="mono" style="font-size:9.5px;text-transform:uppercase;color:#b3a98f;margin-bottom:5px">unmerged commits ('+(w.unmerged_total||w.unmerged_commits.length)+')</div><ul style="margin:0;padding-left:16px;list-style:none">'
+        +w.unmerged_commits.map(s=>'<li style="display:flex;gap:8px;align-items:baseline;margin:3px 0"><span style="flex:none;color:#7faa8c">•</span><span class="mono" style="font-size:12px;color:#3b372f;overflow-wrap:anywhere">'+esc(s)+'</span></li>').join('')
+        +'</ul>'+((w.unmerged_total||0)>w.unmerged_commits.length?'<div class="mono" style="font-size:11px;color:#aaa291;margin-top:3px;padding-left:16px">+ '+(w.unmerged_total-w.unmerged_commits.length)+' more</div>':'')+'</div>';
+    }
+    if(w.dirty_files_names&&w.dirty_files_names.length){
+      h+='<div><div class="mono" style="font-size:9.5px;text-transform:uppercase;color:#b3a98f;margin-bottom:5px">uncommitted files ('+(w.dirty_files_total||w.dirty_files_names.length)+')</div><ul style="margin:0;padding-left:16px;list-style:none">'
+        +w.dirty_files_names.map(f=>'<li style="display:flex;gap:8px;align-items:baseline;margin:3px 0"><span style="flex:none;color:#cbab6a">•</span><span class="mono" style="font-size:12px;color:#a8916a;overflow-wrap:anywhere">'+esc(f)+'</span></li>').join('')
+        +'</ul>'+((w.dirty_files_total||0)>w.dirty_files_names.length?'<div class="mono" style="font-size:11px;color:#aaa291;margin-top:3px;padding-left:16px">+ '+(w.dirty_files_total-w.dirty_files_names.length)+' more</div>':'')+'</div>';
+    }
+    inflight.innerHTML=h;
+    left.appendChild(inflight);
+  }
   grid.appendChild(left);
 
   // handoff

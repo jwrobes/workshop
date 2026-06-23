@@ -84,6 +84,31 @@ def dirty_count(path):
     return len(out.splitlines()) if code == 0 and out else 0
 
 
+def dirty_files(path, cap=10):
+    """Return (names, total): the uncommitted file paths in a worktree (porcelain),
+    capped to `cap` names. `total` is the full count (so the UI can say "+N more")."""
+    code, out = git(path, "status", "--porcelain")
+    if code != 0 or not out:
+        return [], 0
+    lines = out.splitlines()
+    # porcelain lines are "XY <path>" (rename shows "old -> new"); take the path tail.
+    names = [ln[3:].split(" -> ")[-1].strip() for ln in lines if len(ln) > 3]
+    return names[:cap], len(names)
+
+
+def unmerged_subjects(path, branch, base, cap=10):
+    """Return (subjects, total): commit subjects on `branch` not yet on
+    origin/<base> — the actual in-flight work. Capped to `cap`; `total` is the
+    full count. ([], 0) when not computable (detached, missing base, etc.)."""
+    if not base or branch in ("(detached)", "(unknown)") or branch == base:
+        return [], 0
+    code, out = git(path, "log", "--format=%s", f"origin/{base}..{branch}")
+    if code != 0 or not out:
+        return [], 0
+    subjects = [ln for ln in out.splitlines() if ln.strip()]
+    return subjects[:cap], len(subjects)
+
+
 def last_commit_iso(path):
     code, out = git(path, "log", "-1", "--format=%cI")
     return out if code == 0 and out else None
@@ -597,8 +622,11 @@ def link_worktrees_to_cards(rows, cards):
         card = index.get((norm(row.get("repo") or ""), worktree_card_key(row)))
         if card:
             card["has_worktree"] = True
+            # Snapshot the card's goal too, so a worktree card can show real
+            # context (what the work *is*) instead of just the branch name.
             row["card"] = {"title": card["title"], "status": card["status"],
-                           "level": card["level"], "path": card["path"]}
+                           "level": card["level"], "path": card["path"],
+                           "goal": card.get("goal")}
 
 
 def main():
@@ -678,6 +706,14 @@ def main():
             branch = e.get("branch", "(unknown)")
             dirty = dirty_count(path)
             last = last_commit_iso(path)
+            # Local work substance: the dirty file names and the unmerged commit
+            # subjects (work on this branch not yet on main). Only meaningful for
+            # worktrees; clones don't carry in-flight branch work here.
+            dirty_names, dirty_total = ([], 0)
+            unmerged, unmerged_total = ([], 0)
+            if kind == "worktree":
+                dirty_names, dirty_total = dirty_files(path)
+                unmerged, unmerged_total = unmerged_subjects(path, branch, base)
             merged = None
             ahead = behind = None
             if base and branch not in ("(detached)", "(unknown)"):
@@ -731,6 +767,10 @@ def main():
                 "branch": branch, "dirty_files": dirty, "last_commit": last,
                 "ahead": ahead, "behind": behind, "merged": merged,
                 "pr": pr,
+                # local work substance (worktrees): dirty file names + unmerged
+                # commit subjects, each capped with a *_total for "+N more".
+                "dirty_files_names": dirty_names, "dirty_files_total": dirty_total,
+                "unmerged_commits": unmerged, "unmerged_total": unmerged_total,
                 "initiative": ini["name"] if ini else None,
                 "initiative_state": ini["state"] if ini else None,
                 "flags": flags,

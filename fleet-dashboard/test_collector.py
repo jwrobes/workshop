@@ -671,6 +671,86 @@ class LinkInferenceTests(unittest.TestCase):
         self.assertIsNone(rows[0]["card"])
 
 
+class PairingGoalTests(unittest.TestCase):
+    """Local-pairing: the worktree's card snapshot carries the card's goal so the
+    worktree shows real context, not just the branch name."""
+
+    def test_paired_card_includes_goal(self):
+        rows = [{"kind": "worktree", "branch": "build-venmo",
+                 "path": "/ws/claw-venmo", "repo": "claw"}]
+        cards = [{"title": "Venmo", "status": "active", "level": "repo",
+                  "repo": "claw", "path": "plans/active/venmo.md",
+                  "goal": "Categorize Venmo exports automatically."}]
+        collector.link_worktrees_to_cards(rows, cards)
+        self.assertEqual(rows[0]["card"]["goal"],
+                         "Categorize Venmo exports automatically.")
+
+    def test_paired_card_goal_none_when_absent(self):
+        rows = [{"kind": "worktree", "branch": "build-x",
+                 "path": "/ws/r-x", "repo": "r"}]
+        cards = [{"title": "X", "status": "active", "level": "repo",
+                  "repo": "r", "path": "plans/active/x.md"}]  # no goal key
+        collector.link_worktrees_to_cards(rows, cards)
+        self.assertIsNone(rows[0]["card"]["goal"])
+
+
+class WorkSubstanceTests(unittest.TestCase):
+    """Local work substance: unmerged commit subjects + dirty file names.
+    Builds a real git repo with a branch ahead of origin/main + dirty files."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.origin = root / "origin.git"
+        self.work = root / "work"
+        _git(root, "init", "--bare", str(self.origin))
+        _git(root, "clone", str(self.origin), str(self.work))
+        env = ["-c", "user.email=t@t", "-c", "user.name=t"]
+        (self.work / "a.txt").write_text("a\n")
+        _git(self.work, "add", "a.txt")
+        _git(self.work, *env, "commit", "-m", "init")
+        _git(self.work, "branch", "-M", "main")
+        _git(self.work, "push", "origin", "main")
+        # branch with two commits not on origin/main
+        _git(self.work, "checkout", "-b", "build-feature")
+        (self.work / "b.txt").write_text("b\n")
+        _git(self.work, "add", "b.txt")
+        _git(self.work, *env, "commit", "-m", "first feature commit")
+        (self.work / "c.txt").write_text("c\n")
+        _git(self.work, "add", "c.txt")
+        _git(self.work, *env, "commit", "-m", "second feature commit")
+        _git(self.work, "fetch", "origin")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_unmerged_subjects_lists_branch_commits(self):
+        subs, total = collector.unmerged_subjects(self.work, "build-feature", "main")
+        self.assertEqual(total, 2)
+        self.assertEqual(set(subs),
+                         {"first feature commit", "second feature commit"})
+
+    def test_unmerged_subjects_empty_for_base_branch(self):
+        subs, total = collector.unmerged_subjects(self.work, "main", "main")
+        self.assertEqual((subs, total), ([], 0))
+
+    def test_unmerged_subjects_cap(self):
+        subs, total = collector.unmerged_subjects(self.work, "build-feature", "main", cap=1)
+        self.assertEqual(len(subs), 1)
+        self.assertEqual(total, 2)  # full count still reported for "+N more"
+
+    def test_dirty_files_lists_names_and_total(self):
+        (self.work / "dirty1.txt").write_text("x\n")
+        (self.work / "dirty2.txt").write_text("y\n")
+        names, total = collector.dirty_files(self.work)
+        self.assertEqual(total, 2)
+        self.assertEqual(set(names), {"dirty1.txt", "dirty2.txt"})
+
+    def test_dirty_files_clean_is_empty(self):
+        names, total = collector.dirty_files(self.work)
+        self.assertEqual((names, total), ([], 0))
+
+
 class NoLocalModeTests(unittest.TestCase):
     """Leaf 4 AC: --no-local forge-only mode (cloud-portable, no checkouts)."""
 
