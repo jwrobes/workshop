@@ -699,7 +699,7 @@ def _age_days(created_iso, now):
         return None
 
 
-def merge_forge_items_into_cards(cards, forge_items, now):
+def merge_forge_items_into_cards(cards, forge_items, now, repo_to_product=None):
     """Reconcile GitHub items (PRs + issues) against the local cards.
 
     `forge_items` is a list of dicts: {repo, kind:'pr'|'issue', number, title,
@@ -710,7 +710,13 @@ def merge_forge_items_into_cards(cards, forge_items, now):
       - ambiguous (matches >1 card) -> remote-only (never false-merge).
     A build-spec item that is open, has no impl PR, and (if datable) is older
     than DANGLING_SPEC_DAYS is flagged `dangling-spec` and parked at 'spec'd'.
+
+    `repo_to_product` maps a repo name (lowercased) -> product id, so a
+    remote-only card is attributed to the SAME product its repo belongs to (a
+    claw-playbook PR lands under Magic Me, not product=None). Repos in no
+    configured product get product=None (the unaffiliated bucket).
     Returns the (possibly extended) card list."""
+    repo_to_product = repo_to_product or {}
     # Index local cards by (repo, normalized slug) and (repo, normalized title).
     by_slug, by_title = {}, {}
     for c in cards:
@@ -750,7 +756,9 @@ def merge_forge_items_into_cards(cards, forge_items, now):
                     or norm(it.get("title") or "")) or str(it.get("number"))
             ref = f"{it.get('repo')}#{it.get('number')}"
             card = {
-                "level": "repo", "product": None, "repo": it.get("repo"),
+                "level": "repo",
+                "product": repo_to_product.get(norm(it.get("repo") or "")),
+                "repo": it.get("repo"),
                 "status": "spec" if is_spec else "open",
                 "title": it.get("title") or ref, "path": it.get("url") or "",
                 "slug": slug, "goal": None, "body": "", "workbench": None,
@@ -1158,7 +1166,15 @@ def main():
     # under --no-gh. Runs in both local and forge-only modes.
     if not args.no_gh:
         forge_items = collect_forge_items(cfg, forge, products_out)
-        merge_forge_items_into_cards(kanban, forge_items, now)
+        # repo name -> product id, so remote-only cards inherit their repo's
+        # product (a claw-playbook PR shows under Magic Me, not product=None).
+        repo_to_product = {}
+        for p in products_out:
+            for r in p.get("repos", []):
+                rn = (r.get("name") or (r.get("slug") or "").split("/")[-1])
+                if rn:
+                    repo_to_product[norm(rn)] = p.get("id")
+        merge_forge_items_into_cards(kanban, forge_items, now, repo_to_product)
 
     # Link inference: pair worktrees to plan cards by naming; unmatched stays
     # visible (worktree with card=None, card with has_worktree=False).
