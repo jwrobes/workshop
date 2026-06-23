@@ -232,6 +232,21 @@ function pathMeta(path){
   if(path==='remote') return {tag:'remote',color:'#4a6b8a',bg:'#e2ebf2'};
   return {tag:'unrouted',color:'#8c8576',bg:'#efeae0'};
 }
+// readiness: what the card needs NEXT on the spec->issue->build ladder.
+// collector sets card.readiness; fall back here if absent (older status.json).
+function readinessOf(card){
+  if(card.readiness) return card.readiness;
+  if((card.status||'')==='completed'||(card.status||'')==='done') return 'done';
+  if((card.github||{}).number) return 'has-issue';
+  if(((card.body||'').trim()).length>=200) return 'specd';
+  return 'idea';
+}
+function readinessMeta(r){
+  if(r==='has-issue') return {dot:'🟢',label:'ready to build',next:'implement (full-path-github)',color:'#5d8a6f',bg:'#e6efe7'};
+  if(r==='specd')     return {dot:'🟡',label:'needs issue',   next:'file the issue (spec-to-issue)',color:'#a9762a',bg:'#f6ecd6'};
+  if(r==='done')      return {dot:'✓', label:'done',          next:'shipped — no action',color:'#7d8a7d',bg:'#e9efe9'};
+  return                    {dot:'⚪',label:'needs spec',    next:'author a spec first',color:'#8c8576',bg:'#efeae0'};
+}
 // pipeline stages
 const STAGES=[
   {key:'spec',name:"spec'd",color:'#b3a997'},
@@ -258,15 +273,72 @@ function planStage(card){
   if(w){ if((w.dirty_files||0)>0) return {key:'executing',stuck:null}; return {key:'routed',stuck:null}; }
   return {key:'spec',stuck:null};
 }
-function buildPrompt(card,prod){
-  const w=worktreeForCard(card),L=[];
-  L.push('Pick up and continue this plan autonomously.');L.push('');
-  L.push('Plan: '+card.title);
-  L.push('Product: '+(prod?prod.name:card.product)+'  ·  Repo: '+(repoForCard(card)||'(product-level)'));
-  if(card.path) L.push('Plan doc: '+card.path);
-  if(w){L.push('Branch: '+(w.branch||'—'));if(w.path)L.push('Worktree: '+w.path);if(w.pr&&w.pr.number)L.push('PR: #'+w.pr.number+' ('+(w.pr.state||'').toLowerCase()+')');}
-  const a=cardAttention(card);if(a)L.push('Next action: '+attnMeta(a.type).action);
-  L.push('');L.push('Read the plan doc first, then continue the work. Keep commits small. Open or update the PR when ready and report back.');
+// Build a real launch prompt. mode: 'cloud' (claude.ai/code) or 'local'.
+// full-path-github REQUIRES a GitHub issue as its input (its predecessor is
+// "a GitHub issue exists"). So:
+//   - card HAS a github issue/PR  → run full-path-github directly on it.
+//   - card has NO issue (plain plan/workbench card) → run spec-to-issue FIRST
+//     (plan body → groomed issue), THEN full-path-github on that issue.
+// This is the missing-step guard: never point full-path-github at a bare plan doc.
+function buildPrompt(card,prod,mode){
+  const w=worktreeForCard(card);
+  const gh=card.github||{};
+  const rd=readinessOf(card);          // idea | specd | has-issue | done
+  const repo=repoForCard(card)||'(product-level)';
+  const clone = mode==='local'
+    ? 'read ~/workspace/skills/full-path-github/ (or: git clone --depth 1 https://github.com/jwrobes/skills.git /tmp/skills)'
+    : 'git clone --depth 1 https://github.com/jwrobes/skills.git /tmp/skills';
+  const L=[];
+  // Step 1 — get the skills (both spec-to-issue and full-path-github live in jwrobes/skills).
+  L.push('1. The orchestrator + spec-to-issue are NOT registered skills — expected. Get them:');
+  L.push('   '+clone);
+  L.push('   You will read SKILL.md files there and FOLLOW them. Do NOT improvise or skip the clone.');
+  // TARGET repo = where the work IMPLEMENTS (and where the issue must be filed).
+  // For a product-level plan, card.repo is null and the plan declares `repo:`
+  // (impl_repo). The plan doc lives in the PLANNING repo and is NOT reachable
+  // from a session scoped to the impl repo — so the spec must be copied INLINE
+  // into the issue, never linked.
+  const implRepo = card.impl_repo || card.repo || gh.repo || '';
+  const planUnreachable = !!(card.path && card.impl_repo) || (!card.repo && !!card.impl_repo);
+  L.push('');
+  // Context block (shared).
+  L.push('Initiative: '+card.title);
+  L.push('Product: '+(prod?prod.name:card.product)+'   ·   Implements in: '+(implRepo||'(unspecified — ASK which repo)'));
+  if(card.goal) L.push('Goal: '+card.goal);
+  if(card.path) L.push('Plan doc (PLANNING repo — likely NOT reachable from the impl repo): '+card.path);
+  if(gh.url) L.push('GitHub: '+gh.url);
+  if(w) L.push('Existing worktree: '+(w.branch||'—')+(w.path?(' @ '+w.path):''));
+  if(planUnreachable) L.push('NOTE: the plan doc is in the planning repo (magic-me-workbench). A session scoped to '+(implRepo||'the impl repo')+' CANNOT read it — you must copy the full spec INLINE into the issue, not link it.');
+  L.push('');
+  const fileInto = implRepo || '(the implementation repo — ASK if unspecified)';
+  if(rd==='idea'){
+    // No real spec yet → author one (+ build-spec PR for review) BEFORE spec-to-issue.
+    L.push('2. This initiative has NO real spec yet (just an idea/thin card). AUTHOR the spec first:');
+    L.push('   read /tmp/skills/spec-to-issue/SKILL.md (or ~/workspace/skills/spec-to-issue/) and the orchestrator.');
+    L.push('   Draft a real spec from the goal/title above + the ACTUAL '+fileInto+' tree (cite real paths).');
+    L.push('   Open it as a `build-spec`-labeled PR IN '+fileInto+' for HUMAN REVIEW — do NOT implement until reviewed.');
+    L.push('   STOP after opening the build-spec PR and report. (The human reviews the spec, THEN the next steps run.)');
+    L.push('');
+    L.push('3. After review: spec-to-issue (spec → groomed `ready` issue IN '+fileInto+', body IS the spec) →');
+    L.push('   full-path-github on that issue → ground, branch build-<slug>, implement, comprehension artifact');
+    L.push('   at ship (Step 3.5), DRAFT PR "Closes #<issue>", STOP before merge.');
+  } else if(rd==='specd'){
+    // Real spec, no issue → spec-to-issue then full-path-github.
+    L.push('2. This initiative has a spec but NO GitHub issue yet. Run **spec-to-issue** first');
+    L.push('   (read /tmp/skills/spec-to-issue/SKILL.md or ~/workspace/skills/spec-to-issue/):');
+    L.push('   COPY the full plan/spec INLINE into a single GROOMED GitHub issue IN '+fileInto+' — the issue');
+    L.push('   body IS the spec (do not just link the plan doc; the impl session can\'t read it). Label it `ready`.');
+    L.push('   That issue is the input to the next step.');
+    L.push('');
+    L.push('3. Then run **full-path-github** on that new issue: read its SKILL.md + phases/guardrails.md,');
+    L.push('   ground the spec, branch off origin/main (build-<slug>), implement, validate, render a');
+    L.push('   comprehension artifact at ship (Step 3.5), open a DRAFT PR "Closes #<the new issue>", STOP before merge.');
+  } else {  // has-issue (or done — still points at the issue)
+    L.push('2. Run **full-path-github** on issue #'+gh.number+' ('+(card.repo||repo)+'):');
+    L.push('   read its SKILL.md + phases/guardrails.md and FOLLOW them. Ground the spec against the real');
+    L.push('   tree, branch off origin/main (build-<slug>), implement, validate, render a comprehension');
+    L.push('   artifact at ship (Step 3.5), open a DRAFT PR "Closes #'+gh.number+'", and STOP before merge.');
+  }
   return L.join('\n');
 }
 
@@ -602,6 +674,11 @@ function renderPlan(app){
   const sec=el('<section data-view="plan" data-plan-id="'+attr(card.title)+'" data-product="'+attr(STATE.productId)+'" data-status="'+attr(sm.label)+'" style="padding-top:30px"></section>');
   sec.appendChild(el('<div class="planhead"><span class="statuspill" style="color:'+sm.color+';background:'+sm.bg+'">'+sm.label+'</span><span class="mono" style="font-size:11px;color:#a39c8c">'+esc(p?p.name:card.product)+' · '+esc(repoName)+'</span></div>'));
   sec.appendChild(el('<h1 data-plan-title="true" class="mono" style="font-weight:500;font-size:clamp(22px,3.4vw,32px);margin:14px 0 0;color:#2a2722;overflow-wrap:anywhere">'+esc(card.title)+'</h1>'));
+  // READINESS badge: where this card sits on spec->issue->build + what it needs next
+  const rd=readinessOf(card),rm=readinessMeta(rd);
+  sec.appendChild(el('<div data-region="readiness" data-readiness="'+attr(rd)+'" style="margin-top:14px;display:inline-flex;align-items:center;gap:10px">'
+    +'<span class="mono" style="font-size:11px;letter-spacing:.06em;color:'+rm.color+';background:'+rm.bg+';padding:4px 10px;border-radius:5px">'+rm.dot+' '+rm.label+'</span>'
+    +'<span class="mono" style="font-size:11.5px;color:#8c8576">next: '+rm.next+'</span></div>'));
   if(a) sec.appendChild(el('<div data-region="next-action" style="margin-top:18px;display:flex;align-items:center;gap:11px;background:linear-gradient(#fffdf6,#fdf6e7);border:1px solid #e7d3a6;border-radius:8px;padding:13px 16px"><span style="width:9px;height:9px;border-radius:50%;background:#cf962f;box-shadow:0 0 0 4px rgba(207,150,47,.16);flex:none"></span><span class="mono" style="font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#a9762a;flex:none">Next</span><span style="font-size:14px;color:#5b4a28">'+esc(attnMeta(a.type).action)+'</span></div>'));
 
   // GOAL + path tag
@@ -686,10 +763,17 @@ function renderPlan(app){
 
   grid.appendChild(left);
 
-  // handoff
+  // handoff — real full-path-github launch prompts, for cloud AND local
   const right=el('<div class="handoff" data-region="handoff"></div>');
-  const prompt=buildPrompt(card,p);
-  right.innerHTML='<div style="padding:16px 17px 0"><div class="mono" style="font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:#bda86f">Hand off to an agent</div><p style="font-size:13px;color:#bdb6a6;margin:8px 0 0;line-height:1.5">Copy a ready-to-paste prompt with the plan doc, branch and next action.</p></div><pre data-field="launch-prompt">'+esc(prompt)+'</pre><div style="padding:13px 17px 16px"><button class="copybtn" id="copybtn">Copy launch prompt</button></div>';
+  const promptCloud=buildPrompt(card,p,'cloud');
+  const promptLocal=buildPrompt(card,p,'local');
+  right.innerHTML=
+    '<div style="padding:16px 17px 0"><div class="mono" style="font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:#bda86f">Hand off to an agent — runs full-path-github</div>'
+    +'<p style="font-size:13px;color:#bdb6a6;margin:8px 0 0;line-height:1.5">Paste into a fresh agent. Cloud = claude.ai/code (clones the skill); Local = local Claude Code.</p>'
+    +'<div style="display:flex;gap:6px;margin:12px 0 0"><button class="ptab" id="ptab-cloud" data-mode="cloud" style="all:unset;cursor:pointer;font-family:\'IBM Plex Mono\',monospace;font-size:11px;color:#241f12;background:#d7a23f;padding:5px 11px;border-radius:6px">cloud (web)</button>'
+    +'<button class="ptab" id="ptab-local" data-mode="local" style="all:unset;cursor:pointer;font-family:\'IBM Plex Mono\',monospace;font-size:11px;color:#bda86f;background:#33302a;padding:5px 11px;border-radius:6px">local</button></div></div>'
+    +'<pre data-field="launch-prompt" id="launch-pre">'+esc(promptCloud)+'</pre>'
+    +'<div style="padding:13px 17px 16px"><button class="copybtn" id="copybtn">Copy launch prompt</button></div>';
   grid.appendChild(right);
   sec.appendChild(grid);
 
@@ -709,8 +793,19 @@ function renderPlan(app){
   sec.appendChild(back);
   app.appendChild(sec);
 
-  const cbn=$('copybtn');
-  if(cbn) cbn.onclick=()=>{try{navigator.clipboard.writeText(prompt);}catch(e){}cbn.textContent='Copied to clipboard ✓';setTimeout(()=>cbn.textContent='Copy launch prompt',2200);};
+  // launch-prompt mode toggle (cloud/local) + copy
+  let mode='cloud';
+  const pre=$('launch-pre'), cbn=$('copybtn');
+  const tabs={cloud:$('ptab-cloud'),local:$('ptab-local')};
+  function setMode(m){
+    mode=m;
+    if(pre) pre.textContent = (m==='local'?promptLocal:promptCloud);
+    for(const k in tabs){ if(!tabs[k])continue; const on=(k===m);
+      tabs[k].style.color=on?'#241f12':'#bda86f'; tabs[k].style.background=on?'#d7a23f':'#33302a'; }
+  }
+  if(tabs.cloud) tabs.cloud.onclick=()=>setMode('cloud');
+  if(tabs.local) tabs.local.onclick=()=>setMode('local');
+  if(cbn) cbn.onclick=()=>{const t=(mode==='local'?promptLocal:promptCloud);try{navigator.clipboard.writeText(t);}catch(e){}cbn.textContent='Copied to clipboard ✓';setTimeout(()=>cbn.textContent='Copy launch prompt',2200);};
 }
 
 function renderYouAreHere(card){

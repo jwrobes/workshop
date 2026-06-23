@@ -380,16 +380,16 @@ def make_forge(name):
 # — through the Forge file API (no checkout needed).
 # --------------------------------------------------------------------------
 
-def parse_frontmatter_title(text):
-    """Return the `title:` value from a leading YAML frontmatter block
-    (between `---` fences), or None if absent."""
+def parse_frontmatter(text, key):
+    """Return a `<key>: value` from a leading YAML frontmatter block (between
+    `---` fences), or None. Strips a single matched quote pair."""
     if not text.startswith("---"):
         return None
     lines = text.splitlines()
     for i in range(1, len(lines)):
         if lines[i].strip() == "---":
             for fm in lines[1:i]:
-                m = re.match(r"\s*title\s*:\s*(.+?)\s*$", fm)
+                m = re.match(r"\s*" + re.escape(key) + r"\s*:\s*(.+?)\s*$", fm)
                 if m:
                     v = m.group(1).strip()
                     if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
@@ -397,6 +397,11 @@ def parse_frontmatter_title(text):
                     return v or None
             return None
     return None
+
+
+def parse_frontmatter_title(text):
+    """Return the `title:` value from frontmatter, or None."""
+    return parse_frontmatter(text, "title")
 
 
 def _plan_goal(text):
@@ -439,11 +444,36 @@ def _slug_from_path(path):
 
 
 def _card(level, product_id, repo_name, status, title, path, text="", slug=None):
+    # A product-level plan (in the coordinator/planning repo) can declare the
+    # repo its work IMPLEMENTS in, via frontmatter `repo:`. That repo is where
+    # spec-to-issue must file the issue — because the plan doc itself is in the
+    # planning repo and unreachable from a session scoped to the impl repo.
     return {"level": level, "product": product_id, "repo": repo_name,
             "status": status, "title": title, "path": str(path),
             "slug": slug or _slug_from_path(path),
             "goal": _plan_goal(text), "body": text or "",
+            "impl_repo": parse_frontmatter(text, "repo"),
             "workbench": None}
+
+
+SPEC_BODY_MIN = 200  # chars of plan body that count as "a real spec exists"
+
+
+def card_readiness(card):
+    """Where a card sits on the spec->issue->build readiness ladder, so the
+    dashboard can show what it NEEDS next:
+      - 'done'      -> completed/shipped work (no action needed)
+      - 'has-issue' -> a GitHub issue/PR exists -> ready to implement (full-path-github)
+      - 'specd'     -> real plan body, no issue  -> needs the issue filed (spec-to-issue)
+      - 'idea'      -> thin/empty body, no issue -> needs a spec authored first
+    """
+    if (card.get("status") or "") in ("completed", "done"):
+        return "done"
+    if (card.get("github") or {}).get("number"):
+        return "has-issue"
+    if len((card.get("body") or "").strip()) >= SPEC_BODY_MIN:
+        return "specd"
+    return "idea"
 
 
 def _read_plan_entry(entry):
@@ -1207,6 +1237,12 @@ def main():
     # Link inference: pair worktrees to plan cards by naming; unmatched stays
     # visible (worktree with card=None, card with has_worktree=False).
     link_worktrees_to_cards(rows, kanban)
+
+    # Readiness: classify every card AFTER github/workbench/worktree merges, so
+    # it reflects the final state (idea / specd / has-issue / done). Drives the
+    # card badge + the launch prompt's branch.
+    for c in kanban:
+        c["readiness"] = card_readiness(c)
 
     status = {
         "generated_at": now.isoformat(timespec="seconds"),
