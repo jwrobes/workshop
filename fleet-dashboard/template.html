@@ -623,11 +623,22 @@ function renderPlan(app){
   // work links
   const links=el('<div class="links" data-region="links" data-visibility="public"></div>');
   links.appendChild(el('<div class="mono" style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#a39c8c;padding:12px 16px 0">The work</div>'));
-  const planHref=card.path?'file://'+card.path:'#';
-  links.appendChild(el('<a href="'+attr(planHref)+'" data-field="plan-doc" class="lrow"><span class="lk">plan</span><span class="lv">'+esc(card.path||'—')+'</span><span style="flex:none;color:#c2b89f">&#8599;</span></a>'));
-  links.appendChild(el('<div data-field="issue" class="lrow"><span class="lk">issue</span><span class="lv muted">— (link inference: not wired yet)</span></div>'));
+  // plan row: a remote-only card's path IS its GitHub URL (link it as such);
+  // a local card's path is a file on disk.
+  const gh=card.github;
+  const remotePlan=!!(card.path&&/^https?:\/\//.test(card.path));
+  const planHref=remotePlan?card.path:(card.path?'file://'+card.path:'#');
+  links.appendChild(el('<a href="'+attr(planHref)+'"'+(remotePlan?' target="_blank" rel="noopener"':'')+' data-field="plan-doc" class="lrow"><span class="lk">'+(remotePlan?'source':'plan')+'</span><span class="lv">'+esc(card.path||'—')+'</span><span style="flex:none;color:#c2b89f">&#8599;</span></a>'));
+  // issue / PR: wire the GitHub ref+url when the card carries one.
+  if(gh&&gh.number){
+    const kind=gh.kind==='issue'?'issue':'pr';
+    const lbl=(gh.kind==='issue'?'issue #':'PR #')+gh.number+(gh.title?' — '+gh.title:'');
+    links.appendChild(el('<a href="'+attr(gh.url||'#')+'" target="_blank" rel="noopener" data-field="'+kind+'" class="lrow"><span class="lk">'+kind+'</span><span class="lv">'+esc(lbl)+'</span><span style="flex:none;color:#c2b89f">&#8599;</span></a>'));
+  } else {
+    links.appendChild(el('<div data-field="issue" class="lrow"><span class="lk">issue</span><span class="lv muted">—</span></div>'));
+  }
   if(w&&w.pr&&w.pr.number) links.appendChild(el('<div data-field="pr" class="lrow"><span class="lk">pr</span><span class="lv" style="display:flex;align-items:center;gap:7px;color:'+pr.color+'"><span style="width:7px;height:7px;border-radius:50%;background:'+pr.dot+';flex:none"></span>'+esc(pr.label)+'</span></div>'));
-  else links.appendChild(el('<div data-field="pr" class="lrow"><span class="lk">pr</span><span class="lv muted">no PR</span></div>'));
+  else if(!(gh&&gh.kind==='pr')) links.appendChild(el('<div data-field="pr" class="lrow"><span class="lk">pr</span><span class="lv muted">no PR</span></div>'));
   links.appendChild(el('<div data-field="branch" class="lrow"><span class="lk">branch</span><span class="lv">'+esc(w&&w.branch||'—')+'</span></div>'));
   left.appendChild(links);
 
