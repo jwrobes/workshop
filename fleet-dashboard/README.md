@@ -18,7 +18,7 @@ straight from `file://` — no server, no CORS).
 | `template.html` | the rendered dashboard (4-level + pipeline map) |
 | `fleet.config.json` | machine-/account-specific config (products, member_repos, paths) |
 | `run.sh` | regenerate + open the dashboard (one command) |
-| `fleet-doctor.py` | **terminal** health check — flags reapable/stale/orphan worktrees + plans without worktrees. Report-only, copy-paste reap commands, never executes. |
+| `fleet-doctor.py` | **terminal** health check — flags reapable/stale/orphan worktrees, plans without worktrees, AND **likely-duplicate cards** (same initiative living unmerged across sources — repo plan / workbench / GitHub — with the proposed slug alignment to merge them). Report-only, copy-paste commands, never executes. |
 | `skills/new-plan/` | start new work in fleet format — plan card (+ a `build-<slug>` worktree for LOCAL work; card-only + launch prompt for CLOUD work). The front door that keeps the fleet from drifting. |
 
 **Keeping the fleet healthy is two moves, not a repeated cleanup chore:**
