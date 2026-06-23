@@ -881,28 +881,37 @@ def build_product_tree(cfg, clones, forge=None, allow_forge=False):
         coord = (p.get("coordinator_repo") or "").lower()
         repo_map = {}  # keyed by slug-or-name (lower) -> repo node
 
-        member_slugs = []
-        if allow_forge and forge is not None:
+        # Membership: if `member_repos` is set, it's the AUTHORITATIVE whitelist
+        # — the product claims ONLY those slugs. The forge org-member list is
+        # IGNORED entirely (no union), so org members like a coordinator clone or
+        # an unrelated org repo don't leak in. Otherwise fall back to org-match
+        # (org = product boundary). This lets multiple products share one org.
+        explicit = {s.lower() for s in (p.get("member_repos") or [])}
+        use_whitelist = bool(explicit)
+
+        if use_whitelist:
+            for slug in explicit:
+                if slug == coord:
+                    continue  # coordinator is product-level, not a repo card
+                repo_map.setdefault(slug, {"slug": slug,
+                                           "name": slug.split("/")[-1],
+                                           "worktrees": []})
+        elif allow_forge and forge is not None:
             try:
                 member_slugs = forge.list_repos(p)
             except NotImplementedError:
                 member_slugs = []
-        for slug in member_slugs:
-            if slug.lower() == coord:
-                continue  # coordinator is product-level, not a repo card
-            repo_map.setdefault(slug.lower(),
-                                {"slug": slug, "name": slug.split("/")[-1],
-                                 "worktrees": []})
+            for slug in member_slugs:
+                if slug.lower() == coord:
+                    continue  # coordinator is product-level, not a repo card
+                repo_map.setdefault(slug.lower(),
+                                    {"slug": slug, "name": slug.split("/")[-1],
+                                     "worktrees": []})
 
-        # Membership: if `member_repos` is set, it's the AUTHORITATIVE whitelist
-        # (the product claims ONLY those slugs — org is ignored for membership).
-        # Otherwise fall back to org-match (org = product boundary, decision #4).
-        # This lets multiple products share one org by listing members explicitly.
-        explicit = {s.lower() for s in (p.get("member_repos") or [])}
-        use_whitelist = bool(explicit)
-        for slug in explicit:
-            repo_map.setdefault(slug, {"slug": slug, "name": slug.split("/")[-1],
-                                       "worktrees": []})
+        # Names already in the whitelist (so a local clone matches a whitelisted
+        # member even when its remote slug differs by owner — e.g. whitelist
+        # `owner-a/foo` vs the clone's remote `owner-b/foo`).
+        explicit_names = {s.split("/")[-1].lower() for s in explicit}
 
         for c in clones:
             c_slug = (c.get("slug") or "").lower()
@@ -915,7 +924,8 @@ def build_product_tree(cfg, clones, forge=None, allow_forge=False):
                 claimed.add(c["name"])
                 continue
             if use_whitelist:
-                if c_slug not in explicit:
+                # match by exact slug OR by repo name (cross-owner same repo)
+                if c_slug not in explicit and (c.get("name") or "").lower() not in explicit_names:
                     continue
             elif not (org and c_org == org):
                 continue
@@ -926,10 +936,28 @@ def build_product_tree(cfg, clones, forge=None, allow_forge=False):
             claimed.add(c["name"])
 
         pid = p.get("id") or p.get("forge_org") or "unknown"
+        # De-dupe repos by normalized NAME so the same repo reached via two
+        # different slugs (e.g. a whitelisted `owner-a/foo` plus the same repo
+        # `owner-b/foo` discovered from a local clone's remote) collapses to one
+        # card. Prefer the node that carries local worktrees when merging.
+        by_name = {}
+        for k in sorted(repo_map):
+            node = repo_map[k]
+            nk = norm(node.get("name") or "")
+            cur = by_name.get(nk)
+            if cur is None:
+                by_name[nk] = node
+                continue
+            # Merge duplicate (same name, different slug): keep worktrees from
+            # whichever node has them, and prefer a non-empty slug.
+            if node.get("worktrees") and not cur.get("worktrees"):
+                cur["worktrees"] = node["worktrees"]
+            if not cur.get("slug") and node.get("slug"):
+                cur["slug"] = node["slug"]
         products_out.append({
             "id": pid, "name": p.get("name") or pid,
             "coordinator_repo": p.get("coordinator_repo"),
-            "repos": [repo_map[k] for k in sorted(repo_map)],
+            "repos": [by_name[k] for k in sorted(by_name)],
         })
 
     unaffiliated = [{"slug": c.get("slug"), "name": c["name"],

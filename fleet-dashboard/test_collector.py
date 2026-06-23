@@ -526,6 +526,42 @@ class ProductTreeTests(unittest.TestCase):
             self.CFG, [], forge=BoomForge(), allow_forge=False)
         self.assertEqual(products[0]["repos"], [])
 
+    # --- member_repos is the AUTHORITATIVE whitelist (no forge-org union) ---
+    WL_CFG = {
+        "products": [{
+            "id": "magic-me", "name": "Magic Me", "forge_org": "Jwrobes-Magic",
+            "coordinator_repo": "Jwrobes-Magic/magic-me-workbench",
+            "member_repos": ["Jwrobes-Magic/claw-playbook", "jwrobes/wizard"],
+        }],
+    }
+
+    def test_whitelist_ignores_forge_org_members(self):
+        # When member_repos is set, Forge.list_repos() org members must NOT leak
+        # in (e.g. an unrelated org repo or the coordinator clone).
+        class FakeForge(collector.Forge):
+            def list_repos(self, product):
+                return ["Jwrobes-Magic/improve_ai_dev_workspace",
+                        "Jwrobes-Magic/some-other-repo"]
+            def list_prs(self, s, branch=None): return []
+            def read_dir(self, s, p): return []
+            def get_file(self, s, p): return None
+        products, _ = collector.build_product_tree(
+            self.WL_CFG, [], forge=FakeForge(), allow_forge=True)
+        names = sorted(r["name"] for r in products[0]["repos"])
+        self.assertEqual(names, ["claw-playbook", "wizard"])  # exactly the whitelist
+
+    def test_whitelist_dedups_repo_by_name_across_slugs(self):
+        # `jwrobes/wizard` (whitelisted) and a local clone `Jwrobes-Magic/wizard`
+        # are the same repo NAME -> one card, not two.
+        clones = [self._clone("wizard", "Jwrobes-Magic", [{"branch": "build-w"}]),
+                  self._clone("claw-playbook", "Jwrobes-Magic")]
+        products, unaff = collector.build_product_tree(self.WL_CFG, clones)
+        names = sorted(r["name"] for r in products[0]["repos"])
+        self.assertEqual(names, ["claw-playbook", "wizard"])  # wizard once
+        wiz = [r for r in products[0]["repos"] if r["name"] == "wizard"][0]
+        self.assertEqual(wiz["worktrees"], [{"branch": "build-w"}])  # local worktrees kept
+        self.assertEqual(unaff, [])
+
 
 class ProductTreeE2ETests(unittest.TestCase):
     """Leaf 3 AC: works for Magic Me end to end (local, --no-gh)."""

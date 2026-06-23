@@ -189,6 +189,10 @@ function repoForCard(card){
   return w&&w.repo?w.repo:null;
 }
 function cardAttention(card){
+  // A dangling build-spec (stuck in the pipeline) needs attention — must be
+  // consistent with the pipeline map's "N stuck" count so the health summary
+  // never contradicts it.
+  if(isDangling(card)) return {type:'dangling'};
   if(card.status==='blocked') return {type:'blocked'};
   const w=worktreeForCard(card);
   if(w){
@@ -210,6 +214,7 @@ function prMeta(pr){
 function attnMeta(type){
   if(type==='pr-review') return {tag:'review',color:'#9a6f22',bg:'#f6ecd6',action:'Review & merge the open PR'};
   if(type==='blocked') return {tag:'blocked',color:'#a85a39',bg:'#f4e3da',action:'Unblock this plan'};
+  if(type==='dangling') return {tag:'stuck',color:'#c0392b',bg:'#f6e3e0',action:'Stuck spec — launch or close it'};
   return {tag:'worktree',color:'#7a6a3f',bg:'#efe7d2',action:'Remove the merged worktree'};
 }
 // path inference (single helper, easy to swap later)
@@ -268,6 +273,13 @@ function buildPrompt(card,prod){
 function goTo(level,productId,planId,repoId){
   STATE.level=level;STATE.productId=productId??null;STATE.planId=planId??null;STATE.repoId=repoId??null;
   STATE.doneOpen=false;STATE.mapExpanded={};STATE.mapAll=false;
+  // When opening a plan, resolve its real product/repo up front so crumbs +
+  // back-link are correct even when navigated from the fleet map (null product).
+  if(level==='plan'){
+    const c=findCard(STATE.productId,STATE.repoId,STATE.planId);
+    if(c){ if(STATE.productId==null&&c.product!=null) STATE.productId=c.product;
+           if(STATE.repoId==null){const r=repoForCard(c);if(r)STATE.repoId=r;} }
+  }
   window.scrollTo({top:0});render();
 }
 
@@ -305,7 +317,11 @@ function mapChip(card,prod){
   meta+='</div>';
   chip.style.borderLeft='3px solid '+accent;
   chip.innerHTML='<div class="mono" style="font-size:10.5px;color:#33302a;line-height:1.25;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(card.title)+'</div>'+meta;
-  chip.onclick=()=>goTo('plan',prod?prod.id:STATE.productId,card.title,repoForCard(card));
+  // Navigate with the card's OWN product/repo so it opens correctly even from
+  // the fleet-level map (where STATE.productId is null). Fall back to the card's
+  // product field, then the scope's product.
+  const pid=(prod&&prod.id)||card.product||STATE.productId;
+  chip.onclick=()=>goTo('plan',pid,card.title,repoForCard(card));
   return chip;
 }
 function pipelineGroups(plans){
@@ -556,10 +572,29 @@ function kanbanCol(kind,plans,repoName){
 }
 
 // ---------- L4 PLAN (feature hub) ----------
+function findCard(productId,repoId,planId){
+  // Prefer a card scoped to the current product + repo (titles can collide
+  // across repos/products). Fall back to ALL cards by title so a plan opened
+  // from the fleet-level map (productId may be null) still resolves.
+  const all=kanban();
+  let pool=all.filter(c=>c.title===planId);
+  if(pool.length>1 && productId!=null){
+    const scoped=pool.filter(c=>c.product===productId);
+    if(scoped.length) pool=scoped;
+  }
+  if(pool.length>1 && repoId){
+    const r=pool.filter(c=>repoForCard(c)===repoId);
+    if(r.length) pool=r;
+  }
+  return pool[0]||null;
+}
 function renderPlan(app){
-  const p=products().find(x=>x.id===STATE.productId);
-  const card=plansFor(STATE.productId).find(c=>c.title===STATE.planId);
+  const card=findCard(STATE.productId,STATE.repoId,STATE.planId);
   if(!card){app.appendChild(el('<p class="empty">Plan not found.</p>'));return;}
+  // Backfill STATE from the resolved card so breadcrumbs/back-link are correct
+  // even when we arrived from the fleet map with a null product.
+  if(STATE.productId==null && card.product!=null) STATE.productId=card.product;
+  const p=products().find(x=>x.id===STATE.productId);
   const repoName=STATE.repoId||repoForCard(card)||'product-level';
   const w=worktreeForCard(card),pr=prMeta(w&&w.pr),a=cardAttention(card);
   const pm=pathMeta(planPath(card));
