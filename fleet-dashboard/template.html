@@ -214,6 +214,7 @@ function attnMeta(type){
 }
 // path inference (single helper, easy to swap later)
 function planPath(card){
+  if(card.source==='remote-only') return 'remote';
   const w=worktreeForCard(card);
   if(w&&((w.branch||'').includes('build-spec')||w.pr)) return 'cloud';
   if(w) return 'local';
@@ -223,6 +224,7 @@ function pathMeta(path){
   if(path==='cloud') return {tag:'cloud',color:'#9a7b3f',bg:'#f2e9d6'};
   if(path==='local') return {tag:'local',color:'#5f7d68',bg:'#e6efe7'};
   if(path==='openclaw') return {tag:'openclaw',color:'#9a6048',bg:'#f0e1d9'};
+  if(path==='remote') return {tag:'remote',color:'#4a6b8a',bg:'#e2ebf2'};
   return {tag:'unrouted',color:'#8c8576',bg:'#efeae0'};
 }
 // pipeline stages
@@ -233,7 +235,15 @@ const STAGES=[
   {key:'review',name:'in-review',color:'#c07f33'},
   {key:'shipped',name:'shipped',color:'#7faa8c'},
 ];
+function isRemoteOnly(c){return c.source==='remote-only';}
+function isDangling(c){return (c.flags||[]).indexOf('dangling-spec')>=0;}
 function planStage(card){
+  // Remote-only items (GitHub PR/issue, no local footprint) sit early in the
+  // pipeline; a dangling build-spec is "stuck" at spec'd.
+  if(isRemoteOnly(card)){
+    if(isDangling(card)) return {key:'spec',stuck:(card.age_days!=null?card.age_days+'d':'stuck')};
+    return {key:'spec',stuck:null};
+  }
   if(card.status==='completed'||card.status==='done') return {key:'shipped',stuck:null};
   if(card.status==='blocked') return {key:'executing',stuck:'6d'};
   if(card.status==='backlog') return {key:'spec',stuck:null};
@@ -279,15 +289,17 @@ function renderCrumbs(){
 }
 
 // ---------- PIPELINE MAP (shared) ----------
-function inFlight(plans){return plans.filter(c=>c.status==='active'||c.status==='backlog'||c.status==='blocked');}
+function inFlight(plans){return plans.filter(c=>c.status==='active'||c.status==='backlog'||c.status==='blocked'||isRemoteOnly(c));}
 function mapChip(card,prod){
   const pm=pathMeta(planPath(card)),stg=planStage(card),w=worktreeForCard(card),pr=(w&&w.pr)||{};
   const a=cardAttention(card);
-  const accent=stg.stuck?'#d99a2c':(a?'#cf962f':pm.color);
-  const chip=el('<button class="pmchip" data-plan="'+attr(card.title)+'" data-path="'+pm.tag+'" data-stuck="'+(!!stg.stuck)+'" title="'+attr(card.title)+'"></button>');
+  const accent=isDangling(card)?'#c0392b':(stg.stuck?'#d99a2c':(a?'#cf962f':pm.color));
+  const chip=el('<button class="pmchip" data-plan="'+attr(card.title)+'" data-path="'+pm.tag+'" data-stuck="'+(!!stg.stuck)+'" data-remote="'+isRemoteOnly(card)+'" data-dangling="'+isDangling(card)+'" title="'+attr(card.title)+'"></button>');
   let meta='<div style="display:flex;align-items:center;gap:5px;margin-top:6px;flex-wrap:wrap">'
     +'<span class="mono" style="font-size:8.5px;color:'+pm.color+';background:'+pm.bg+';padding:1px 5px;border-radius:4px">'+pm.tag+'</span>';
   if(pr.number) meta+='<span class="mono" style="font-size:8.5px;color:#9a6f22">PR #'+pr.number+'</span>';
+  if(card.github&&card.github.number) meta+='<span class="mono" style="font-size:8.5px;color:#4a6b8a">'+(card.github.kind==='issue'?'issue':'PR')+' #'+card.github.number+'</span>';
+  if(isDangling(card)) meta+='<span class="mono" style="display:inline-flex;align-items:center;gap:3px;font-size:8.5px;color:#c0392b;background:#f6e3e0;padding:1px 5px;border-radius:4px">⚠ dangling spec</span>';
   if(stg.stuck) meta+='<span class="mono" style="display:inline-flex;align-items:center;gap:3px;font-size:8.5px;color:#b5701f"><span style="width:5px;height:5px;border-radius:50%;background:#d99a2c;animation:pulseAmber 1.8s ease-in-out infinite"></span>stuck '+stg.stuck+'</span>';
   if(a) meta+='<span style="width:6px;height:6px;border-radius:50%;background:#cf962f;box-shadow:0 0 0 2.5px rgba(207,150,47,.16)"></span>';
   meta+='</div>';

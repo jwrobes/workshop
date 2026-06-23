@@ -195,13 +195,33 @@ class Forge(ABC):
         """Return the decoded text of a file in a repo's default branch,
         or None when missing/unavailable."""
 
+    # --- Forge-only items: ALL open PRs / issues for a repo (no branch filter).
+    # Concrete no-op defaults so existing Forge subclasses (and offline mode)
+    # keep working; GitHubForge overrides these, GitLabForge raises.
+    def list_open_prs(self, repo_slug):
+        """Return a list of open-PR dicts for repo_slug:
+        {number, title, headRefName, labels:[str], createdAt, isDraft, url}.
+        [] when none/forge unavailable. Used to surface GitHub-only work that
+        has no local footprint (the forge-only data path)."""
+        return []
+
+    def list_issues(self, repo_slug):
+        """Return a list of open-issue dicts for repo_slug:
+        {number, title, labels:[str], createdAt, url}. [] when none/unavailable."""
+        return []
+
 
 class GitHubForge(Forge):
     """GitHub forge wrapping the `gh` CLI. This is the ONLY place `gh` is
     invoked — the collector body routes all forge calls through here."""
 
     def list_repos(self, product):
-        org = product["forge_org"]
+        # A product may define members only via `member_repos` (no forge_org);
+        # then there's no org to enumerate — return [] and let the whitelist
+        # supply members.
+        org = product.get("forge_org")
+        if not org:
+            return []
         code, out = run(["gh", "repo", "list", org,
                          "--json", "nameWithOwner", "--limit", "200"], timeout=30)
         if code != 0 or not out:
@@ -256,6 +276,48 @@ class GitHubForge(Forge):
         except (ValueError, TypeError):
             return None
 
+    @staticmethod
+    def _label_names(item):
+        """Normalize gh's labels (list of {name}) to a list of label strings."""
+        return [l.get("name") for l in (item.get("labels") or []) if l.get("name")]
+
+    def list_open_prs(self, repo_slug):
+        if not repo_slug:
+            return []
+        code, out = run(["gh", "pr", "list", "--repo", repo_slug,
+                         "--state", "open", "--limit", "100", "--json",
+                         "number,title,headRefName,labels,createdAt,isDraft,url"],
+                        timeout=30)
+        if code != 0 or not out:
+            return []
+        try:
+            prs = json.loads(out)
+        except json.JSONDecodeError:
+            return []
+        return [{"number": p.get("number"), "title": p.get("title") or "",
+                 "headRefName": p.get("headRefName") or "",
+                 "labels": self._label_names(p), "createdAt": p.get("createdAt"),
+                 "isDraft": bool(p.get("isDraft")), "url": p.get("url")}
+                for p in prs]
+
+    def list_issues(self, repo_slug):
+        if not repo_slug:
+            return []
+        # `gh issue list` excludes PRs by default (good — PRs come from list_open_prs).
+        code, out = run(["gh", "issue", "list", "--repo", repo_slug,
+                         "--state", "open", "--limit", "100", "--json",
+                         "number,title,labels,createdAt,url"], timeout=30)
+        if code != 0 or not out:
+            return []
+        try:
+            issues = json.loads(out)
+        except json.JSONDecodeError:
+            return []
+        return [{"number": i.get("number"), "title": i.get("title") or "",
+                 "labels": self._label_names(i), "createdAt": i.get("createdAt"),
+                 "url": i.get("url")}
+                for i in issues]
+
 
 class GitLabForge(Forge):
     """STUB — not yet implemented. GitLab mapping for a future port:
@@ -287,6 +349,14 @@ class GitLabForge(Forge):
     def get_file(self, repo_slug, path):
         raise NotImplementedError(
             "GitLabForge.get_file: use `glab api projects/:id/repository/files/<path>/raw`")
+
+    def list_open_prs(self, repo_slug):
+        raise NotImplementedError(
+            "GitLabForge.list_open_prs: PR->MR; use `glab mr list -R <repo> --state opened -F json`")
+
+    def list_issues(self, repo_slug):
+        raise NotImplementedError(
+            "GitLabForge.list_issues: use `glab issue list -R <repo> --state opened -F json`")
 
 
 FORGES = {"github": GitHubForge, "gitlab": GitLabForge}
@@ -578,6 +648,167 @@ def merge_workbench_into_cards(cards, workbench_entries):
             cards.append(new)
             index[key] = new
     return cards
+
+
+# --------------------------------------------------------------------------
+# Forge-only data path (the 4th source: GitHub PRs/issues with no local footprint)
+#
+# Surfaces work that exists ONLY on the forge — a cloud-build spec with no local
+# worktree, an orphan PR, an issue-as-spec — so the dashboard isn't local-first
+# blind. Reconciles each GitHub item against the already-merged local cards
+# (repo plan + workbench + worktree) by normalized slug or title; a match
+# ATTACHES (no duplicate card), no match becomes a `remote-only` card. When
+# uncertain we prefer remote-only over a wrong merge. build-spec items with no
+# downstream implementation PR (and/or stale) are flagged `dangling-spec`.
+# --------------------------------------------------------------------------
+
+# A build-spec PR/issue open longer than this (and lacking an impl PR) is "stuck".
+DANGLING_SPEC_DAYS = 7
+
+
+def branch_slug_candidates(branch):
+    """Candidate normalized slugs for a head branch like `bosque/build-spec-007`:
+    the last path segment, with common build-/spec- prefixes also stripped.
+    Returns a set of normalized slugs to match against card slugs."""
+    if not branch:
+        return set()
+    tail = branch.split("/")[-1]
+    cands = {norm(tail)}
+    for pref in ("build-spec-", "build-", "spec-"):
+        if tail.lower().startswith(pref):
+            cands.add(norm(tail[len(pref):]))
+    return {c for c in cands if c}
+
+
+def _is_build_spec(labels, title):
+    """Heuristic: a build-spec item carries a build-spec label or its title/
+    branch reads like a build spec."""
+    lab = {(l or "").lower() for l in (labels or [])}
+    if "build-spec" in lab or "build_spec" in lab:
+        return True
+    return bool(re.search(r"\bbuild[\s_-]?spec\b", (title or ""), re.I))
+
+
+def _age_days(created_iso, now):
+    if not created_iso:
+        return None
+    try:
+        return (now - datetime.datetime.fromisoformat(
+            created_iso.replace("Z", "+00:00"))).days
+    except ValueError:
+        return None
+
+
+def merge_forge_items_into_cards(cards, forge_items, now):
+    """Reconcile GitHub items (PRs + issues) against the local cards.
+
+    `forge_items` is a list of dicts: {repo, kind:'pr'|'issue', number, title,
+    branch, labels, createdAt, isDraft, url, has_impl_pr}. Each is matched to a
+    local card in the SAME repo by branch-slug or normalized title:
+      - match  -> attach `github` to that card (no duplicate).
+      - no match -> a new `remote-only` card (source='remote-only').
+      - ambiguous (matches >1 card) -> remote-only (never false-merge).
+    A build-spec item that is open, has no impl PR, and (if datable) is older
+    than DANGLING_SPEC_DAYS is flagged `dangling-spec` and parked at 'spec'd'.
+    Returns the (possibly extended) card list."""
+    # Index local cards by (repo, normalized slug) and (repo, normalized title).
+    by_slug, by_title = {}, {}
+    for c in cards:
+        rk = norm(c.get("repo") or "")
+        by_slug.setdefault((rk, norm(c.get("slug") or "")), []).append(c)
+        by_title.setdefault((rk, norm(c.get("title") or "")), []).append(c)
+
+    for it in forge_items:
+        rk = norm(it.get("repo") or "")
+        # Collect candidate matches: branch-slug first, then title.
+        matches = []
+        for cand in branch_slug_candidates(it.get("branch")):
+            matches += by_slug.get((rk, cand), [])
+        if not matches:
+            matches += by_title.get((rk, norm(it.get("title") or "")), [])
+        # De-dupe candidate cards (a card could match by both slug and title).
+        uniq = []
+        for m in matches:
+            if m not in uniq:
+                uniq.append(m)
+
+        gh = {"kind": it.get("kind"), "number": it.get("number"),
+              "title": it.get("title"), "url": it.get("url"),
+              "state": "OPEN", "labels": it.get("labels") or [],
+              "isDraft": bool(it.get("isDraft")), "createdAt": it.get("createdAt")}
+
+        if len(uniq) == 1:
+            # Unambiguous match -> attach (no duplicate card).
+            uniq[0]["github"] = gh
+        else:
+            # No match, OR ambiguous (>1) -> remote-only card (never false-merge).
+            age = _age_days(it.get("createdAt"), now)
+            is_spec = _is_build_spec(it.get("labels"), it.get("title"))
+            dangling = bool(is_spec and not it.get("has_impl_pr")
+                            and (age is None or age >= DANGLING_SPEC_DAYS))
+            slug = (next(iter(branch_slug_candidates(it.get("branch"))), None)
+                    or norm(it.get("title") or "")) or str(it.get("number"))
+            ref = f"{it.get('repo')}#{it.get('number')}"
+            card = {
+                "level": "repo", "product": None, "repo": it.get("repo"),
+                "status": "spec" if is_spec else "open",
+                "title": it.get("title") or ref, "path": it.get("url") or "",
+                "slug": slug, "goal": None, "body": "", "workbench": None,
+                "source": "remote-only", "github": gh,
+                "flags": (["dangling-spec"] if dangling else []),
+                "age_days": age, "ambiguous_match": len(uniq) > 1,
+            }
+            cards.append(card)
+            by_slug.setdefault((rk, slug), []).append(card)
+    return cards
+
+
+def collect_forge_items(cfg, forge, products_out):
+    """Gather open PRs + issues for every product member repo, via the Forge.
+    Returns a flat list of normalized item dicts (see merge_forge_items_into_cards).
+    `has_impl_pr` marks a build-spec that has a SEPARATE non-spec PR referencing
+    it (so the spec isn't 'dangling'); heuristically, any non-spec open PR in the
+    repo whose branch slug matches the spec's slug counts as its impl."""
+    items = []
+    seen_repos = set()
+    for prod in products_out:
+        for repo in prod.get("repos", []):
+            slug = repo.get("slug")
+            if not slug or slug in seen_repos:
+                continue
+            seen_repos.add(slug)
+            try:
+                prs = forge.list_open_prs(slug)
+                issues = forge.list_issues(slug)
+            except NotImplementedError:
+                continue
+            # impl-PR detection: slugs of non-build-spec open PRs in this repo.
+            impl_slugs = set()
+            for p in prs:
+                if not _is_build_spec(p.get("labels"), p.get("title")):
+                    impl_slugs |= branch_slug_candidates(p.get("headRefName"))
+            for p in prs:
+                spec_slugs = branch_slug_candidates(p.get("headRefName"))
+                has_impl = bool(_is_build_spec(p.get("labels"), p.get("title"))
+                                and (spec_slugs & impl_slugs))
+                items.append({
+                    "repo": repo.get("name") or slug.split("/")[-1],
+                    "kind": "pr", "number": p.get("number"),
+                    "title": p.get("title"), "branch": p.get("headRefName"),
+                    "labels": p.get("labels"), "createdAt": p.get("createdAt"),
+                    "isDraft": p.get("isDraft"), "url": p.get("url"),
+                    "has_impl_pr": has_impl,
+                })
+            for i in issues:
+                items.append({
+                    "repo": repo.get("name") or slug.split("/")[-1],
+                    "kind": "issue", "number": i.get("number"),
+                    "title": i.get("title"), "branch": None,
+                    "labels": i.get("labels"), "createdAt": i.get("createdAt"),
+                    "isDraft": False, "url": i.get("url"),
+                    "has_impl_pr": False,
+                })
+    return items
 
 
 # --------------------------------------------------------------------------
@@ -920,6 +1151,14 @@ def main():
     if local:
         workbench_entries = collect_workbench(workspace_root)
         merge_workbench_into_cards(kanban, workbench_entries)
+
+    # Forge-only data path (4th source): open PRs/issues with no local footprint.
+    # Reconcile against the local cards — matches attach, the rest become
+    # `remote-only` cards (e.g. a dangling build-spec). Needs `gh`; skipped
+    # under --no-gh. Runs in both local and forge-only modes.
+    if not args.no_gh:
+        forge_items = collect_forge_items(cfg, forge, products_out)
+        merge_forge_items_into_cards(kanban, forge_items, now)
 
     # Link inference: pair worktrees to plan cards by naming; unmatched stays
     # visible (worktree with card=None, card with has_worktree=False).

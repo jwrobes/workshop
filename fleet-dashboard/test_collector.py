@@ -1042,5 +1042,130 @@ class MergeWorkbenchTests(unittest.TestCase):
         self.assertEqual(len(merged), 2)  # yogada plan + yogada-shop workbench-only
 
 
+class ForgeListItemsTests(unittest.TestCase):
+    """list_open_prs / list_issues parse the forge response; GitLab stub raises."""
+
+    def test_github_list_open_prs_parses(self):
+        sample = json.dumps([
+            {"number": 88, "title": "Build Spec 007", "headRefName": "bosque/build-spec-007",
+             "labels": [{"name": "build-spec"}], "createdAt": "2026-06-08T00:00:00Z",
+             "isDraft": False, "url": "https://x/pull/88"}])
+        import unittest.mock as mock
+        with mock.patch.object(collector, "run", return_value=(0, sample)):
+            prs = collector.GitHubForge().list_open_prs("org/repo")
+        self.assertEqual(len(prs), 1)
+        self.assertEqual(prs[0]["number"], 88)
+        self.assertEqual(prs[0]["labels"], ["build-spec"])  # flattened from {name}
+        self.assertEqual(prs[0]["headRefName"], "bosque/build-spec-007")
+
+    def test_github_list_issues_parses(self):
+        sample = json.dumps([{"number": 5, "title": "An issue", "labels": [],
+                              "createdAt": "2026-06-01T00:00:00Z", "url": "u"}])
+        import unittest.mock as mock
+        with mock.patch.object(collector, "run", return_value=(0, sample)):
+            iss = collector.GitHubForge().list_issues("org/repo")
+        self.assertEqual(iss[0]["number"], 5)
+
+    def test_github_list_open_prs_no_slug(self):
+        self.assertEqual(collector.GitHubForge().list_open_prs(None), [])
+
+    def test_gitlab_stub_raises(self):
+        with self.assertRaises(NotImplementedError):
+            collector.GitLabForge().list_open_prs("g/r")
+        with self.assertRaises(NotImplementedError):
+            collector.GitLabForge().list_issues("g/r")
+
+    def test_base_forge_defaults_empty(self):
+        # A Forge subclass that doesn't override gets safe [] defaults.
+        class Bare(collector.Forge):
+            def list_repos(self, p): return []
+            def list_prs(self, s, branch=None): return []
+            def read_dir(self, s, p): return []
+            def get_file(self, s, p): return None
+        self.assertEqual(Bare().list_open_prs("r"), [])
+        self.assertEqual(Bare().list_issues("r"), [])
+
+
+class BranchSlugCandidateTests(unittest.TestCase):
+    def test_strips_owner_and_spec_prefixes(self):
+        cands = collector.branch_slug_candidates("bosque/build-spec-007")
+        self.assertIn("build-spec-007", cands)
+        self.assertIn("007", cands)  # build-spec- prefix stripped, then norm
+
+    def test_underscore_normalized(self):
+        cands = collector.branch_slug_candidates("feature/cot_trip_matcher")
+        self.assertIn("cot-trip-matcher", cands)
+
+
+class ForgeReconcileTests(unittest.TestCase):
+    """4th source: GitHub items attach to a matching card, else become
+    remote-only; ambiguous never false-merges; dangling-spec flagged."""
+
+    NOW = collector.datetime.datetime(2026, 6, 23, tzinfo=collector.datetime.timezone.utc)
+
+    def _card(self, repo, slug, title, status="active"):
+        return {"level": "repo", "product": "p", "repo": repo, "status": status,
+                "title": title, "path": f"/x/{slug}.md", "slug": slug,
+                "goal": None, "body": "", "workbench": None}
+
+    def _item(self, **kw):
+        base = {"repo": "claw-playbook", "kind": "pr", "number": 1, "title": "T",
+                "branch": "feature/x", "labels": [], "createdAt": "2026-06-01T00:00:00Z",
+                "isDraft": False, "url": "u", "has_impl_pr": False}
+        base.update(kw); return base
+
+    def test_branch_slug_match_attaches(self):
+        cards = [self._card("claw-playbook", "venmo-enrichment", "Venmo")]
+        items = [self._item(branch="build-venmo-enrichment", number=42)]
+        out = collector.merge_forge_items_into_cards(cards, items, self.NOW)
+        self.assertEqual(len(out), 1)               # no new card
+        self.assertEqual(out[0]["github"]["number"], 42)
+
+    def test_title_match_attaches(self):
+        cards = [self._card("claw-playbook", "x", "Cot Trip Matcher")]
+        items = [self._item(title="cot trip matcher", branch=None, number=7)]
+        out = collector.merge_forge_items_into_cards(cards, items, self.NOW)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["github"]["number"], 7)
+
+    def test_no_match_becomes_remote_only_and_dangling(self):
+        cards = []
+        items = [self._item(branch="bosque/build-spec-007", number=88,
+                            title="Build Spec 007", labels=["build-spec"],
+                            createdAt="2026-06-08T00:00:00Z")]
+        out = collector.merge_forge_items_into_cards(cards, items, self.NOW)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["source"], "remote-only")
+        self.assertIn("dangling-spec", out[0]["flags"])  # build-spec, no impl, old
+
+    def test_ambiguous_match_does_not_false_merge(self):
+        # two cards with the same title -> ambiguous -> remote-only, not attached
+        cards = [self._card("claw-playbook", "a", "Same"),
+                 self._card("claw-playbook", "b", "Same")]
+        items = [self._item(title="same", branch=None, number=9)]
+        out = collector.merge_forge_items_into_cards(cards, items, self.NOW)
+        self.assertEqual(len(out), 3)               # 2 originals + 1 remote-only
+        self.assertEqual(out[-1]["source"], "remote-only")
+        self.assertTrue(out[-1]["ambiguous_match"])
+        self.assertNotIn("github", cards[0])        # neither original got attached
+        self.assertNotIn("github", cards[1])
+
+    def test_recent_build_spec_not_dangling(self):
+        cards = []
+        items = [self._item(branch="bosque/build-spec-009", number=99,
+                            title="Build Spec 009", labels=["build-spec"],
+                            createdAt="2026-06-22T00:00:00Z")]  # 1 day old
+        out = collector.merge_forge_items_into_cards(cards, items, self.NOW)
+        self.assertNotIn("dangling-spec", out[0]["flags"])
+
+    def test_build_spec_with_impl_not_dangling(self):
+        cards = []
+        items = [self._item(branch="bosque/build-spec-007", number=88,
+                            title="Build Spec 007", labels=["build-spec"],
+                            createdAt="2026-06-01T00:00:00Z", has_impl_pr=True)]
+        out = collector.merge_forge_items_into_cards(cards, items, self.NOW)
+        self.assertNotIn("dangling-spec", out[0]["flags"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

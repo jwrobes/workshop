@@ -156,20 +156,17 @@ worktrees in a "Needs attention" block at the top.
 
 ## Known limitations
 
-- **Local-first: it does NOT show specs/PRs/issues that have no local footprint.**
-  This is the biggest gap. Today the collector sees (a) local `plans/*.md` files
-  and (b) worktrees + the PR for each worktree's branch (`gh pr list --head`). It
-  does **not** independently query GitHub for *all* open PRs/issues in your repos.
-  So it is **blind to:**
-  - a **cloud-build spec** an agent is working on the web (no local worktree),
-  - an **open PR** on a branch you don't have checked out locally,
-  - an **issue-as-spec** sitting on GitHub with no local plan file or worktree.
-  A spec only appears if it has a local file OR a local worktree. (E.g. a closed
-  spec-PR shows only while its worktree still exists; reap the worktree and it
-  vanishes from the view even though the PR record lives on GitHub.)
-  **Fix (planned):** wire the forge-only data path — list PRs/issues per repo via
-  `gh` independent of local files, and surface any with no local match (this also
-  catches orphan PRs and cloud-initiated work). Tracked as the next initiative.
+- **Forge-only items (GitHub PRs/issues with no local footprint) — now surfaced.**
+  The collector lists every member repo's open PRs + issues via the `Forge`
+  (`gh`), reconciles each against the local cards by branch-slug or title, and
+  either **attaches** it to the matching card (no duplicate) or surfaces it as a
+  **`remote-only`** card. So cloud-build specs with no local worktree, orphan
+  PRs, and issue-as-spec records are visible. A `build-spec` item that is open
+  with no implementation PR (and older than a threshold) is flagged
+  **`dangling-spec`** and parked at the `spec'd` stage on the pipeline map.
+  Requires `gh`; under `--no-gh` the collector stays local-only (no remote-only
+  cards). Reconciliation is conservative — an ambiguous match becomes
+  remote-only rather than risk a wrong merge.
 - **Per-plan issue links + cloud/local path tags are inferred/stubbed.** Issue
   links show "not wired yet"; the path tag (cloud/local) is best-effort from
   branch/PR signals, not authoritative. Same forge-wiring task addresses these.
