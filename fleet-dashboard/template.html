@@ -258,15 +258,40 @@ function planStage(card){
   if(w){ if((w.dirty_files||0)>0) return {key:'executing',stuck:null}; return {key:'routed',stuck:null}; }
   return {key:'spec',stuck:null};
 }
-function buildPrompt(card,prod){
-  const w=worktreeForCard(card),L=[];
-  L.push('Pick up and continue this plan autonomously.');L.push('');
-  L.push('Plan: '+card.title);
-  L.push('Product: '+(prod?prod.name:card.product)+'  ·  Repo: '+(repoForCard(card)||'(product-level)'));
-  if(card.path) L.push('Plan doc: '+card.path);
-  if(w){L.push('Branch: '+(w.branch||'—'));if(w.path)L.push('Worktree: '+w.path);if(w.pr&&w.pr.number)L.push('PR: #'+w.pr.number+' ('+(w.pr.state||'').toLowerCase()+')');}
-  const a=cardAttention(card);if(a)L.push('Next action: '+attnMeta(a.type).action);
-  L.push('');L.push('Read the plan doc first, then continue the work. Keep commits small. Open or update the PR when ready and report back.');
+// Build a real full-path-github launch prompt. mode: 'cloud' (claude.ai/code,
+// clone the skill at runtime) or 'local' (local Claude Code). Both invoke the
+// actual orchestrator — not a generic "continue the work". The card's GitHub
+// issue/PR ref is the spec target when present (spec-in-issue model).
+function buildPrompt(card,prod,mode){
+  const w=worktreeForCard(card);
+  const gh=card.github||{};
+  const repo=repoForCard(card)||'(product-level)';
+  const target = gh.number ? ('issue/PR #'+gh.number+' on '+(card.repo||repo))
+               : (card.path ? ('the plan doc at '+card.path) : ('plan "'+card.title+'"'));
+  const L=[];
+  L.push('You are running the full-path-github orchestrator on '+target+'.');
+  L.push('');
+  L.push('1. The orchestrator is NOT a registered skill — that is expected. Get it first:');
+  if(mode==='local'){
+    L.push('   read ~/workspace/skills/full-path-github/SKILL.md then phases/guardrails.md');
+    L.push('   (or: git clone --depth 1 https://github.com/jwrobes/skills.git /tmp/skills)');
+  }else{
+    L.push('   git clone --depth 1 https://github.com/jwrobes/skills.git /tmp/skills');
+    L.push('   read /tmp/skills/full-path-github/SKILL.md then phases/guardrails.md');
+  }
+  L.push('   FOLLOW them. Do NOT improvise the workflow or skip the clone.');
+  L.push('');
+  L.push('2. Target: '+target+'.');
+  L.push('   Plan: '+card.title+'   ·   Product: '+(prod?prod.name:card.product)+'   ·   Repo: '+repo);
+  if(card.goal) L.push('   Goal: '+card.goal);
+  if(card.path) L.push('   Plan doc: '+card.path);
+  if(gh.url) L.push('   GitHub: '+gh.url);
+  if(w){L.push('   Existing worktree: '+(w.branch||'—')+(w.path?(' @ '+w.path):''));}
+  const a=cardAttention(card);if(a)L.push('   Next action: '+attnMeta(a.type).action);
+  L.push('');
+  L.push('3. Ground the spec against the real tree, branch off origin/main (build-<slug>),');
+  L.push('   implement, validate, render a comprehension artifact at ship (Step 3.5),');
+  L.push('   open a DRAFT PR'+(gh.number?(' that says "Closes #'+gh.number+'"'):'')+', and STOP before merge.');
   return L.join('\n');
 }
 
@@ -686,10 +711,17 @@ function renderPlan(app){
 
   grid.appendChild(left);
 
-  // handoff
+  // handoff — real full-path-github launch prompts, for cloud AND local
   const right=el('<div class="handoff" data-region="handoff"></div>');
-  const prompt=buildPrompt(card,p);
-  right.innerHTML='<div style="padding:16px 17px 0"><div class="mono" style="font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:#bda86f">Hand off to an agent</div><p style="font-size:13px;color:#bdb6a6;margin:8px 0 0;line-height:1.5">Copy a ready-to-paste prompt with the plan doc, branch and next action.</p></div><pre data-field="launch-prompt">'+esc(prompt)+'</pre><div style="padding:13px 17px 16px"><button class="copybtn" id="copybtn">Copy launch prompt</button></div>';
+  const promptCloud=buildPrompt(card,p,'cloud');
+  const promptLocal=buildPrompt(card,p,'local');
+  right.innerHTML=
+    '<div style="padding:16px 17px 0"><div class="mono" style="font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:#bda86f">Hand off to an agent — runs full-path-github</div>'
+    +'<p style="font-size:13px;color:#bdb6a6;margin:8px 0 0;line-height:1.5">Paste into a fresh agent. Cloud = claude.ai/code (clones the skill); Local = local Claude Code.</p>'
+    +'<div style="display:flex;gap:6px;margin:12px 0 0"><button class="ptab" id="ptab-cloud" data-mode="cloud" style="all:unset;cursor:pointer;font-family:\'IBM Plex Mono\',monospace;font-size:11px;color:#241f12;background:#d7a23f;padding:5px 11px;border-radius:6px">cloud (web)</button>'
+    +'<button class="ptab" id="ptab-local" data-mode="local" style="all:unset;cursor:pointer;font-family:\'IBM Plex Mono\',monospace;font-size:11px;color:#bda86f;background:#33302a;padding:5px 11px;border-radius:6px">local</button></div></div>'
+    +'<pre data-field="launch-prompt" id="launch-pre">'+esc(promptCloud)+'</pre>'
+    +'<div style="padding:13px 17px 16px"><button class="copybtn" id="copybtn">Copy launch prompt</button></div>';
   grid.appendChild(right);
   sec.appendChild(grid);
 
@@ -709,8 +741,19 @@ function renderPlan(app){
   sec.appendChild(back);
   app.appendChild(sec);
 
-  const cbn=$('copybtn');
-  if(cbn) cbn.onclick=()=>{try{navigator.clipboard.writeText(prompt);}catch(e){}cbn.textContent='Copied to clipboard ✓';setTimeout(()=>cbn.textContent='Copy launch prompt',2200);};
+  // launch-prompt mode toggle (cloud/local) + copy
+  let mode='cloud';
+  const pre=$('launch-pre'), cbn=$('copybtn');
+  const tabs={cloud:$('ptab-cloud'),local:$('ptab-local')};
+  function setMode(m){
+    mode=m;
+    if(pre) pre.textContent = (m==='local'?promptLocal:promptCloud);
+    for(const k in tabs){ if(!tabs[k])continue; const on=(k===m);
+      tabs[k].style.color=on?'#241f12':'#bda86f'; tabs[k].style.background=on?'#d7a23f':'#33302a'; }
+  }
+  if(tabs.cloud) tabs.cloud.onclick=()=>setMode('cloud');
+  if(tabs.local) tabs.local.onclick=()=>setMode('local');
+  if(cbn) cbn.onclick=()=>{const t=(mode==='local'?promptLocal:promptCloud);try{navigator.clipboard.writeText(t);}catch(e){}cbn.textContent='Copied to clipboard ✓';setTimeout(()=>cbn.textContent='Copy launch prompt',2200);};
 }
 
 function renderYouAreHere(card){
