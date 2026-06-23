@@ -293,32 +293,42 @@ function buildPrompt(card,prod,mode){
   L.push('1. The orchestrator + spec-to-issue are NOT registered skills — expected. Get them:');
   L.push('   '+clone);
   L.push('   You will read SKILL.md files there and FOLLOW them. Do NOT improvise or skip the clone.');
+  // TARGET repo = where the work IMPLEMENTS (and where the issue must be filed).
+  // For a product-level plan, card.repo is null and the plan declares `repo:`
+  // (impl_repo). The plan doc lives in the PLANNING repo and is NOT reachable
+  // from a session scoped to the impl repo — so the spec must be copied INLINE
+  // into the issue, never linked.
+  const implRepo = card.impl_repo || card.repo || gh.repo || '';
+  const planUnreachable = !!(card.path && card.impl_repo) || (!card.repo && !!card.impl_repo);
   L.push('');
   // Context block (shared).
   L.push('Initiative: '+card.title);
-  L.push('Product: '+(prod?prod.name:card.product)+'   ·   Repo: '+repo);
+  L.push('Product: '+(prod?prod.name:card.product)+'   ·   Implements in: '+(implRepo||'(unspecified — ASK which repo)'));
   if(card.goal) L.push('Goal: '+card.goal);
-  if(card.path) L.push('Plan doc: '+card.path);
+  if(card.path) L.push('Plan doc (PLANNING repo — likely NOT reachable from the impl repo): '+card.path);
   if(gh.url) L.push('GitHub: '+gh.url);
   if(w) L.push('Existing worktree: '+(w.branch||'—')+(w.path?(' @ '+w.path):''));
+  if(planUnreachable) L.push('NOTE: the plan doc is in the planning repo (magic-me-workbench). A session scoped to '+(implRepo||'the impl repo')+' CANNOT read it — you must copy the full spec INLINE into the issue, not link it.');
   L.push('');
+  const fileInto = implRepo || '(the implementation repo — ASK if unspecified)';
   if(rd==='idea'){
     // No real spec yet → author one (+ build-spec PR for review) BEFORE spec-to-issue.
     L.push('2. This initiative has NO real spec yet (just an idea/thin card). AUTHOR the spec first:');
     L.push('   read /tmp/skills/spec-to-issue/SKILL.md (or ~/workspace/skills/spec-to-issue/) and the orchestrator.');
-    L.push('   Draft a real spec from the goal/title above + the ACTUAL '+(card.repo||repo)+' tree (cite real paths).');
-    L.push('   Open it as a `build-spec`-labeled PR for HUMAN REVIEW — do NOT implement until the spec is reviewed.');
+    L.push('   Draft a real spec from the goal/title above + the ACTUAL '+fileInto+' tree (cite real paths).');
+    L.push('   Open it as a `build-spec`-labeled PR IN '+fileInto+' for HUMAN REVIEW — do NOT implement until reviewed.');
     L.push('   STOP after opening the build-spec PR and report. (The human reviews the spec, THEN the next steps run.)');
     L.push('');
-    L.push('3. After the spec is reviewed: spec-to-issue (spec → groomed `ready` issue, body IS the spec) →');
+    L.push('3. After review: spec-to-issue (spec → groomed `ready` issue IN '+fileInto+', body IS the spec) →');
     L.push('   full-path-github on that issue → ground, branch build-<slug>, implement, comprehension artifact');
     L.push('   at ship (Step 3.5), DRAFT PR "Closes #<issue>", STOP before merge.');
   } else if(rd==='specd'){
     // Real spec, no issue → spec-to-issue then full-path-github.
     L.push('2. This initiative has a spec but NO GitHub issue yet. Run **spec-to-issue** first');
     L.push('   (read /tmp/skills/spec-to-issue/SKILL.md or ~/workspace/skills/spec-to-issue/):');
-    L.push('   turn the plan above into a single GROOMED GitHub issue in '+(card.repo||repo)+' — the issue');
-    L.push('   body IS the spec (inline it). Label it `ready`. That issue is the input to the next step.');
+    L.push('   COPY the full plan/spec INLINE into a single GROOMED GitHub issue IN '+fileInto+' — the issue');
+    L.push('   body IS the spec (do not just link the plan doc; the impl session can\'t read it). Label it `ready`.');
+    L.push('   That issue is the input to the next step.');
     L.push('');
     L.push('3. Then run **full-path-github** on that new issue: read its SKILL.md + phases/guardrails.md,');
     L.push('   ground the spec, branch off origin/main (build-<slug>), implement, validate, render a');
