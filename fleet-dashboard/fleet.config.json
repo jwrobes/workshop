@@ -16,6 +16,14 @@
         "Jwrobes-Magic/yogada-shop",
         "jwrobes/wizard"
       ]
+    },
+    {
+      "id": "build-tooling",
+      "name": "Build Tooling",
+      "member_repos": [
+        "jwrobes/workshop",
+        "jwrobes/skills"
+      ]
     }
   ]
 }
