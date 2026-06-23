@@ -446,6 +446,26 @@ def _card(level, product_id, repo_name, status, title, path, text="", slug=None)
             "workbench": None}
 
 
+SPEC_BODY_MIN = 200  # chars of plan body that count as "a real spec exists"
+
+
+def card_readiness(card):
+    """Where a card sits on the spec->issue->build readiness ladder, so the
+    dashboard can show what it NEEDS next:
+      - 'done'      -> completed/shipped work (no action needed)
+      - 'has-issue' -> a GitHub issue/PR exists -> ready to implement (full-path-github)
+      - 'specd'     -> real plan body, no issue  -> needs the issue filed (spec-to-issue)
+      - 'idea'      -> thin/empty body, no issue -> needs a spec authored first
+    """
+    if (card.get("status") or "") in ("completed", "done"):
+        return "done"
+    if (card.get("github") or {}).get("number"):
+        return "has-issue"
+    if len((card.get("body") or "").strip()) >= SPEC_BODY_MIN:
+        return "specd"
+    return "idea"
+
+
 def _read_plan_entry(entry):
     """Given a plan entry that is EITHER a flat `<slug>.md` file OR a folder
     `<slug>/README.md`, return (slug, path_to_render, text). The two forms are
@@ -1207,6 +1227,12 @@ def main():
     # Link inference: pair worktrees to plan cards by naming; unmatched stays
     # visible (worktree with card=None, card with has_worktree=False).
     link_worktrees_to_cards(rows, kanban)
+
+    # Readiness: classify every card AFTER github/workbench/worktree merges, so
+    # it reflects the final state (idea / specd / has-issue / done). Drives the
+    # card badge + the launch prompt's branch.
+    for c in kanban:
+        c["readiness"] = card_readiness(c)
 
     status = {
         "generated_at": now.isoformat(timespec="seconds"),

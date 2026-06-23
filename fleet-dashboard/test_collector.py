@@ -1203,5 +1203,25 @@ class ForgeReconcileTests(unittest.TestCase):
         self.assertNotIn("dangling-spec", out[0]["flags"])
 
 
+class ReadinessTests(unittest.TestCase):
+    def test_has_issue_when_github_number(self):
+        self.assertEqual(collector.card_readiness(
+            {"status": "active", "github": {"number": 88}, "body": ""}), "has-issue")
+
+    def test_specd_when_real_body_no_issue(self):
+        self.assertEqual(collector.card_readiness(
+            {"status": "active", "body": "x" * 250}), "specd")
+
+    def test_idea_when_thin_body_no_issue(self):
+        self.assertEqual(collector.card_readiness(
+            {"status": "active", "body": "short"}), "idea")
+        self.assertEqual(collector.card_readiness(
+            {"status": "active", "body": ""}), "idea")
+
+    def test_done_for_completed(self):
+        self.assertEqual(collector.card_readiness(
+            {"status": "completed", "body": "x" * 250}), "done")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
