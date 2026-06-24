@@ -121,6 +121,7 @@ See `dictate-context.md.example` in this folder for a starter template.
 |---------|---------|-------------|
 | `llm` (default) | Simon Willison's `llm` CLI | Any API key — OpenAI, Anthropic, Gemini, etc. |
 | `ollama` | `ollama run` | Fully offline / no API key needed |
+| `litellm` | Any OpenAI-compatible proxy | Company proxy or self-hosted LiteLLM — set `LITELLM_BASE_URL` + `LITELLM_API_KEY` |
 
 ### Ollama setup (optional)
 
@@ -140,9 +141,16 @@ Always use the `-mlx` suffix variants — the non-suffix variants (`whisper-smal
 | `mlx-community/whisper-small.en-mlx` | ~300MB | fast | better | Default — daily use |
 | `mlx-community/whisper-medium.en-mlx` | ~700MB | moderate | best | Long dictations (>30s) |
 
-## Planned next phase
+## Planned next phases
 
-**Session-aware context:** `dictate` will optionally pull the last N lines from the active Claude Code session (via `cli_ready_alerts` context stash) or Cursor session (via `cursor_chat_mining` SQLite) and prepend them to the cleanup prompt alongside `context.md`. This gives the cleanup LLM live session awareness — resolving "that function" or "the service we discussed" — with no extra LLM calls.
+**Phase 1 — Session-aware context:** `dictate` will optionally pull the last N lines from the active Claude Code session (via `cli_ready_alerts` context stash) or Cursor session (via `cursor_chat_mining` SQLite) and prepend them to the cleanup prompt alongside `context.md`. This gives the cleanup LLM live session awareness — resolving "that function" or "the service we discussed" — with no extra LLM calls.
+
+**Phase 2 — Seeded context library:** Instead of one global `context.md`, `dictate` will load topic-specific bundles on demand. Pre-built bundles in `~/.config/dictate/contexts/` (e.g. `project.md`, `team.md`) can be selected per call or generated on demand from a docs folder:
+
+```bash
+dictate --generate-context myproject --from ~/workspace/myproject/docs
+dictate --context myproject,team  write a bug report for the auth retry loop
+```
 
 ## Related
 

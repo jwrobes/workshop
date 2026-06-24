@@ -73,7 +73,11 @@ cmd_status() {
 
   printf 'cli-ready-alerts\n'
   printf '  enabled:              %s\n' "$enabled"
-  printf '  quiet_hours:          %s..%s\n' "$quiet_start" "$quiet_end"
+  if [[ -n "$quiet_start" && -n "$quiet_end" ]]; then
+    printf '  quiet_hours:          %s..%s\n' "$quiet_start" "$quiet_end"
+  else
+    printf '  quiet_hours:          (none)\n'
+  fi
   printf '  skip_if_cursor_front: %s\n' "$skip_frontmost"
 
   if [[ -n "${CURSOR_ALERT_DISABLE:-}" && "${CURSOR_ALERT_DISABLE}" == "1" ]]; then
@@ -157,6 +161,23 @@ cmd_edit() {
   "${EDITOR:-vi}" "$CRA_CONFIG"
 }
 
+cmd_sounds() {
+  local action="${1:-}"
+  case "$action" in
+    on)
+      _cra_write_config '.channels.sound.enabled = true'
+      info "sound channel: ON"
+      ;;
+    off)
+      _cra_write_config '.channels.sound.enabled = false'
+      info "sound channel: OFF"
+      ;;
+    *)
+      die "usage: cra sounds on|off"
+      ;;
+  esac
+}
+
 cmd_help() {
   cat <<'HELP'
 cra — cli-ready-alerts control CLI
@@ -167,6 +188,7 @@ Commands:
   on                    Enable alerts (sets config.enabled=true)
   off                   Disable alerts globally (persists across sessions)
   status                Show current config, contexts, routing, overrides
+  sounds on|off         Toggle the sound channel without disabling everything else
   mute <context>        Silence a specific context (e.g. cra mute myproject)
   unmute <context>      Re-enable a silenced context
   test [event] [ctx]    Play the sound that would fire for an event+context
@@ -193,6 +215,7 @@ case "$cmd" in
   unmute)  cmd_unmute "$@" ;;
   tail|log) cmd_tail "$@" ;;
   test)    cmd_test "$@" ;;
+  sounds)  cmd_sounds "$@" ;;
   edit)    cmd_edit ;;
   help|-h|--help) cmd_help ;;
   *)       die "unknown command: $cmd (try 'cra help')" ;;
