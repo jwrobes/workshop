@@ -78,6 +78,7 @@ if [[ "$ok" == "0" ]]; then
 fi
 
 # ── Symlink dictate ──────────────────────────────────────────────────────────
+run "chmod +x '$SRC_DIR/dictate'"
 run "mkdir -p '$(dirname "$BIN_SYMLINK")'"
 run "ln -sfn '$SRC_DIR/dictate' '$BIN_SYMLINK'"
 say "symlinked $BIN_SYMLINK -> $SRC_DIR/dictate"
