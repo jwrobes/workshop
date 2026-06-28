@@ -1186,11 +1186,20 @@ def main():
                     flags.append("no-workbench-pair")
                 if not in_workspace_dir:
                     flags.append("orphan")
-            # NOTE (v1-faithful behavior): under --no-gh, `pr` is always None, so a
-            # dirty/ahead-unmerged worktree is flagged `unprotected` even if an open
-            # PR would protect it online. Offline mode cannot know PR state; this
-            # matches the v1 engine. Treat offline `unprotected` as "PR state unknown".
-            if dirty or (ahead and not pr and merged is False):
+            # `unprotected` means FEATURE-BRANCH work at risk (uncommitted or
+            # unmerged-ahead with no PR safety net). It must NOT fire on a
+            # default-branch (main/master) checkout: a dirty main clone is just
+            # local edits on main, not feature work about to be lost — flagging
+            # it buried the real actionable items under ~7 false positives.
+            # A dirty default branch gets the quieter `dirty-default-branch`.
+            is_default_branch = base is not None and branch == base
+            # NOTE (v1-faithful): under --no-gh, `pr` is always None, so an
+            # ahead-unmerged feature branch reads `unprotected` even if an open
+            # PR would protect it online. Offline can't know PR state.
+            if is_default_branch:
+                if dirty:
+                    flags.append("dirty-default-branch")
+            elif dirty or (ahead and not pr and merged is False):
                 flags.append("unprotected")
             if kind == "clone" and behind:
                 flags.append("behind-origin")

@@ -553,9 +553,18 @@ function reposOf(p){
     const ps=plans.filter(c=>repoForCard(c)===name);
     const active=ps.filter(c=>c.status==='active').length;
     const attn=ps.filter(c=>cardAttention(c)).length;
-    const wt=worktrees().filter(w=>w.repo===name&&w.kind==='worktree').length;
-    return {name,planCount:ps.length,active,attn,worktrees:wt};
-  }).filter(r=>r.planCount>0||r.worktrees>0);
+    // Match worktree rows to this repo case-insensitively: a clone's repo name
+    // comes from its filesystem dir (e.g. `Yogada`) which can differ in case
+    // from the config-derived product-repo name (`yogada`). Without this the
+    // repo's worktrees/activity don't link and the repo can vanish from the grid.
+    const lc=(name||'').toLowerCase();
+    const rows=worktrees().filter(w=>(w.repo||'').toLowerCase()===lc);
+    const wt=rows.filter(w=>w.kind==='worktree').length;
+    // A member repo with local activity (e.g. a dirty/behind clone) but no plans
+    // or worktrees would otherwise vanish; count any flagged row so it surfaces.
+    const activity=rows.filter(w=>(w.flags||[]).length).length;
+    return {name,planCount:ps.length,active,attn,worktrees:wt,activity};
+  }).filter(r=>r.planCount>0||r.worktrees>0||r.activity>0);
 }
 
 // ---------- L3 REPO ----------
@@ -894,6 +903,9 @@ function render(){
 }
 let _rt;
 window.addEventListener('resize',()=>{clearTimeout(_rt);_rt=setTimeout(render,120);});
+// Expose the router + data for headless verification (verify_ui.mjs). Harmless
+// in normal use; lets a test drive navigation and assert against the source data.
+window.goTo=goTo;window.DATA=DATA;window.STATE=STATE;
 render();
 </script>
 </body>

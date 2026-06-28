@@ -268,6 +268,47 @@ class FlagEngineTests(unittest.TestCase):
         # F5 guard: pairing flag suppressed while initiatives is empty
         self.assertNotIn("no-workbench-pair", feat[0]["flags"])
 
+    def _run_collector(self):
+        import sys
+        old = sys.argv
+        sys.argv = ["collector.py", "--no-gh", "--workspace", str(self.ws),
+                    "--out", str(self.out)]
+        try:
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(collector.main(), 0)
+        finally:
+            sys.argv = old
+        return json.loads((self.out / "status.json").read_text())
+
+    def test_dirty_default_branch_not_unprotected(self):
+        # Phase 3: a dirty checkout ON main/master is NOT 'unprotected' (that
+        # alarm is for feature work at risk) — it gets the quieter
+        # 'dirty-default-branch'. This killed ~7 false positives on the board.
+        (self.repo / "dirty.txt").write_text("uncommitted\n")  # dirty on main
+        status = self._run_collector()
+        main_row = [r for r in status["worktrees"]
+                    if r["branch"] == "main" and r["kind"] == "clone"]
+        self.assertEqual(len(main_row), 1)
+        self.assertNotIn("unprotected", main_row[0]["flags"])
+        self.assertIn("dirty-default-branch", main_row[0]["flags"])
+
+    def test_dirty_feature_branch_still_unprotected(self):
+        # The real signal must survive: an unmerged feature branch with a dirty
+        # file is still 'unprotected'. Use a fresh, NOT-merged feature branch.
+        env = ["-c", "user.email=t@t", "-c", "user.name=t"]
+        _git(self.repo, "checkout", "-b", "build-live")
+        (self.repo / "c.txt").write_text("c\n")
+        _git(self.repo, "add", "c.txt")
+        _git(self.repo, *env, "commit", "-m", "live work")
+        _git(self.repo, "checkout", "main")  # free the branch for a worktree
+        _git(self.repo, "worktree", "add",
+             str(self.ws / "demo-live"), "build-live")
+        (self.ws / "demo-live" / "wip.txt").write_text("wip\n")  # dirty in worktree
+        status = self._run_collector()
+        live = [r for r in status["worktrees"] if r["branch"] == "build-live"]
+        self.assertEqual(len(live), 1)
+        self.assertIn("unprotected", live[0]["flags"])
+
 
 class ConfigErrorTests(unittest.TestCase):
     """F2: malformed/missing config yields a clean error, not a traceback."""
