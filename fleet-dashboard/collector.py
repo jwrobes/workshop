@@ -210,6 +210,14 @@ class Forge(ABC):
         {number, title, labels:[str], createdAt, url}. [] when none/unavailable."""
         return []
 
+    def list_merged_prs(self, repo_slug, limit=60):
+        """Return recently-MERGED PR dicts for repo_slug:
+        {number, title, headRefName, labels:[str], mergedAt, url}. [] when
+        none/unavailable. A merged *impl* PR is the 'shipped' signal (Phase 4a);
+        a closed-not-merged PR is NOT here (a closed spec-PR is normal, not
+        shipped). Default no-op so offline mode + GitLab stub keep working."""
+        return []
+
 
 class GitHubForge(Forge):
     """GitHub forge wrapping the `gh` CLI. This is the ONLY place `gh` is
@@ -317,6 +325,25 @@ class GitHubForge(Forge):
                  "labels": self._label_names(i), "createdAt": i.get("createdAt"),
                  "url": i.get("url")}
                 for i in issues]
+
+    def list_merged_prs(self, repo_slug, limit=60):
+        if not repo_slug:
+            return []
+        code, out = run(["gh", "pr", "list", "--repo", repo_slug,
+                         "--state", "merged", "--limit", str(limit), "--json",
+                         "number,title,headRefName,labels,mergedAt,url"],
+                        timeout=30)
+        if code != 0 or not out:
+            return []
+        try:
+            prs = json.loads(out)
+        except json.JSONDecodeError:
+            return []
+        return [{"number": p.get("number"), "title": p.get("title") or "",
+                 "headRefName": p.get("headRefName") or "",
+                 "labels": self._label_names(p), "mergedAt": p.get("mergedAt"),
+                 "url": p.get("url")}
+                for p in prs]
 
 
 class GitLabForge(Forge):
@@ -788,16 +815,40 @@ def merge_forge_items_into_cards(cards, forge_items, now, repo_to_product=None):
             if m not in uniq:
                 uniq.append(m)
 
+        is_merged_item = bool(it.get("merged"))
         gh = {"kind": it.get("kind"), "number": it.get("number"),
               "title": it.get("title"), "url": it.get("url"),
-              "state": "OPEN", "labels": it.get("labels") or [],
-              "isDraft": bool(it.get("isDraft")), "createdAt": it.get("createdAt")}
+              "state": "MERGED" if is_merged_item else "OPEN",
+              "labels": it.get("labels") or [],
+              "isDraft": bool(it.get("isDraft")), "createdAt": it.get("createdAt"),
+              "mergedAt": it.get("mergedAt")}
 
         if len(uniq) == 1:
             # Unambiguous match -> attach (no duplicate card).
-            uniq[0]["github"] = gh
+            card = uniq[0]
+            # Phase 4a: a merged impl PR is the 'shipped' signal — it wins over a
+            # prior open-PR attachment (a track can have both; shipped is later).
+            # Don't downgrade a card already marked shipped to an open PR.
+            already_shipped = card.get("shipped")
+            if is_merged_item:
+                card["github"] = gh
+                card["shipped"] = True
+                card["shipped_pr"] = it.get("number")
+                card["shipped_at"] = it.get("mergedAt")
+            elif not already_shipped:
+                card["github"] = gh
+        elif is_merged_item:
+            # An UNMATCHED merged PR is just history — it must NOT spawn a card.
+            # Merged PRs are only interesting when they attach to a known track
+            # (marking it shipped, above). Creating a card per merged PR floods
+            # the board with ~130 orphan "spec'd" cards (the Phase-4a regression).
+            # Unmatched merged work that SHOULD belong to a track is the Phase-5
+            # LLM job, not a deterministic remote-only card.
+            continue
         else:
             # No match, OR ambiguous (>1) -> remote-only card (never false-merge).
+            # (Open PRs/issues with no local footprint ARE surfaced — that's
+            # genuine GitHub-only work; only merged history is suppressed above.)
             age = _age_days(it.get("createdAt"), now)
             is_spec = _is_build_spec(it.get("labels"), it.get("title"))
             dangling = bool(is_spec and not it.get("has_impl_pr")
@@ -865,6 +916,27 @@ def collect_forge_items(cfg, forge, products_out):
                     "labels": i.get("labels"), "createdAt": i.get("createdAt"),
                     "isDraft": False, "url": i.get("url"),
                     "has_impl_pr": False,
+                })
+            # Phase 4a: recently-MERGED impl PRs are the 'shipped' signal. A
+            # merged *impl* PR (NOT a build-spec PR) attaches to its track/card
+            # and marks it shipped. A merged build-spec PR is excluded — merging
+            # a spec isn't shipping the feature. (Closed-not-merged PRs never get
+            # here, so a closed spec-PR is correctly NOT treated as shipped.)
+            try:
+                merged = forge.list_merged_prs(slug)
+            except NotImplementedError:
+                merged = []
+            for p in merged:
+                if _is_build_spec(p.get("labels"), p.get("title")):
+                    continue
+                items.append({
+                    "repo": repo.get("name") or slug.split("/")[-1],
+                    "kind": "pr", "number": p.get("number"),
+                    "title": p.get("title"), "branch": p.get("headRefName"),
+                    "labels": p.get("labels"), "createdAt": p.get("mergedAt"),
+                    "isDraft": False, "url": p.get("url"),
+                    "has_impl_pr": False, "merged": True,
+                    "mergedAt": p.get("mergedAt"),
                 })
     return items
 

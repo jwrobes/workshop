@@ -265,6 +265,9 @@ function planStage(card){
     return {key:'spec',stuck:null};
   }
   if(card.status==='completed'||card.status==='done') return {key:'shipped',stuck:null};
+  // Phase 4a: a merged IMPL PR attached by the collector ships the card, even
+  // when the plan card has no local worktree (the common product-plan case).
+  if(card.shipped) return {key:'shipped',stuck:null};
   if(card.status==='blocked') return {key:'executing',stuck:'6d'};
   if(card.status==='backlog') return {key:'spec',stuck:null};
   const w=worktreeForCard(card),pr=(w&&w.pr)||{};

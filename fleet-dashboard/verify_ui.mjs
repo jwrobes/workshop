@@ -114,6 +114,22 @@ check('no main/master checkout flagged `unprotected`',
   badUnprotected.length === 0,
   badUnprotected.length ? badUnprotected.join(', ') : 'none');
 
+// ----- REQ 6 (Phase 4a): merged impl PRs produce a `shipped` signal — the
+// pipeline must no longer read SHIPPED 0 when real work has merged. -----------
+const shipInfo = await page.evaluate(() => {
+  const cards = (window.DATA && window.DATA.kanban) || [];
+  const shipped = cards.filter(c => c.shipped);
+  return {
+    count: shipped.length,
+    sample: shipped.slice(0, 3).map(c => `${c.slug}#${c.shipped_pr}`),
+    everyShippedHasPr: shipped.every(c => c.shipped_pr != null),
+  };
+});
+check('merged impl PRs mark cards `shipped` (pipeline SHIPPED > 0)',
+  shipInfo.count > 0, `${shipInfo.count} shipped; e.g. ${shipInfo.sample.join(', ')}`);
+check('  every shipped card carries its merged PR number',
+  shipInfo.everyShippedHasPr);
+
 // Screenshot for human confirmation.
 const shot = join(dirname(HTML), 'verify-magic-me.png');
 await goTo('product', 'magic-me');
