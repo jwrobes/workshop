@@ -747,21 +747,41 @@ def merge_forge_items_into_cards(cards, forge_items, now, repo_to_product=None):
     configured product get product=None (the unaffiliated bucket).
     Returns the (possibly extended) card list."""
     repo_to_product = repo_to_product or {}
-    # Index local cards by (repo, normalized slug) and (repo, normalized title).
+    # Index local cards by (repo, slug) and (repo, title) for repo-level matches.
+    # ALSO index product-level cards (repo=None) by (product, slug)/(product,
+    # title): a Magic Me plan card lives at product level, but the PRs/branches
+    # that implement it live in a member repo (claw-playbook). Without this, the
+    # impl/spec PR can't find its plan card and scatters as a `remote-only` card
+    # ("the real work is buried, not under Magic Me"). The product index lets a
+    # member-repo item attach to its product-level plan via the shared slug.
     by_slug, by_title = {}, {}
+    by_prod_slug, by_prod_title = {}, {}
     for c in cards:
         rk = norm(c.get("repo") or "")
         by_slug.setdefault((rk, norm(c.get("slug") or "")), []).append(c)
         by_title.setdefault((rk, norm(c.get("title") or "")), []).append(c)
+        # Product-level cards (no repo) are the canonical plan; index by product.
+        if c.get("level") == "product" and c.get("product"):
+            pk = c["product"]
+            by_prod_slug.setdefault((pk, norm(c.get("slug") or "")), []).append(c)
+            by_prod_title.setdefault((pk, norm(c.get("title") or "")), []).append(c)
 
     for it in forge_items:
         rk = norm(it.get("repo") or "")
-        # Collect candidate matches: branch-slug first, then title.
+        pk = repo_to_product.get(rk)  # product this item's repo belongs to
+        # Collect candidate matches, most-specific first:
+        #   1. repo-level card by branch-slug, 2. repo-level card by title,
+        #   3. product-level plan card by branch-slug, 4. by title.
         matches = []
         for cand in branch_slug_candidates(it.get("branch")):
             matches += by_slug.get((rk, cand), [])
         if not matches:
             matches += by_title.get((rk, norm(it.get("title") or "")), [])
+        if not matches and pk:
+            for cand in branch_slug_candidates(it.get("branch")):
+                matches += by_prod_slug.get((pk, cand), [])
+            if not matches:
+                matches += by_prod_title.get((pk, norm(it.get("title") or "")), [])
         # De-dupe candidate cards (a card could match by both slug and title).
         uniq = []
         for m in matches:

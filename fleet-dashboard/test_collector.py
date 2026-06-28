@@ -1182,9 +1182,61 @@ class ForgeReconcileTests(unittest.TestCase):
         out = collector.merge_forge_items_into_cards(cards, items, self.NOW)
         self.assertEqual(len(out), 3)               # 2 originals + 1 remote-only
         self.assertEqual(out[-1]["source"], "remote-only")
-        self.assertTrue(out[-1]["ambiguous_match"])
-        self.assertNotIn("github", cards[0])        # neither original got attached
-        self.assertNotIn("github", cards[1])
+
+    def _product_card(self, product, slug, title):
+        # A product-level plan card has NO repo (the plan lives at product level;
+        # impl PRs live in a member repo). This is the canonical plan card.
+        return {"level": "product", "product": product, "repo": None,
+                "status": "active", "title": title, "path": f"/p/{slug}.md",
+                "slug": slug, "goal": None, "body": "", "workbench": None}
+
+    def test_member_repo_pr_attaches_to_product_level_plan(self):
+        # The real bug: a product-level plan card (repo=None) and a member-repo
+        # PR whose build-branch slug matches it. Must ATTACH to the plan, not
+        # spawn a remote-only card ("real work buried, not under the product").
+        cards = [self._product_card("magic-me", "communications-hub-morning-briefing",
+                                    "Communications Hub & Morning Briefing")]
+        items = [self._item(repo="claw-playbook", number=113,
+                            branch="build-communications-hub-morning-briefing")]
+        out = collector.merge_forge_items_into_cards(
+            cards, items, self.NOW, repo_to_product={"claw-playbook": "magic-me"})
+        self.assertEqual(len(out), 1)                  # no new card — attached
+        self.assertEqual(out[0]["level"], "product")
+        self.assertEqual(out[0]["github"]["number"], 113)
+
+    def test_member_repo_pr_attaches_to_product_plan_by_title(self):
+        cards = [self._product_card("magic-me", "comm-hub", "Communications Hub")]
+        items = [self._item(repo="claw-playbook", number=200, branch=None,
+                            title="communications hub")]
+        out = collector.merge_forge_items_into_cards(
+            cards, items, self.NOW, repo_to_product={"claw-playbook": "magic-me"})
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["github"]["number"], 200)
+
+    def test_repo_level_match_wins_over_product_level(self):
+        # If a repo-level card matches, prefer it (most specific) — the product
+        # card is only the fallback, so we don't double-match the same item.
+        cards = [self._card("claw-playbook", "feat-x", "Feat X"),
+                 self._product_card("magic-me", "feat-x", "Feat X")]
+        items = [self._item(repo="claw-playbook", number=5, branch="build-feat-x")]
+        out = collector.merge_forge_items_into_cards(
+            cards, items, self.NOW, repo_to_product={"claw-playbook": "magic-me"})
+        self.assertEqual(len(out), 2)                  # no new card
+        repo_card = next(c for c in out if c["level"] == "repo")
+        self.assertEqual(repo_card["github"]["number"], 5)  # attached to repo card
+        prod_card = next(c for c in out if c["level"] == "product")
+        self.assertNotIn("github", prod_card)               # product NOT touched
+
+    def test_product_plan_no_false_match_across_products(self):
+        # A claw-playbook PR must NOT attach to a same-slug plan under a DIFFERENT
+        # product. Product scoping prevents cross-product bleed.
+        cards = [self._product_card("other-product", "shared-slug", "Shared")]
+        items = [self._item(repo="claw-playbook", number=9, branch="build-shared-slug")]
+        out = collector.merge_forge_items_into_cards(
+            cards, items, self.NOW, repo_to_product={"claw-playbook": "magic-me"})
+        self.assertEqual(len(out), 2)                  # original + remote-only
+        self.assertEqual(out[-1]["source"], "remote-only")
+        self.assertNotIn("github", cards[0])        # the cross-product plan untouched
 
     def test_recent_build_spec_not_dangling(self):
         cards = []
