@@ -130,6 +130,26 @@ check('merged impl PRs mark cards `shipped` (pipeline SHIPPED > 0)',
 check('  every shipped card carries its merged PR number',
   shipInfo.everyShippedHasPr);
 
+// ----- REQ 7 (Phase 5): work-tracks render + the correction loop exists ------
+await goTo('tracks');
+const trackBoxes = await page.locator('[data-track]').count();
+check('work-tracks view renders consolidated tracks', trackBoxes > 0,
+  `${trackBoxes} track(s)`);
+const hasDownload = await page.locator('[data-action="download-corrections"]').count();
+check('  "Download corrections" control present', hasDownload > 0);
+const hasReassign = await page.locator('[data-action="reassign"]').count();
+check('  per-artifact reassign control present', hasReassign > 0,
+  `${hasReassign} control(s)`);
+// The correction loop: clicking reassign must update localStorage so a download
+// would carry it. Simulate a split via the page's own store + assert it persists.
+const corrPersists = await page.evaluate(() => {
+  saveCorr({ split: ['claw-playbook/cot_trip_matcher'] });
+  const back = loadCorr();
+  return (back.split || []).includes('claw-playbook/cot_trip_matcher');
+});
+check('  corrections persist to the download store (localStorage)', corrPersists);
+await page.evaluate(() => saveCorr({})); // reset
+
 // Screenshot for human confirmation.
 const shot = join(dirname(HTML), 'verify-magic-me.png');
 await goTo('product', 'magic-me');

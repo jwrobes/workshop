@@ -41,6 +41,8 @@ import sys
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+import consolidate
+
 STALE_DAYS = 14
 DEFAULT_CONFIG = Path(__file__).parent / "fleet.config.json"
 
@@ -1147,6 +1149,10 @@ def main():
     ap.add_argument("--no-local", action="store_true",
                     help="forge-only mode: product->repo->PR+Kanban from the API, "
                          "no local worktrees (cloud-portable)")
+    ap.add_argument("--consolidate", action="store_true",
+                    help="run the LLM work-track consolidation pass (Phase 5), "
+                         "caching tracks.json. Normal runs reuse the cache so "
+                         "they stay fast + offline; corrections always apply.")
     args = ap.parse_args()
 
     try:
@@ -1345,6 +1351,21 @@ def main():
     for c in kanban:
         c["readiness"] = card_readiness(c)
 
+    # Phase 5: work-track consolidation. The LLM pass is on-demand (--consolidate)
+    # and cached to tracks.json so normal runs stay fast + offline. User
+    # corrections (track-overrides.json, downloaded from the UI) ALWAYS win and
+    # are applied every run — so a wrong grouping you fixed stays fixed, fully
+    # reversible by editing/deleting the file.
+    repo_dir = Path(__file__).parent
+    if args.consolidate:
+        llm_tracks = consolidate.run_llm_consolidation(kanban)
+        consolidate.save_tracks(out_dir, llm_tracks)
+        print(f"consolidate: {len(llm_tracks)} LLM track(s) -> {out_dir}/tracks.json")
+    tracks = consolidate.load_tracks(out_dir)
+    overrides = consolidate.load_overrides(out_dir, repo_dir)
+    tracks = consolidate.apply_overrides(tracks, overrides)
+    consolidate.attach_tracks_to_cards(kanban, tracks)
+
     status = {
         "generated_at": now.isoformat(timespec="seconds"),
         "mode": "forge-only" if not local else "local",
@@ -1353,6 +1374,7 @@ def main():
         "unaffiliated": unaffiliated,
         "kanban": kanban,
         "initiatives": initiatives,
+        "tracks": tracks,
     }
 
     (out_dir / "status.json").write_text(json.dumps(status, indent=2))

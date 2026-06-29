@@ -172,6 +172,19 @@ function kanban(){return (DATA&&DATA.kanban)||[];}
 function worktrees(){return (DATA&&DATA.worktrees)||[];}
 function unaffiliated(){return (DATA&&DATA.unaffiliated)||[];}
 function plansFor(pid){return kanban().filter(c=>c.product===pid);}
+// Work-tracks (Phase 5): consolidated groupings. Mirrors collector's _card_id.
+function tracks(){return (DATA&&DATA.tracks)||[];}
+function tracksMulti(){return tracks().filter(t=>(t.members||[]).length>=2);}
+function cardId(c){
+  const n=(c.github||{}).number;
+  if(n!=null) return (c.repo||'?')+'#'+n;
+  return (c.repo||c.product||'?')+'/'+(c.slug||'');
+}
+function cardById(id){return kanban().find(c=>cardId(c)===id)||null;}
+// Pending UI corrections live in localStorage until the user downloads them as
+// track-overrides.json (no server). Shape mirrors collector.apply_overrides.
+function loadCorr(){try{return JSON.parse(localStorage.getItem('fleetTrackOverrides')||'{}');}catch(e){return {};}}
+function saveCorr(o){localStorage.setItem('fleetTrackOverrides',JSON.stringify(o));}
 
 function worktreeForCard(card){
   const t=(card.title||'').toLowerCase();
@@ -362,6 +375,11 @@ function renderCrumbs(){
   const c=$('crumbs');c.innerHTML='';
   const root=el('<button class="crumb root">fleet</button>');root.onclick=()=>goTo('fleet');c.appendChild(root);
   if(STATE.level==='fleet') return;
+  if(STATE.level==='tracks'){
+    c.appendChild(el('<span class="sep">/</span>'));
+    c.appendChild(el('<button class="crumb" style="color:#23211c">work tracks</button>'));
+    return;
+  }
   const pid=STATE.productId;
   const pname=pid==='unaffiliated'?'unaffiliated':((products().find(p=>p.id===pid)||{}).name||pid);
   c.appendChild(el('<span class="sep">/</span>'));
@@ -515,7 +533,18 @@ function renderFleet(app){
   u.innerHTML='<div><span class="serif" style="font-size:21px;font-weight:500;font-style:italic;color:#6e6757">unaffiliated</span><div class="prepo">no product yet</div></div>'
     +'<div style="display:flex;align-items:baseline;gap:7px"><span class="pbig" style="color:#6e6757">'+unaffiliated().length+'</span><span style="font-size:12px;color:#8c8576">repos</span></div>';
   u.onclick=()=>goTo('product','unaffiliated');grid.appendChild(u);
-  sec.appendChild(grid);app.appendChild(sec);
+  sec.appendChild(grid);
+  // Work-tracks entry: scattered artifacts the LLM consolidated into one effort.
+  const trk=tracksMulti();
+  if(trk.length){
+    const b=el('<button data-region="tracks-entry" style="margin-top:20px;width:100%;text-align:left;border:1px dashed #d7cdb8;border-radius:10px;background:#faf6ee;padding:14px 16px;cursor:pointer;display:flex;align-items:center;justify-content:space-between"></button>');
+    const grouped=trk.reduce((n,t)=>n+t.members.length,0);
+    b.innerHTML='<span><span class="mono" style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#9a917f">Work tracks</span>'
+      +'<span class="mono" style="font-size:12px;color:#6e6757;margin-left:10px">'+trk.length+' tracks unify '+grouped+' scattered artifacts</span></span>'
+      +'<span class="mono" style="font-size:11px;color:#a9762a">review / fix grouping →</span>';
+    b.onclick=()=>goTo('tracks');sec.appendChild(b);
+  }
+  app.appendChild(sec);
 }
 
 // ---------- L2 PRODUCT ----------
@@ -900,15 +929,60 @@ function render(){
   const app=$('app');app.innerHTML='';
   if(!DATA){app.appendChild(el('<p class="empty">No data — run <code>python3 collector.py</code>.</p>'));return;}
   if(STATE.level==='fleet') renderFleet(app);
+  else if(STATE.level==='tracks') renderTracks(app);
   else if(STATE.level==='product') renderProduct(app);
   else if(STATE.level==='repo') renderRepo(app);
   else if(STATE.level==='plan') renderPlan(app);
+}
+
+// ---------- WORK TRACKS (Phase 5): review + fix LLM groupings ----------
+function renderTracks(app){
+  const corr=loadCorr();
+  const sec=el('<section data-view="tracks" style="padding-top:30px"></section>');
+  sec.innerHTML='<div class="eyebrow" style="color:#a39c8c;letter-spacing:.16em">fleet · consolidation</div>'
+    +'<h1 class="title" style="font-weight:500">Work tracks</h1>'
+    +'<p class="lede">Scattered artifacts the LLM grouped into one effort. Wrong grouping? Reassign or split a card — then download your corrections; they win on the next run.</p>';
+  // Pending-corrections bar + download.
+  const nPend=Object.keys(corr.reassign||{}).length+((corr.split||[]).length);
+  const bar=el('<div data-region="corrections-bar" style="display:flex;align-items:center;gap:12px;margin:14px 0 6px;padding:10px 14px;border-radius:8px;background:'+(nPend?'#fbf3e2':'#f3f0e8')+';border:1px solid '+(nPend?'#e3cf9f':'#e6e0d5')+'"></div>');
+  bar.innerHTML='<span class="mono" style="font-size:12px;color:#6e6757" data-pending="'+nPend+'">'+(nPend?nPend+' pending correction'+(nPend===1?'':'s'):'no pending corrections')+'</span>';
+  const dl=el('<button data-action="download-corrections" style="margin-left:auto;font-size:12px;border:1px solid #d2b06a;background:#e7c06a;color:#3b372f;border-radius:6px;padding:6px 12px;cursor:pointer">Download corrections</button>');
+  dl.onclick=()=>downloadCorrections();
+  const clr=el('<button data-action="clear-corrections" style="font-size:12px;border:1px solid #ddd4c2;background:transparent;color:#8c8576;border-radius:6px;padding:6px 12px;cursor:pointer">Clear</button>');
+  clr.onclick=()=>{saveCorr({});render();};
+  bar.appendChild(dl);if(nPend)bar.appendChild(clr);
+  sec.appendChild(bar);
+  // Track list.
+  tracksMulti().forEach(t=>{
+    const box=el('<div data-track="'+attr(t.name)+'" style="margin-top:16px;border:1px solid #e6e0d5;border-radius:10px;overflow:hidden"></div>');
+    box.appendChild(el('<div style="display:flex;align-items:baseline;gap:10px;padding:11px 15px;background:#faf6ee;border-bottom:1px solid #ece5d6"><span class="mono" style="font-size:13px;color:#2a2722">'+esc(t.name)+'</span><span class="mono" style="font-size:11px;color:#a39c8c">'+t.members.length+' artifacts'+(t.source==='override'?' · corrected':'')+'</span></div>'));
+    t.members.forEach(id=>{
+      const c=cardById(id);
+      const label=c?(c.title||c.slug||id):id;
+      const row=el('<div data-track-member="'+attr(id)+'" style="display:flex;align-items:center;gap:10px;padding:9px 15px;border-top:1px solid #f1ece1"></div>');
+      row.innerHTML='<span class="mono" style="font-size:12px;color:#3b372f;flex:1;overflow-wrap:anywhere">'+esc(String(label).slice(0,80))+'</span>'
+        +'<span class="mono" style="font-size:10px;color:#b3ab9b">'+esc(id)+'</span>';
+      const re=el('<button data-action="reassign" style="font-size:10.5px;border:1px solid #ddd4c2;background:#fff;border-radius:5px;padding:3px 8px;cursor:pointer;color:#8c6a2a">reassign</button>');
+      re.onclick=()=>{const to=prompt('Move "'+label+'" to which track? (name, or blank to pull into its own)',t.name);if(to===null)return;const o=loadCorr();o.reassign=o.reassign||{};if(to.trim())o.reassign[id]=to.trim();else{o.split=o.split||[];if(o.split.indexOf(id)<0)o.split.push(id);}saveCorr(o);render();};
+      row.appendChild(re);box.appendChild(row);
+    });
+    sec.appendChild(box);
+  });
+  app.appendChild(sec);
+}
+// Build track-overrides.json from localStorage and trigger a browser download.
+function downloadCorrections(){
+  const o=loadCorr();
+  const blob=new Blob([JSON.stringify(o,null,2)],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download='track-overrides.json';document.body.appendChild(a);a.click();a.remove();
 }
 let _rt;
 window.addEventListener('resize',()=>{clearTimeout(_rt);_rt=setTimeout(render,120);});
 // Expose the router + data for headless verification (verify_ui.mjs). Harmless
 // in normal use; lets a test drive navigation and assert against the source data.
 window.goTo=goTo;window.DATA=DATA;window.STATE=STATE;
+window.saveCorr=saveCorr;window.loadCorr=loadCorr;
 render();
 </script>
 </body>
