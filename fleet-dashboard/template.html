@@ -171,6 +171,13 @@ function products(){return (DATA&&DATA.products)||[];}
 function kanban(){return (DATA&&DATA.kanban)||[];}
 function worktrees(){return (DATA&&DATA.worktrees)||[];}
 function unaffiliated(){return (DATA&&DATA.unaffiliated)||[];}
+// Board/pipeline/repo views show plan-bearing cards INCLUDING shipped merged
+// work. `merged-unmatched` cards (shipped PRs whose branch matched no plan) have
+// status 'shipped' — they belong in the SHIPPED pipeline stage + the (collapsed)
+// Completed column, NOT in ACTIVE/BACKLOG, so they don't flood the board. They
+// also appear in the Work-tracks view. (Earlier they were excluded entirely,
+// which wrongly showed SHIPPED: 0 on a repo that had 28 merged PRs.)
+function isMergedUnmatched(c){return c.source==='merged-unmatched';}
 function plansFor(pid){return kanban().filter(c=>c.product===pid);}
 // Work-tracks (Phase 5): consolidated groupings. Mirrors collector's _card_id.
 function tracks(){return (DATA&&DATA.tracks)||[];}
@@ -394,7 +401,10 @@ function renderCrumbs(){
 }
 
 // ---------- PIPELINE MAP (shared) ----------
-function inFlight(plans){return plans.filter(c=>c.status==='active'||c.status==='backlog'||c.status==='blocked'||isRemoteOnly(c));}
+// Cards the pipeline map shows: in-flight work PLUS shipped work (so the SHIPPED
+// stage reflects reality — a repo that merged 28 PRs must not read SHIPPED 0).
+// planStage() routes each to its stage; shipped cards land only in SHIPPED.
+function inFlight(plans){return plans.filter(c=>c.status==='active'||c.status==='backlog'||c.status==='blocked'||c.shipped||c.status==='completed'||c.status==='done'||isRemoteOnly(c));}
 function mapChip(card,prod){
   const pm=pathMeta(planPath(card)),stg=planStage(card),w=worktreeForCard(card),pr=(w&&w.pr)||{};
   const a=cardAttention(card);
@@ -612,7 +622,7 @@ function renderRepo(app){
   // board
   const narrow=window.innerWidth<760;
   const board=el('<div class="board" data-region="board" style="grid-template-columns:'+(narrow?'1fr':'1fr 1fr 1fr')+'"></div>');
-  const active=rplans.filter(c=>c.status==='active'),backlog=rplans.filter(c=>c.status==='backlog'),completed=rplans.filter(c=>c.status==='completed'||c.status==='done');
+  const active=rplans.filter(c=>c.status==='active'),backlog=rplans.filter(c=>c.status==='backlog'),completed=rplans.filter(c=>c.status==='completed'||c.status==='done'||c.status==='shipped'||c.shipped);
   board.appendChild(kanbanCol('active',active,repoName));
   board.appendChild(kanbanCol('backlog',backlog,repoName));
   board.appendChild(kanbanCol('completed',completed,repoName));
