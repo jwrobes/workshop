@@ -44,6 +44,11 @@ from pathlib import Path
 import consolidate
 
 STALE_DAYS = 14
+# A merged PR anchors a track only if it merged within this window — recent
+# shipped work (possibly broken, worth revisiting). Older merges are archive,
+# not tracks. This is the deterministic scope that keeps the board usable (see
+# TRACK-MODEL.md); without it, ALL merge history floods consolidation (77 tracks).
+MERGED_RECENT_DAYS = 30
 DEFAULT_CONFIG = Path(__file__).parent / "fleet.config.json"
 
 
@@ -840,12 +845,28 @@ def merge_forge_items_into_cards(cards, forge_items, now, repo_to_product=None):
             elif not already_shipped:
                 card["github"] = gh
         elif is_merged_item:
-            # An UNMATCHED merged PR is just history — it must NOT spawn a card.
-            # Merged PRs are only interesting when they attach to a known track
-            # (marking it shipped, above). Creating a card per merged PR floods
-            # the board with ~130 orphan "spec'd" cards (the Phase-4a regression).
-            # Unmatched merged work that SHOULD belong to a track is the Phase-5
-            # LLM job, not a deterministic remote-only card.
+            # An UNMATCHED merged PR is shipped work whose (often auto-generated)
+            # branch name matched no plan slug — e.g. `claude/trusting-bohr-...`.
+            # RECENT ones (<= MERGED_RECENT_DAYS) anchor a track — they must NOT
+            # vanish (that hid the real communications-hub feature #115/#117/#119).
+            # OLD merges are archive: dropped, so they don't flood consolidation
+            # (the 77-track wall). See TRACK-MODEL.md.
+            mage = _age_days(it.get("mergedAt"), now)
+            if mage is None or mage > MERGED_RECENT_DAYS:
+                continue
+            slug = (next(iter(branch_slug_candidates(it.get("branch"))), None)
+                    or norm(it.get("title") or "")) or str(it.get("number"))
+            cards.append({
+                "level": "repo",
+                "product": repo_to_product.get(norm(it.get("repo") or "")),
+                "repo": it.get("repo"),
+                "status": "shipped",
+                "title": it.get("title") or f"{it.get('repo')}#{it.get('number')}",
+                "path": it.get("url") or "", "slug": slug, "goal": None,
+                "body": "", "workbench": None, "source": "merged-unmatched",
+                "github": gh, "flags": [], "shipped": True,
+                "shipped_pr": it.get("number"), "shipped_at": it.get("mergedAt"),
+            })
             continue
         else:
             # No match, OR ambiguous (>1) -> remote-only card (never false-merge).

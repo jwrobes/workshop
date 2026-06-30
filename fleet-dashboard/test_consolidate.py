@@ -43,20 +43,31 @@ class LLMConsolidationTests(unittest.TestCase):
         ids = [consolidate._card_id(c) for c in cards]
         payload = {"tracks": [
             {"name": "email-triage", "members": [ids[0], ids[1]]},
-            {"name": "ynab", "members": [ids[2]]},
+            {"name": "ynab", "members": [ids[2]]},  # singleton -> dropped
         ]}
         tracks = consolidate.run_llm_consolidation(cards, runner=self._runner(payload))
         names = {t["name"] for t in tracks}
-        self.assertEqual(names, {"email-triage", "ynab"})
+        # Only the 2+ member track survives; the singleton 'ynab' is dropped.
+        self.assertEqual(names, {"email-triage"})
         et = next(t for t in tracks if t["name"] == "email-triage")
         self.assertEqual(set(et["members"]), {ids[0], ids[1]})
 
-    def test_drops_unknown_member_ids(self):
-        cards = [card("a", pr=1)]
-        payload = {"tracks": [{"name": "t", "members":
-                              [consolidate._card_id(cards[0]), "ghost#999"]}]}
+    def test_singletons_are_dropped(self):
+        cards = [card("a", pr=1), card("b", pr=2)]
+        ids = [consolidate._card_id(c) for c in cards]
+        payload = {"tracks": [{"name": "solo", "members": [ids[0]]},
+                              {"name": "solo2", "members": [ids[1]]}]}
         tracks = consolidate.run_llm_consolidation(cards, runner=self._runner(payload))
-        self.assertEqual(tracks[0]["members"], ["claw-playbook#1"])
+        self.assertEqual(tracks, [])  # both singletons -> nothing
+
+    def test_drops_unknown_member_ids(self):
+        # Known id stays; ghost dropped. Needs a 2nd known member to survive the
+        # singleton filter, so we can assert the ghost was filtered.
+        cards = [card("a", pr=1), card("b", pr=2)]
+        ids = [consolidate._card_id(c) for c in cards]
+        payload = {"tracks": [{"name": "t", "members": [ids[0], ids[1], "ghost#999"]}]}
+        tracks = consolidate.run_llm_consolidation(cards, runner=self._runner(payload))
+        self.assertEqual(set(tracks[0]["members"]), {ids[0], ids[1]})
 
     def test_junk_output_returns_empty(self):
         cards = [card("a", pr=1)]
@@ -65,12 +76,24 @@ class LLMConsolidationTests(unittest.TestCase):
         self.assertEqual(tracks, [])
 
     def test_fenced_json_is_parsed(self):
-        cards = [card("a", pr=1)]
-        cid = consolidate._card_id(cards[0])
+        cards = [card("a", pr=1), card("b", pr=2)]
+        ids = [consolidate._card_id(c) for c in cards]
         fenced = "```json\n" + json.dumps(
-            {"tracks": [{"name": "t", "members": [cid]}]}) + "\n```"
+            {"tracks": [{"name": "t", "members": ids}]}) + "\n```"
         tracks = consolidate.run_llm_consolidation(cards, runner=lambda p: fenced)
         self.assertEqual(tracks[0]["name"], "t")
+
+    def test_prose_then_fence_is_parsed(self):
+        # The real failure: CLI prefixed "Here is the output:" before a ```json
+        # fence, which produced 0 tracks. Must survive prose-THEN-fence.
+        cards = [card("a", pr=1), card("b", pr=2)]
+        ids = [consolidate._card_id(c) for c in cards]
+        resp = ("The grouping analysis is complete. Here is the output:\n\n"
+                "```json\n" + json.dumps({"tracks": [{"name": "t",
+                "members": ids}]}) + "\n```\nLet me know if you need changes.")
+        tracks = consolidate.run_llm_consolidation(cards, runner=lambda p: resp)
+        self.assertEqual(tracks[0]["name"], "t")
+        self.assertEqual(set(tracks[0]["members"]), set(ids))
 
     def test_cli_failure_returns_empty_not_raise(self):
         cards = [card("a", pr=1)]

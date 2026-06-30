@@ -25,14 +25,19 @@ Public entry points:
 """
 
 import json
+import re
 import subprocess
 
 CLAUDE_CLI = "claude"
 TRACKS_FILE = "tracks.json"
 OVERRIDES_FILE = "track-overrides.json"
 
-# Only these card sources are "loose" (not yet unified into a real plan track).
-LOOSE_SOURCES = ("remote-only", "workbench-only")
+# Card sources the LLM should try to group into tracks: not-yet-unified plan
+# fragments (remote-only, workbench-only) AND shipped-but-unmatched merged PRs
+# (merged-unmatched) — the latter is how #115/#117/#119 rejoin their feature
+# instead of vanishing. A card already on a real plan (source local) is its own
+# track anchor and is left alone.
+LOOSE_SOURCES = ("remote-only", "workbench-only", "merged-unmatched")
 
 
 def loose_cards(cards):
@@ -53,6 +58,10 @@ def _card_brief(c):
         "repo": c.get("repo"),
         "product": c.get("product"),
         "pr": gh.get("number"),
+        # State helps the LLM group AND lets the UI show a track's reality
+        # (merged code vs open work). Branch names are often useless (auto-gen),
+        # so the title is the real grouping signal.
+        "state": "merged" if c.get("shipped") else (gh.get("state") or "").lower(),
     }
 
 
@@ -66,16 +75,19 @@ def _card_id(c):
 
 
 CONSOLIDATE_PROMPT = """\
-You group scattered software work artifacts into work-tracks. A "track" is ONE
-feature/effort whose artifacts (plan, issues, spec-PRs, impl-PRs) are scattered
-with diverging titles. Group items that are clearly the SAME effort.
+You group scattered software work artifacts that belong to the SAME feature/effort
+into work-tracks. A "track" is ONE feature whose artifacts (plan, issues, spec-PRs,
+merged impl-PRs) are scattered with diverging titles (branch names are often
+auto-generated and useless — group by TITLE meaning).
 
 Rules:
-- Only group items you are confident belong together (shared feature/topic).
-- A singleton track is fine — do NOT force unrelated items together.
-- Prefer a short, human kebab-case track name (e.g. "communications-hub", "email-triage").
+- ONLY return tracks that group 2+ items that clearly belong to the same feature.
+- DO NOT return singletons. An item with no sibling is omitted entirely.
+- Be CONSERVATIVE: when unsure two items are the same effort, leave them apart.
+  Wrongly merging unrelated work is worse than leaving it ungrouped.
+- Prefer a short kebab-case track name (e.g. "communications-hub", "email-triage").
 - Return ONLY compact JSON, no prose, no markdown fence:
-  {"tracks":[{"name":"<kebab>","members":["<id>",...]}]}
+  {"tracks":[{"name":"<kebab>","members":["<id>","<id>",...]}]}
 
 Items:
 %s
@@ -108,7 +120,9 @@ def run_llm_consolidation(cards, runner=None):
             continue
         members = [m for m in (t.get("members") or []) if m in known]
         name = (t.get("name") or "").strip()
-        if name and members:
+        # A track must group 2+ real items — singletons aren't consolidations and
+        # only add board noise (the 77-track wall was 37 singletons). Drop them.
+        if name and len(members) >= 2:
             out.append({"name": name, "members": members, "source": "llm"})
     return out
 
@@ -123,18 +137,20 @@ def _claude_cli(prompt):
 
 
 def _parse_json(raw):
-    """Parse JSON that may be wrapped in a ```json fence or have leading prose."""
+    """Parse the JSON object out of an LLM response that may have leading prose,
+    a ```json fence, prose-THEN-fence, or trailing text. Strategy: if there's a
+    fenced block, take its contents; otherwise take the whole string. Then grab
+    the outermost {...}. (The CLI sometimes prefixes 'Here is the output:' before
+    the fence — earlier this silently produced 0 tracks.)"""
     s = (raw or "").strip()
-    if s.startswith("```"):
-        s = s.split("```", 2)[1]
-        if s.startswith("json"):
-            s = s[4:]
-        s = s.strip().rstrip("`").strip()
-    # If there's leading/trailing prose, grab the outermost {...}.
-    if not s.startswith("{"):
-        i, j = s.find("{"), s.rfind("}")
-        if i >= 0 and j > i:
-            s = s[i:j + 1]
+    # Prefer a fenced block anywhere in the response.
+    fence = re.search(r"```(?:json)?\s*(.*?)```", s, re.S)
+    if fence:
+        s = fence.group(1).strip()
+    # Grab the outermost JSON object (drops any surrounding prose).
+    i, j = s.find("{"), s.rfind("}")
+    if i >= 0 and j > i:
+        s = s[i:j + 1]
     return json.loads(s)
 
 
