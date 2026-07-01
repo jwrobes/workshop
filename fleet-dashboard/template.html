@@ -165,7 +165,7 @@ function mdToHtml(src){
 function $(id){return document.getElementById(id);}
 function slug(s){return String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');}
 
-const STATE={level:'fleet',productId:null,repoId:null,planId:null,doneOpen:false,mapExpanded:{},mapAll:false,trackOpen:{},trackName:null,strandOpen:{}};
+const STATE={level:'fleet',productId:null,repoId:null,planId:null,doneOpen:false,mapExpanded:{},mapAll:false,trackOpen:{},trackName:null,strandOpen:{},archivedOpen:false};
 
 function products(){return (DATA&&DATA.products)||[];}
 function kanban(){return (DATA&&DATA.kanban)||[];}
@@ -178,7 +178,12 @@ function unaffiliated(){return (DATA&&DATA.unaffiliated)||[];}
 // also appear in the Work-tracks view. (Earlier they were excluded entirely,
 // which wrongly showed SHIPPED: 0 on a repo that had 28 merged PRs.)
 function isMergedUnmatched(c){return c.source==='merged-unmatched';}
-function plansFor(pid){return kanban().filter(c=>c.product===pid);}
+// Archive (Pass-1 triage): a soft, reversible flag (collector stamps c.archived
+// from the overrides `archive` list). Archived cards are DROPPED from the board /
+// pipeline / Ungrouped surfaces so they don't clutter — but they stay in
+// DATA.kanban, so the Work-tracks "Archived" section can list them + unarchive.
+function archivedCards(){return kanban().filter(c=>c.archived);}
+function plansFor(pid){return kanban().filter(c=>c.product===pid&&!c.archived);}
 // Work-tracks (Phase 5): consolidated groupings. Mirrors collector's _card_id.
 function tracks(){return (DATA&&DATA.tracks)||[];}
 function tracksMulti(){return tracks().filter(t=>(t.members||[]).length>=2);}
@@ -208,6 +213,16 @@ function cardById(id){return kanban().find(c=>cardId(c)===id)||null;}
 // track-overrides.json (no server). Shape mirrors collector.apply_overrides.
 function loadCorr(){try{return JSON.parse(localStorage.getItem('fleetTrackOverrides')||'{}');}catch(e){return {};}}
 function saveCorr(o){localStorage.setItem('fleetTrackOverrides',JSON.stringify(o));}
+// A HUMAN reassign: set the target AND clear any `_source:'llm-triage'` tag on
+// that id, so this becomes a human-owned correction. Critical for "human wins":
+// otherwise the next triage run sees the id still marked llm-triage and would
+// revert the human's track back to the LLM's proposal.
+function humanReassign(o,id,track){o.reassign=o.reassign||{};o.reassign[id]=track;if(o._source&&o._source[id])delete o._source[id];}
+// The LLM change-log ("Since last analysis" panel). Keyed by the run's
+// generated_at so a dismiss sticks until the NEXT run overwrites the log.
+function llmRunlog(){return (DATA&&DATA.llm_runlog)||null;}
+function runlogDismissed(){const r=llmRunlog();return !!r&&localStorage.getItem('fleetRunlogDismissed')===(r.generated_at||'');}
+function dismissRunlog(){const r=llmRunlog();if(r)localStorage.setItem('fleetRunlogDismissed',r.generated_at||'');}
 
 function worktreeForCard(card){
   const t=(card.title||'').toLowerCase();
@@ -589,12 +604,54 @@ function attnPanel(plans,onOpen){
 }
 
 // ---------- L1 FLEET ----------
+// The "Since last analysis" change-log panel (Pass-1 triage). Shows what the
+// last LLM run DID — auto-attaches (already applied, undoable) vs suggestions
+// (pending your review) — so LLM state changes are never silent. Dismissible;
+// returns null when there's no run, no changes, or it was dismissed.
+function runlogPanel(){
+  const r=llmRunlog();
+  if(!r||!(r.changes||[]).length||runlogDismissed()) return null;
+  const auto=(r.changes||[]).filter(c=>c.kind==='auto');
+  const sugg=(r.changes||[]).filter(c=>c.kind==='suggest');
+  const at=(r.generated_at||'').replace('T',' ').slice(11,16);
+  const box=el('<div data-region="llm-runlog" data-auto="'+auto.length+'" data-suggestions="'+sugg.length+'" style="margin:22px 0 4px;border:1px solid #d9c9a0;border-radius:10px;background:linear-gradient(#fffdf6,#fdf6e7);overflow:hidden"></div>');
+  const head=el('<div style="display:flex;align-items:center;gap:11px;padding:12px 16px;border-bottom:1px solid #ecdfbf"></div>');
+  head.innerHTML='<span class="mono" style="font-size:10px;letter-spacing:.13em;text-transform:uppercase;color:#a9762a">LLM triage</span>'
+    +'<span style="font-size:14px;color:#5b4a28;font-weight:500">Since last analysis'+(at?' ('+at+')':'')+'</span>'
+    +'<span class="mono" style="font-size:11px;color:#8a7f66">'+auto.length+' applied · '+sugg.length+' to review</span>';
+  const rev=el('<button data-action="review-suggestions" style="margin-left:auto;font-size:11px;border:1px solid #d2b06a;background:#e7c06a;color:#3b372f;border-radius:6px;padding:5px 11px;cursor:pointer">Review in Work-tracks →</button>');
+  rev.onclick=()=>goTo('tracks');
+  const dis=el('<button data-action="dismiss-runlog" style="font-size:11px;border:1px solid #ddd4c2;background:transparent;color:#8c8576;border-radius:6px;padding:5px 10px;cursor:pointer">Dismiss</button>');
+  dis.onclick=()=>{dismissRunlog();render();};
+  head.appendChild(rev);head.appendChild(dis);box.appendChild(head);
+  const list=el('<div style="padding:6px 0"></div>');
+  (r.changes||[]).forEach(c=>{
+    const isAuto=c.kind==='auto';
+    // AUTO = done (a check); SUGGEST = pending (a question mark) — visually
+    // distinct per the trust rule so you never mistake a proposal for a fact.
+    const badge=isAuto
+      ?'<span data-change-kind="auto" style="flex:none;font-size:9px;letter-spacing:.08em;text-transform:uppercase;color:#2f7a52;background:#e3f1e6;border:1px solid #bcdcc4;border-radius:4px;padding:2px 6px">✓ applied</span>'
+      :'<span data-change-kind="suggest" style="flex:none;font-size:9px;letter-spacing:.08em;text-transform:uppercase;color:#a9762a;background:#fbf1dc;border:1px solid #e3cf9f;border-radius:4px;padding:2px 6px">? '+esc(c.action)+'</span>';
+    const detail=c.action==='attach'?('→ '+esc(c.track||'?')):(c.action==='create'?('new track '+esc(c.track||'?')):'archive');
+    const row=el('<div data-change="'+attr(c.id)+'" style="display:flex;align-items:center;gap:10px;padding:7px 16px"></div>');
+    row.innerHTML=badge
+      +'<span class="mono" style="font-size:11px;color:#6e6757;flex:none">'+esc(c.id)+'</span>'
+      +'<span class="mono" style="font-size:11px;color:#8c6a2a;flex:none">'+detail+'</span>'
+      +'<span style="font-size:12px;color:#8a7f66;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(c.reason||'')+'</span>';
+    list.appendChild(row);
+  });
+  box.appendChild(list);
+  return box;
+}
+
 function renderFleet(app){
   const ps=products();
   const totalActive=ps.reduce((n,p)=>n+productActive(p.id),0);
   const totalAttn=ps.reduce((n,p)=>n+productAttention(p.id),0);
-  // pipeline map over ALL in-flight plans
-  app.appendChild(renderMap('whole fleet',inFlight(kanban()),null));
+  // pipeline map over ALL in-flight plans (archived cards are soft-hidden here
+  // too, consistent with the product/repo boards which filter via plansFor).
+  app.appendChild(renderMap('whole fleet',inFlight(kanban().filter(c=>!c.archived)),null));
+  const rl=runlogPanel();if(rl)app.appendChild(rl);
   const sec=el('<section data-view="fleet"></section>');
   sec.innerHTML='<div style="padding:34px 0 8px"><div class="eyebrow">The fleet</div>'
     +'<h1 class="title">Where things stand</h1>'
@@ -1233,8 +1290,9 @@ function renderTracks(app){
   sec.innerHTML='<div class="eyebrow" style="color:#a39c8c;letter-spacing:.16em">fleet · consolidation</div>'
     +'<h1 class="title" style="font-weight:500">Work tracks</h1>'
     +'<p class="lede">Scattered artifacts the LLM grouped into one effort. Wrong grouping? Reassign or split a card — then download your corrections; they win on the next run.</p>';
-  // Pending-corrections bar + download.
-  const nPend=Object.keys(corr.reassign||{}).length+((corr.split||[]).length);
+  // Pending-corrections bar + download. Archive entries (soft-hide) count too —
+  // they ride the SAME download-corrections flow as reassign/split.
+  const nPend=Object.keys(corr.reassign||{}).length+((corr.split||[]).length)+((corr.archive||[]).length);
   const bar=el('<div data-region="corrections-bar" style="display:flex;align-items:center;gap:12px;margin:14px 0 6px;padding:10px 14px;border-radius:8px;background:'+(nPend?'#fbf3e2':'#f3f0e8')+';border:1px solid '+(nPend?'#e3cf9f':'#e6e0d5')+'"></div>');
   bar.innerHTML='<span class="mono" style="font-size:12px;color:#6e6757" data-pending="'+nPend+'">'+(nPend?nPend+' pending correction'+(nPend===1?'':'s'):'no pending corrections')+'</span>';
   const dl=el('<button data-action="download-corrections" style="margin-left:auto;font-size:12px;border:1px solid #d2b06a;background:#e7c06a;color:#3b372f;border-radius:6px;padding:6px 12px;cursor:pointer">Download corrections</button>');
@@ -1254,11 +1312,17 @@ function renderTracks(app){
       row.innerHTML='<span class="mono" style="font-size:12px;color:#3b372f;flex:1;overflow-wrap:anywhere">'+esc(String(label).slice(0,80))+'</span>'
         +'<span class="mono" style="font-size:10px;color:#b3ab9b">'+esc(id)+'</span>';
       const re=el('<button data-action="reassign" style="font-size:10.5px;border:1px solid #ddd4c2;background:#fff;border-radius:5px;padding:3px 8px;cursor:pointer;color:#8c6a2a">reassign</button>');
-      re.onclick=()=>{const to=prompt('Move "'+label+'" to which track? (name, or blank to pull into its own)',t.name);if(to===null)return;const o=loadCorr();o.reassign=o.reassign||{};if(to.trim())o.reassign[id]=to.trim();else{o.split=o.split||[];if(o.split.indexOf(id)<0)o.split.push(id);}saveCorr(o);render();};
+      re.onclick=()=>{const to=prompt('Move "'+label+'" to which track? (name, or blank to pull into its own)',t.name);if(to===null)return;const o=loadCorr();if(to.trim())humanReassign(o,id,to.trim());else{o.split=o.split||[];if(o.split.indexOf(id)<0)o.split.push(id);if(o._source&&o._source[id])delete o._source[id];}saveCorr(o);render();};
       row.appendChild(re);box.appendChild(row);
     });
     sec.appendChild(box);
   });
+  // TRIAGE SUGGESTIONS: the medium/low attaches + all create/archive proposals
+  // from the last LLM run (auto-attaches already applied — they're in the tracks
+  // above). Each is accept/dismiss: accepting stages the SAME kind of correction
+  // a human would (reassign / archive), so it rides the download flow.
+  const sbox=triageSuggestionsBox();
+  if(sbox) sec.appendChild(sbox);
   // UNGROUPED: real in-flight/shipped cards that are in NO track — so a stray
   // like a product-level PR (that deterministic attach didn't catch) can be
   // given a track by hand. Assigning writes the same corrections file.
@@ -1276,12 +1340,109 @@ function renderTracks(app){
         +'<span class="mono" style="font-size:9px;letter-spacing:.06em;color:#a8916a">'+esc(stg)+'</span>'
         +'<span class="mono" style="font-size:10px;color:#b3ab9b">'+esc(id)+'</span>';
       const as=el('<button data-action="assign-track" style="font-size:10.5px;border:1px solid #d2b06a;background:#fff;border-radius:5px;padding:3px 8px;cursor:pointer;color:#8c6a2a">give a track</button>');
-      as.onclick=()=>{const to=prompt('Assign "'+label+'" to which track? (existing name, or a new one)','');if(to===null||!to.trim())return;const o=loadCorr();o.reassign=o.reassign||{};o.reassign[id]=to.trim();saveCorr(o);render();};
-      row.appendChild(as);ubox.appendChild(row);
+      as.onclick=()=>{const to=prompt('Assign "'+label+'" to which track? (existing name, or a new one)','');if(to===null||!to.trim())return;const o=loadCorr();humanReassign(o,id,to.trim());saveCorr(o);render();};
+      const ar=el('<button data-action="archive" style="font-size:10.5px;border:1px solid #ddd4c2;background:#fff;border-radius:5px;padding:3px 8px;cursor:pointer;color:#8c8576">archive</button>');
+      ar.onclick=()=>{stageArchive(id);};
+      row.appendChild(as);row.appendChild(ar);ubox.appendChild(row);
     });
   }
   sec.appendChild(ubox);
+  // ARCHIVED: soft-hidden artifacts (still in the data, dropped from the board).
+  // Collapsible so it doesn't clutter. Each has an "unarchive" that stages
+  // removal from the archive list -> download -> the collector restores it.
+  sec.appendChild(archivedBox());
   app.appendChild(sec);
+}
+
+// Stage an archive (soft-hide) into the corrections `archive` list — same
+// download-corrections flow as reassign/split. Idempotent.
+function stageArchive(id){
+  const o=loadCorr();o.archive=o.archive||[];
+  if(o.archive.indexOf(id)<0)o.archive.push(id);
+  saveCorr(o);render();
+}
+// Stage an UNARCHIVE: remove the id from the pending archive list. (A card
+// archived by a PREVIOUS downloaded run carries c.archived=true from the
+// collector; to bring it back you clear it from track-overrides.json — which
+// this stages once the download is re-applied.)
+function stageUnarchive(id){
+  const o=loadCorr();o.archive=(o.archive||[]).filter(x=>x!==id);
+  saveCorr(o);render();
+}
+// Triage suggestions that the human hasn't yet accepted/dismissed. Dismissed
+// ids live in localStorage (per suggestion id) so they stay hidden.
+function dismissedSuggestions(){try{return JSON.parse(localStorage.getItem('fleetDismissedSuggestions')||'[]');}catch(e){return [];}}
+function dismissSuggestion(id){const d=dismissedSuggestions();if(d.indexOf(id)<0)d.push(id);localStorage.setItem('fleetDismissedSuggestions',JSON.stringify(d));render();}
+function triageSuggestions(){
+  const r=llmRunlog();if(!r)return [];
+  const dis=dismissedSuggestions();
+  return (r.changes||[]).filter(c=>c.kind==='suggest'&&dis.indexOf(c.id)<0);
+}
+function triageSuggestionsBox(){
+  const sugg=triageSuggestions();
+  if(!sugg.length) return null;
+  const box=el('<div data-region="triage-suggestions" style="margin-top:26px;border:1px solid #e3cf9f;border-radius:10px;overflow:hidden"></div>');
+  box.appendChild(el('<div style="display:flex;align-items:baseline;gap:10px;padding:11px 15px;background:#fbf1dc;border-bottom:1px solid #ecdfbf"><span class="mono" style="font-size:13px;color:#2a2722">Triage suggestions</span><span class="mono" style="font-size:11px;color:#a9762a" data-suggestion-count="'+sugg.length+'">'+sugg.length+' proposal'+(sugg.length===1?'':'s')+' to review</span></div>'));
+  sugg.forEach(c=>{
+    const cd=cardById(c.id);const label=cd?(cd.title||cd.slug||c.id):c.id;
+    const verb=c.action==='attach'?('attach → '+esc(c.track||'?')):(c.action==='create'?('create track '+esc(c.track||'?')):'archive');
+    const row=el('<div data-suggestion="'+attr(c.id)+'" data-suggestion-action="'+attr(c.action)+'" style="display:flex;align-items:center;gap:10px;padding:9px 15px;border-top:1px solid #f1ece1"></div>');
+    row.innerHTML='<span class="mono" style="flex:none;font-size:9px;letter-spacing:.06em;text-transform:uppercase;color:#a9762a;background:#fff;border:1px solid #e3cf9f;border-radius:4px;padding:2px 6px">'+esc(c.action)+'</span>'
+      +'<span class="mono" style="font-size:12px;color:#3b372f;flex:1;overflow-wrap:anywhere">'+esc(String(label).slice(0,70))+'</span>'
+      +'<span class="mono" style="font-size:10.5px;color:#8c6a2a;flex:none">'+verb+'</span>'
+      +'<span class="mono" style="font-size:10px;color:#b3ab9b;flex:none">'+esc(c.confidence||'')+'</span>';
+    const acc=el('<button data-action="accept-suggestion" style="font-size:10.5px;border:1px solid #d2b06a;background:#e7c06a;color:#3b372f;border-radius:5px;padding:3px 8px;cursor:pointer">accept</button>');
+    acc.onclick=()=>{acceptSuggestion(c);};
+    const dis=el('<button data-action="dismiss-suggestion" style="font-size:10.5px;border:1px solid #ddd4c2;background:#fff;border-radius:5px;padding:3px 8px;cursor:pointer;color:#8c8576">dismiss</button>');
+    dis.onclick=()=>{dismissSuggestion(c.id);};
+    row.appendChild(acc);row.appendChild(dis);box.appendChild(row);
+  });
+  return box;
+}
+// Accepting a suggestion stages the SAME correction a human would make by hand
+// (so it's reversible + rides the download flow), then dismisses it from the
+// queue. attach/create -> reassign to the (new-or-existing) track; archive ->
+// the archive list.
+function acceptSuggestion(c){
+  if(c.action==='archive'){stageArchive(c.id);}
+  else if((c.action==='attach'||c.action==='create')&&c.track){
+    const o=loadCorr();o.reassign=o.reassign||{};o.reassign[c.id]=c.track;saveCorr(o);
+  }
+  dismissSuggestion(c.id);   // also re-renders
+}
+function archivedBox(){
+  const arch=archivedCards();
+  const staged=(loadCorr().archive||[]);
+  // Also show cards the human just STAGED to archive this session (not yet
+  // downloaded/applied, so still c.archived=false) so the action has feedback.
+  const stagedCards=staged.map(id=>cardById(id)).filter(c=>c&&!c.archived);
+  const all=arch.concat(stagedCards);
+  const box=el('<div data-region="archived" data-archived-count="'+all.length+'" style="margin-top:26px;border:1px dashed #d7cdb8;border-radius:10px;overflow:hidden"></div>');
+  const head=el('<button data-action="toggle-archived" style="width:100%;text-align:left;display:flex;align-items:baseline;gap:10px;padding:11px 15px;background:#f3f0e8;border:none;border-bottom:1px solid #ece5d6;cursor:pointer"></button>');
+  const open=STATE.archivedOpen;
+  head.innerHTML='<span class="mono" style="font-size:13px;color:#2a2722">Archived</span>'
+    +'<span class="mono" style="font-size:11px;color:#a39c8c">'+all.length+' soft-hidden artifact'+(all.length===1?'':'s')+'</span>'
+    +'<span class="mono" style="margin-left:auto;font-size:11px;color:#a9762a">'+(open?'hide ▲':'show ▼')+'</span>';
+  head.onclick=()=>{STATE.archivedOpen=!STATE.archivedOpen;render();};
+  box.appendChild(head);
+  if(open){
+    if(!all.length){
+      box.appendChild(el('<div class="mono" style="font-size:11px;color:#a3b39a;padding:11px 15px">Nothing archived.</div>'));
+    }else{
+      all.forEach(c=>{
+        const id=cardId(c),label=c.title||c.slug||id;
+        const isStaged=!c.archived;   // staged this session, not yet applied
+        const row=el('<div data-archived-card="'+attr(id)+'" style="display:flex;align-items:center;gap:10px;padding:9px 15px;border-top:1px solid #f1ece1;opacity:.85"></div>');
+        row.innerHTML='<span class="mono" style="font-size:12px;color:#6e6757;flex:1;overflow-wrap:anywhere;text-decoration:line-through">'+esc(String(label).slice(0,80))+'</span>'
+          +(isStaged?'<span class="mono" style="flex:none;font-size:9px;color:#a9762a">pending</span>':'')
+          +'<span class="mono" style="font-size:10px;color:#b3ab9b">'+esc(id)+'</span>';
+        const un=el('<button data-action="unarchive" style="font-size:10.5px;border:1px solid #d2b06a;background:#fff;border-radius:5px;padding:3px 8px;cursor:pointer;color:#8c6a2a">unarchive</button>');
+        un.onclick=()=>{stageUnarchive(id);};
+        row.appendChild(un);box.appendChild(row);
+      });
+    }
+  }
+  return box;
 }
 // Cards that are real strays worth grouping by hand: forge-backed (a PR/issue)
 // but in NO track. We deliberately EXCLUDE plain local plan cards (no github) —
@@ -1289,7 +1450,7 @@ function renderTracks(app){
 // would bury the actual strays (like the #113 product-level PR). A PR/issue with
 // no track is exactly the "belongs to some effort but wasn't grouped" case.
 function ungroupedCards(){
-  return kanban().filter(c=>!c.track&&(c.github||{}).number!=null)
+  return kanban().filter(c=>!c.track&&!c.archived&&(c.github||{}).number!=null)
     .sort((a,b)=>String(a.title||a.slug||'').localeCompare(String(b.title||b.slug||'')));
 }
 // Build track-overrides.json from localStorage and trigger a browser download.

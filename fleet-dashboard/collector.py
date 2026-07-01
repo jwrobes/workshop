@@ -1186,7 +1186,26 @@ def main():
                     help="run the LLM work-track consolidation pass (Phase 5), "
                          "caching tracks.json. Normal runs reuse the cache so "
                          "they stay fast + offline; corrections always apply.")
+    ap.add_argument("--triage", action="store_true",
+                    help="PASS 1: LLM-triage the Ungrouped strays vs existing "
+                         "tracks — auto-attach high-confidence, suggest the rest, "
+                         "write llm-runlog.json. On-demand (reuses cache otherwise).")
+    ap.add_argument("--llm-all", action="store_true",
+                    help="run every LLM pass in order (triage -> analyze -> "
+                         "rollup). Order matters: triage changes membership before "
+                         "analysis. (analyze/rollup are later passes.)")
+    ap.add_argument("--triage-fixture", default=None,
+                    help="TEST ONLY: a JSON file of canned triage proposals to "
+                         "feed the triage pass INSTEAD of shelling out to claude "
+                         "(the injected-runner discipline, at the CLI boundary). "
+                         "Implies --triage; keeps e2e gates offline/deterministic.")
     args = ap.parse_args()
+    if args.triage_fixture:
+        args.triage = True
+    # --llm-all is the convenience that runs each pass in order. For now it
+    # implies --triage (Pass 1); analyze/rollup wire in as they're built.
+    if args.llm_all:
+        args.triage = True
 
     try:
         cfg = load_config(args.config)
@@ -1394,14 +1413,64 @@ def main():
         llm_tracks = consolidate.run_llm_consolidation(kanban)
         consolidate.save_tracks(out_dir, llm_tracks)
         print(f"consolidate: {len(llm_tracks)} LLM track(s) -> {out_dir}/tracks.json")
-    tracks = consolidate.load_tracks(out_dir)
-    overrides = consolidate.load_overrides(out_dir, repo_dir)
-    tracks = consolidate.apply_overrides(tracks, overrides)
-    # Deterministic stray-attach: a loose card whose build-<slug> branch matches
-    # a track name, or that 'closes #<member>', joins that track (catches e.g. a
-    # product-level PR the LLM pass never saw). No LLM; overrides already won.
-    consolidate.attach_strays_to_tracks(kanban, tracks)
-    consolidate.attach_tracks_to_cards(kanban, tracks)
+
+    # A single deterministic build of tracks from the cache + overrides. Called
+    # again after triage so auto-attaches take effect (the "re-stamp" step).
+    def _build_tracks():
+        # Clear any track stamp from a PRIOR build so this one recomputes
+        # membership from scratch. Critical: after a triage auto-attach we build
+        # AGAIN; the kanban cards are mutated in place, so a stray stamped in
+        # build 1 would make build 2's attach_strays_to_tracks skip it (it skips
+        # already-stamped cards) — silently dropping e.g. #113 from its track.
+        for c in kanban:
+            c["track"] = None
+        tks = consolidate.load_tracks(out_dir)
+        ovr = consolidate.load_overrides(out_dir, repo_dir)
+        tks = consolidate.apply_overrides(tks, ovr)
+        # Deterministic stray-attach: a loose card whose build-<slug> branch
+        # matches a track name, or that 'closes #<member>', joins that track
+        # (catches a product-level PR the LLM pass never saw). Overrides won first.
+        consolidate.attach_strays_to_tracks(kanban, tks)
+        consolidate.attach_tracks_to_cards(kanban, tks)
+        # Archive is a soft, reversible flag (an overrides `archive` list): mark
+        # the cards so the UI drops them from board/pipeline/Ungrouped but keeps
+        # them in status.json. Recomputed each run -> unarchive just works.
+        consolidate.stamp_archived(kanban, ovr)
+        return tks, ovr
+
+    tracks, overrides = _build_tracks()
+
+    # PASS 1 — TRIAGE (on-demand, --triage / --llm-all). Sweep the Ungrouped
+    # forge-backed strays against the existing tracks; HIGH-confidence attaches
+    # auto-apply (folded into track-overrides.json as _source llm-triage) and we
+    # RE-BUILD so membership reflects them before facts are stamped; medium/low +
+    # all create/archive become suggestions surfaced in the UI. A change-log
+    # (llm-runlog.json) records what happened. Best-effort + offline-safe.
+    if getattr(args, "triage", False):
+        ungrouped = [c for c in kanban
+                     if not c.get("track") and not c.get("archived")
+                     and (c.get("github") or {}).get("number") is not None]
+        # Injected runner (offline test) vs the real claude CLI. The fixture is
+        # a canned triage payload — the same shape run_triage's runner returns.
+        fixture_runner = None
+        if args.triage_fixture:
+            _fx = Path(args.triage_fixture).read_text()
+            fixture_runner = lambda _prompt: _fx
+        triage = consolidate.run_triage(ungrouped, tracks, cards=kanban,
+                                        runner=fixture_runner)
+        if triage["auto"]:
+            overrides = consolidate.apply_triage_auto(overrides, triage["auto"])
+            # Persist so the auto-attaches are durable + editable like any
+            # correction (this is the file Jonathan downloads/inspects/undoes).
+            (out_dir / consolidate.OVERRIDES_FILE).write_text(
+                json.dumps(overrides, indent=2))
+            tracks, overrides = _build_tracks()   # re-stamp: attaches take effect
+        runlog = consolidate.build_runlog(now.isoformat(timespec="seconds"), triage)
+        consolidate.save_runlog(out_dir, runlog)
+        print(f"triage: {len(triage['auto'])} auto-attach(es), "
+              f"{len(triage['suggestions'])} suggestion(s) -> "
+              f"{out_dir}/{consolidate.RUNLOG_FILE}")
+
     # Phase 1: deterministic strand facts. Stamp each track with per-member
     # role/state/source/stage + a fact summary so the unified card renders
     # layer 1 (facts) with no LLM. See UNIFIED-CARD-MODEL.md.
@@ -1416,6 +1485,9 @@ def main():
         "kanban": kanban,
         "initiatives": initiatives,
         "tracks": tracks,
+        # The most recent LLM run's change-log ('Since last analysis' panel).
+        # None until a --triage/--llm-all run has written llm-runlog.json.
+        "llm_runlog": consolidate.load_runlog(out_dir),
     }
 
     (out_dir / "status.json").write_text(json.dumps(status, indent=2))

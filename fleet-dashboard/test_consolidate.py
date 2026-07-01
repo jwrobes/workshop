@@ -467,5 +467,221 @@ class TrackFactsTests(unittest.TestCase):
         self.assertEqual(det["ghost#999"]["role"], "?")
 
 
+# ---------------------------------------------------------------------------
+# Pass 1 — TRIAGE. The LLM sweeps Ungrouped artifacts and proposes, per item,
+# ONE of attach / create-track / archive + a confidence. HIGH-confidence
+# attaches auto-apply (written into track-overrides.json as _source llm-triage);
+# medium/low attaches + all create/archive are SUGGESTIONS the human resolves.
+# The runner is injected so these stay offline + deterministic (never call the
+# real claude CLI in a gate).
+# ---------------------------------------------------------------------------
+def triage_runner(proposals):
+    """A fake claude runner that returns a canned triage payload."""
+    return lambda prompt: json.dumps({"proposals": proposals})
+
+
+class TriageTests(unittest.TestCase):
+    def _ungrouped(self):
+        return [pr_card(200, "Morning briefing digest tweaks", repo="claw-playbook"),
+                pr_card(201, "Totally unrelated infra script", repo="claw-playbook")]
+
+    def _tracks(self):
+        return [{"name": "communications-hub",
+                 "members": ["claw-playbook#115", "claw-playbook#119"]}]
+
+    def test_no_ungrouped_no_call(self):
+        called = []
+        res = consolidate.run_triage(
+            [], self._tracks(),
+            runner=lambda p: called.append(1) or "{}")
+        self.assertEqual(called, [])          # runner never invoked
+        self.assertEqual(res["proposals"], [])
+
+    def test_high_confidence_attach_is_auto(self):
+        res = consolidate.run_triage(
+            self._ungrouped(), self._tracks(),
+            runner=triage_runner([
+                {"id": "claw-playbook#200", "action": "attach",
+                 "track": "communications-hub", "confidence": "high",
+                 "reason": "same morning-briefing feature"}]))
+        # An auto-attach: applied (goes into overrides), NOT a pending suggestion.
+        self.assertEqual(len(res["auto"]), 1)
+        self.assertEqual(res["auto"][0]["id"], "claw-playbook#200")
+        self.assertEqual(res["auto"][0]["track"], "communications-hub")
+        self.assertEqual(res["suggestions"], [])
+
+    def test_medium_attach_is_a_suggestion_not_auto(self):
+        res = consolidate.run_triage(
+            self._ungrouped(), self._tracks(),
+            runner=triage_runner([
+                {"id": "claw-playbook#200", "action": "attach",
+                 "track": "communications-hub", "confidence": "medium",
+                 "reason": "maybe related"}]))
+        self.assertEqual(res["auto"], [])
+        self.assertEqual(len(res["suggestions"]), 1)
+        self.assertEqual(res["suggestions"][0]["action"], "attach")
+
+    def test_create_track_is_always_a_suggestion_even_high(self):
+        # create/archive are higher-stakes -> never auto, regardless of confidence.
+        res = consolidate.run_triage(
+            self._ungrouped(), [],
+            runner=triage_runner([
+                {"id": "claw-playbook#200", "action": "create",
+                 "track": "briefing-digest", "confidence": "high",
+                 "reason": "two items form one effort"}]))
+        self.assertEqual(res["auto"], [])
+        self.assertEqual(len(res["suggestions"]), 1)
+        self.assertEqual(res["suggestions"][0]["action"], "create")
+
+    def test_archive_is_always_a_suggestion_even_high(self):
+        res = consolidate.run_triage(
+            self._ungrouped(), self._tracks(),
+            runner=triage_runner([
+                {"id": "claw-playbook#201", "action": "archive",
+                 "confidence": "high", "reason": "stale, superseded"}]))
+        self.assertEqual(res["auto"], [])
+        self.assertEqual(len(res["suggestions"]), 1)
+        self.assertEqual(res["suggestions"][0]["action"], "archive")
+
+    def test_attach_to_unknown_track_is_dropped(self):
+        # An auto-attach to a track that doesn't exist would corrupt membership.
+        res = consolidate.run_triage(
+            self._ungrouped(), self._tracks(),
+            runner=triage_runner([
+                {"id": "claw-playbook#200", "action": "attach",
+                 "track": "nonexistent-track", "confidence": "high"}]))
+        self.assertEqual(res["auto"], [])
+        self.assertEqual(res["suggestions"], [])
+
+    def test_proposal_for_unknown_id_is_dropped(self):
+        res = consolidate.run_triage(
+            self._ungrouped(), self._tracks(),
+            runner=triage_runner([
+                {"id": "claw-playbook#9999", "action": "attach",
+                 "track": "communications-hub", "confidence": "high"}]))
+        self.assertEqual(res["auto"], [])
+        self.assertEqual(res["suggestions"], [])
+
+    def test_junk_output_returns_empty_not_raise(self):
+        res = consolidate.run_triage(
+            self._ungrouped(), self._tracks(),
+            runner=lambda p: "I cannot help with that.")
+        self.assertEqual(res["auto"], [])
+        self.assertEqual(res["suggestions"], [])
+
+    def test_cli_failure_returns_empty_not_raise(self):
+        def boom(p):
+            raise OSError("claude missing")
+        res = consolidate.run_triage(self._ungrouped(), self._tracks(), runner=boom)
+        self.assertEqual(res["auto"], [])
+        self.assertEqual(res["suggestions"], [])
+
+    def test_prose_then_fence_parsed(self):
+        resp = ('Here is the triage:\n```json\n'
+                '{"proposals":[{"id":"claw-playbook#200","action":"attach",'
+                '"track":"communications-hub","confidence":"high"}]}\n```')
+        res = consolidate.run_triage(self._ungrouped(), self._tracks(),
+                                     runner=lambda p: resp)
+        self.assertEqual(len(res["auto"]), 1)
+
+    def test_duplicate_proposals_for_one_id_collapse(self):
+        # Two proposals for the same id -> only the first is kept (no double
+        # auto-attach / no inflated runlog).
+        res = consolidate.run_triage(
+            self._ungrouped(), self._tracks(),
+            runner=triage_runner([
+                {"id": "claw-playbook#200", "action": "attach",
+                 "track": "communications-hub", "confidence": "high"},
+                {"id": "claw-playbook#200", "action": "attach",
+                 "track": "communications-hub", "confidence": "high"}]))
+        self.assertEqual(len(res["auto"]), 1)
+        self.assertEqual(len(res["proposals"]), 1)
+
+
+class ApplyTriageAutoTests(unittest.TestCase):
+    """A high-confidence auto-attach writes into track-overrides.json as a real
+    reassign, marked _source:'llm-triage' so it's editable like any correction."""
+
+    def test_auto_attach_written_as_reassign_override(self):
+        overrides = {}
+        auto = [{"id": "claw-playbook#200", "track": "communications-hub",
+                 "confidence": "high"}]
+        out = consolidate.apply_triage_auto(overrides, auto)
+        self.assertEqual(out["reassign"]["claw-playbook#200"], "communications-hub")
+        # Marked as LLM-sourced so the UI can distinguish it from a human reassign.
+        self.assertEqual(out.get("_source", {}).get("claw-playbook#200"), "llm-triage")
+
+    def test_auto_attach_does_not_clobber_human_reassign(self):
+        # A human reassign already in the file must WIN over the LLM auto-attach.
+        overrides = {"reassign": {"claw-playbook#200": "human-track"}}
+        auto = [{"id": "claw-playbook#200", "track": "communications-hub",
+                 "confidence": "high"}]
+        out = consolidate.apply_triage_auto(overrides, auto)
+        self.assertEqual(out["reassign"]["claw-playbook#200"], "human-track")
+
+    def test_human_takeover_of_llm_reassign_is_not_reverted(self):
+        # A reassign the human EDITED (clearing the llm-triage _source tag, as the
+        # UI does) must NOT be reverted to the LLM's proposal on the next run.
+        overrides = {"reassign": {"claw-playbook#200": "human-track"},
+                     "_source": {}}   # human cleared the tag
+        auto = [{"id": "claw-playbook#200", "track": "communications-hub",
+                 "confidence": "high"}]
+        out = consolidate.apply_triage_auto(overrides, auto)
+        self.assertEqual(out["reassign"]["claw-playbook#200"], "human-track")
+
+    def test_still_llm_sourced_reassign_is_refreshed(self):
+        # If it's STILL marked llm-triage (human hasn't touched it), the pass may
+        # keep it pointed at the current proposal (idempotent re-assert).
+        overrides = {"reassign": {"claw-playbook#200": "old-track"},
+                     "_source": {"claw-playbook#200": "llm-triage"}}
+        auto = [{"id": "claw-playbook#200", "track": "new-track",
+                 "confidence": "high"}]
+        out = consolidate.apply_triage_auto(overrides, auto)
+        self.assertEqual(out["reassign"]["claw-playbook#200"], "new-track")
+
+
+# ---------------------------------------------------------------------------
+# ARCHIVE — a soft, reversible flag carried in track-overrides.json (an
+# `archive:[id]` list, mirroring `split`). apply_overrides marks the card and
+# the collector drops it from board/pipeline/Ungrouped, but it STAYS in
+# status.json. Unarchiving (removing the id from the list) brings it back.
+# ---------------------------------------------------------------------------
+class ArchiveOverrideTests(unittest.TestCase):
+    def test_apply_overrides_returns_archived_set(self):
+        # apply_overrides surfaces the archive list so the collector can stamp
+        # cards (archive doesn't change track grouping, so it's a passthrough).
+        tracks = [{"name": "t", "members": ["a#1", "a#2"]}]
+        out = consolidate.apply_overrides(tracks, {"archive": ["a#1"]})
+        # Grouping is untouched by archive.
+        by = {t["name"]: set(t["members"]) for t in out}
+        self.assertEqual(by["t"], {"a#1", "a#2"})
+
+    def test_stamp_archived_marks_and_is_reversible(self):
+        cards = [pr_card(300, "stale thing", repo="r"),
+                 pr_card(301, "live thing", repo="r")]
+        consolidate.stamp_archived(cards, {"archive": ["r#300"]})
+        by = {consolidate._card_id(c): c for c in cards}
+        self.assertTrue(by["r#300"].get("archived"))
+        self.assertFalse(by["r#301"].get("archived"))
+        # Unarchive: empty archive list -> nothing marked (returns).
+        consolidate.stamp_archived(cards, {"archive": []})
+        self.assertFalse(by["r#300"].get("archived"))
+
+    def test_archived_card_dropped_from_ungrouped_but_kept(self):
+        # This is the collector-level behavior: an archived stray leaves the
+        # Ungrouped/board surfaces (card.archived True) but persists in the data.
+        cards = [pr_card(300, "stale", repo="r")]
+        consolidate.stamp_archived(cards, {"archive": ["r#300"]})
+        self.assertTrue(cards[0]["archived"])   # still IN the list, just flagged
+
+    def test_archive_is_noop_for_a_track_member(self):
+        # Archive only declutters STRAYS. A card that's a track member must NOT
+        # get hidden (that would leave the member listed but its card gone).
+        member = pr_card(400, "in a track", repo="r")
+        member["track"] = "some-track"
+        consolidate.stamp_archived([member], {"archive": ["r#400"]})
+        self.assertFalse(member.get("archived"))  # member is not hidden
+
+
 if __name__ == "__main__":
     unittest.main()

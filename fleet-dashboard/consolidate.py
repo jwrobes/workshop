@@ -31,6 +31,7 @@ import subprocess
 CLAUDE_CLI = "claude"
 TRACKS_FILE = "tracks.json"
 OVERRIDES_FILE = "track-overrides.json"
+RUNLOG_FILE = "llm-runlog.json"
 
 # Card sources the LLM should try to group into tracks: not-yet-unified plan
 # fragments (remote-only, workbench-only) AND shipped-but-unmatched merged PRs
@@ -157,11 +158,173 @@ def _parse_json(raw):
     return json.loads(s)
 
 
+# ---------------------------------------------------------------------------
+# PASS 1 — TRIAGE (fleet/product altitude). Sweep the Ungrouped artifacts and,
+# per item, propose ONE of: attach to an existing track / create a new track /
+# archive (stale). Each carries a confidence (high/medium/low).
+#
+# The trust rule (decided with Jonathan):
+#   * HIGH-confidence ATTACH auto-applies — written into track-overrides.json as
+#     a real reassign marked _source:'llm-triage' (visible, editable, undoable).
+#   * medium/low attaches, and ALL create/archive proposals (regardless of
+#     confidence — creating/removing structure is higher-stakes), are
+#     SUGGESTIONS the human accepts/dismisses in the UI.
+# Best-effort + offline-safe: a failed pass returns empty (no auto changes),
+# never fatal. The runner is injectable for offline/deterministic tests.
+# ---------------------------------------------------------------------------
+
+TRIAGE_PROMPT = """\
+You are triaging SCATTERED software work artifacts (loose PRs/issues that belong
+to no work-track yet) against the EXISTING work-tracks. For EACH ungrouped item,
+propose exactly ONE action:
+- "attach": it clearly belongs to an existing track (match by TITLE/BODY meaning
+  — branch names are often auto-generated and useless). Give the track name.
+- "create": it (with 1+ other ungrouped items) clearly forms a NEW distinct
+  effort not covered by any existing track. Give a short kebab-case track name.
+  Be CONSERVATIVE — only when items clearly pair; never a singleton track.
+- "archive": it is stale / superseded / not live and should be decluttered.
+
+Give each a "confidence": "high" | "medium" | "low", and a one-line "reason".
+Prefer "attach" to an existing track over "create". When unsure, use lower
+confidence — do not assert a shaky match as high.
+
+Return ONLY compact JSON, no prose, no markdown fence:
+  {"proposals":[{"id":"<id>","action":"attach|create|archive",
+    "track":"<name-or-null>","confidence":"high|medium|low","reason":"<why>"}]}
+
+EXISTING TRACKS (name -> member titles):
+%s
+
+UNGROUPED ITEMS to triage:
+%s
+"""
+
+
+def _triage_track_brief(track, cards):
+    """Compact view of an existing track for the triage prompt: name + the
+    member TITLES (the real matching signal), so the LLM can attach by meaning."""
+    by_id = {_card_id(c): c for c in cards}
+    titles = []
+    for m in (track.get("members") or []):
+        c = by_id.get(m)
+        if c is not None:
+            gh = c.get("github") or {}
+            titles.append((gh.get("title") or c.get("title") or m)[:80])
+    return {"name": track.get("name"), "members": titles}
+
+
+def _triage_item_brief(c):
+    """Compact view of an ungrouped artifact — id + title + a body snippet, the
+    'what is this trying to do' signal that makes fuzzy attach tractable."""
+    gh = c.get("github") or {}
+    body = (gh.get("body") or c.get("body") or "").strip()
+    return {
+        "id": _card_id(c),
+        "title": (gh.get("title") or c.get("title") or c.get("slug") or "")[:120],
+        "repo": c.get("repo"),
+        "product": c.get("product"),
+        "state": "merged" if c.get("shipped") else (gh.get("state") or "").lower(),
+        "body": body[:400],
+    }
+
+
+def run_triage(ungrouped, tracks, runner=None, cards=None):
+    """Triage the Ungrouped artifacts against the existing tracks via the
+    `claude` CLI. Returns a dict:
+      {"proposals":[...raw...],
+       "auto":[{id,track,confidence,reason}],        # high-conf attaches -> apply
+       "suggestions":[{id,action,track,confidence,reason}]}  # human resolves
+
+    `ungrouped` are the loose forge-backed cards (from ungroupedCards). `tracks`
+    are the existing multi-member tracks (for attach matching). `cards` is the
+    full card list used to resolve member titles (defaults to `ungrouped`).
+    `runner` is an injectable callable(prompt)->str for offline tests.
+
+    Validation is strict: an attach must target a KNOWN track and a KNOWN
+    ungrouped id, or it's dropped (never corrupt membership on a hallucination).
+    On ANY failure (CLI missing, bad JSON) returns empty auto+suggestions."""
+    empty = {"proposals": [], "auto": [], "suggestions": []}
+    if not ungrouped:
+        return empty
+    all_cards = cards if cards is not None else ungrouped
+    track_briefs = [_triage_track_brief(t, all_cards)
+                    for t in tracks if len(t.get("members") or []) >= 2]
+    item_briefs = [_triage_item_brief(c) for c in ungrouped]
+    prompt = TRIAGE_PROMPT % (json.dumps(track_briefs, indent=0),
+                              json.dumps(item_briefs, indent=0))
+    run = runner or _claude_cli
+    try:
+        data = _parse_json(run(prompt))
+    except (OSError, ValueError):
+        return empty
+    proposals = data.get("proposals") if isinstance(data, dict) else None
+    if not isinstance(proposals, list):
+        return empty
+
+    known_ids = {b["id"] for b in item_briefs}
+    known_tracks = {b["name"] for b in track_briefs}
+    auto, suggestions, kept = [], [], []
+    seen_ids = set()                      # one proposal per artifact (first wins)
+    for p in proposals:
+        if not isinstance(p, dict):
+            continue
+        pid = p.get("id")
+        action = (p.get("action") or "").lower()
+        conf = (p.get("confidence") or "").lower()
+        if pid not in known_ids or action not in ("attach", "create", "archive"):
+            continue                      # hallucinated id/action -> drop
+        if pid in seen_ids:
+            continue                      # dup proposal for one id -> ignore
+        seen_ids.add(pid)
+        track = (p.get("track") or "").strip() or None
+        reason = (p.get("reason") or "").strip()
+        item = {"id": pid, "action": action, "track": track,
+                "confidence": conf, "reason": reason}
+        if action == "attach" and track not in known_tracks:
+            continue                      # attach must target a real track
+        kept.append(item)
+        # High-confidence ATTACH is the ONLY auto case. create/archive are
+        # always suggestions (higher stakes); medium/low attaches too.
+        if action == "attach" and conf == "high":
+            auto.append({"id": pid, "track": track, "confidence": conf,
+                         "reason": reason})
+        else:
+            suggestions.append(item)
+    return {"proposals": kept, "auto": auto, "suggestions": suggestions}
+
+
+def apply_triage_auto(overrides, auto):
+    """Fold high-confidence triage attaches INTO the overrides dict as real
+    `reassign` entries, marked `_source[id]='llm-triage'` so the UI can show them
+    as auto-applied (vs a human reassign). Returns a NEW overrides dict.
+
+    A HUMAN reassign already present for that id WINS — the human's correction is
+    never overwritten by the LLM (the file is the source of truth Jonathan
+    trusts). Idempotent: re-running with the same auto list is a no-op."""
+    out = dict(overrides or {})
+    reassign = dict(out.get("reassign") or {})
+    source = dict(out.get("_source") or {})
+    for a in auto or []:
+        cid, track = a.get("id"), a.get("track")
+        if not cid or not track:
+            continue
+        # Only apply if the human hasn't already reassigned this card by hand.
+        if cid in reassign and source.get(cid) != "llm-triage":
+            continue
+        reassign[cid] = track
+        source[cid] = "llm-triage"
+    out["reassign"] = reassign
+    out["_source"] = source
+    return out
+
+
 def apply_overrides(tracks, overrides):
     """Apply user corrections (from track-overrides.json) OVER the LLM tracks.
     Overrides win. Supported corrections (all by stable card id):
       - reassign: {card_id: track_name}  -> move a card to a (new or existing) track
       - split:    [card_id, ...]         -> force each into its own singleton track
+      - archive:  [card_id, ...]         -> soft-hide (handled by stamp_archived,
+        not here — archive doesn't change track grouping)
     Returns a new tracks list. Deterministic; reversible by editing the file."""
     overrides = overrides or {}
     reassign = overrides.get("reassign") or {}
@@ -279,7 +442,16 @@ def attach_strays_to_tracks(cards, tracks):
 def attach_tracks_to_cards(cards, tracks):
     """Stamp each card with its track name (card['track']) so the UI can render
     unified work-tracks. Cards not in any multi-member track are left untracked
-    (a singleton isn't a 'consolidation' worth showing as a group)."""
+    (a singleton isn't a 'consolidation' worth showing as a group).
+
+    IDEMPOTENT across rebuilds: clears any prior `track` stamp first, then
+    re-derives from `tracks`. This matters because the collector rebuilds tracks
+    twice when a triage auto-attach fires (build → auto-attach → REBUILD). Build
+    2 reloads tracks.json fresh (no deterministic strays), and
+    `attach_strays_to_tracks` skips cards already stamped — so if we didn't clear
+    here, a deterministically-attached stray (e.g. #113) would keep a dangling
+    stamp yet be dropped from the rebuilt track's members. Clearing makes each
+    build recompute membership from scratch, keeping strays attached."""
     member_to_track = {}
     for t in tracks:
         if len(t.get("members") or []) >= 2:  # only real groupings
@@ -287,8 +459,7 @@ def attach_tracks_to_cards(cards, tracks):
                 member_to_track[m] = t["name"]
     for c in cards:
         tn = member_to_track.get(_card_id(c))
-        if tn:
-            c["track"] = tn
+        c["track"] = tn if tn else None
     return cards
 
 
@@ -557,6 +728,70 @@ def stamp_track_facts(tracks, cards):
         t["members_detail"] = details
         t["facts"] = track_facts(details)
     return tracks
+
+
+def stamp_archived(cards, overrides):
+    """Mark each card as `archived:true` if its id is in the overrides `archive`
+    list — a SOFT, REVERSIBLE flag (mirrors `split`). The collector drops
+    archived cards from the board/pipeline/Ungrouped surfaces but KEEPS them in
+    status.json, so unarchiving (removing the id from the list) brings them back.
+    Fully re-computed each run: a card NOT in the list is un-archived. Returns
+    the set of archived ids actually applied."""
+    archive = set((overrides or {}).get("archive") or [])
+    applied = set()
+    for c in cards:
+        cid = _card_id(c)
+        # Archive is for decluttering STRAYS (ungrouped artifacts). A card that
+        # belongs to a track lives inside that track — archiving it would leave a
+        # member listed but its card hidden (a confusing half-state). So archive
+        # is a no-op for track members: it only hides loose cards. (This can only
+        # arise from hand-editing overrides; the UI/triage only archive strays.)
+        if cid in archive and not c.get("track"):
+            c["archived"] = True
+            applied.add(cid)
+        elif c.get("archived"):
+            # No longer in the list (or now a member) -> unarchive (restore).
+            c["archived"] = False
+    return applied
+
+
+def load_runlog(out_dir):
+    """The most recent LLM run's change-log (what triage/analysis did). Powers
+    the dashboard 'Since last analysis' panel. Missing/bad -> None (no panel)."""
+    p = out_dir / RUNLOG_FILE
+    try:
+        return json.loads(p.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def save_runlog(out_dir, runlog):
+    (out_dir / RUNLOG_FILE).write_text(json.dumps(runlog, indent=2))
+
+
+def build_runlog(now_iso, triage_result):
+    """Assemble the change-log entry for a triage run: a timestamp + a flat list
+    of changes, each tagged auto|suggest so the panel can distinguish what
+    already happened (undoable) from what's pending review. Also carries counts
+    for the panel headline."""
+    changes = []
+    for a in triage_result.get("auto") or []:
+        changes.append({"kind": "auto", "action": "attach", "id": a["id"],
+                        "track": a.get("track"), "confidence": a.get("confidence"),
+                        "reason": a.get("reason", "")})
+    for s in triage_result.get("suggestions") or []:
+        changes.append({"kind": "suggest", "action": s["action"], "id": s["id"],
+                        "track": s.get("track"), "confidence": s.get("confidence"),
+                        "reason": s.get("reason", "")})
+    return {
+        "generated_at": now_iso,
+        "pass": "triage",
+        "changes": changes,
+        "counts": {
+            "auto": len(triage_result.get("auto") or []),
+            "suggestions": len(triage_result.get("suggestions") or []),
+        },
+    }
 
 
 def load_tracks(out_dir):
