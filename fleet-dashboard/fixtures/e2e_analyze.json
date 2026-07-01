@@ -1,0 +1,44 @@
+{
+  "communications-hub-morning-briefing": {
+    "headline": "SHIPPED · needs cleanup",
+    "completion_pct": 85,
+    "completion_verbal": "~90% — impl shipped; close spec-PR #118; #111/#112 supplanted by #119",
+    "cleanup": [
+      "close spec-PR #118 (impl already merged)",
+      "close issues #111 / #112 — supplanted by #119"
+    ],
+    "relationships": [
+      {
+        "pair": ["claw-playbook#115", "claw-playbook#119"],
+        "relation": "progressive",
+        "confidence": "high",
+        "note": "#119 builds the curation stages on top of #115's hub"
+      },
+      {
+        "pair": ["claw-playbook#111", "claw-playbook#112"],
+        "relation": "competing",
+        "confidence": "low",
+        "note": "both track the same comms-hub work — possibly duplicate, confirm"
+      }
+    ],
+    "strands": {
+      "claw-playbook#115": {"status": "keep", "note": "the shipped hub", "confidence": "high"},
+      "claw-playbook#117": {"status": "keep", "note": "email-triage tagging, shipped", "confidence": "high"},
+      "claw-playbook#119": {"status": "keep", "note": "curation stages, shipped", "confidence": "high"},
+      "claw-playbook#118": {"status": "close", "note": "spec already implemented — close it", "confidence": "high"},
+      "claw-playbook#111": {"status": "supplanted", "note": "superseded by #119", "confidence": "medium"},
+      "claw-playbook#112": {"status": "supplanted", "note": "superseded by #119", "confidence": "medium"},
+      "magic-me#113": {"status": "keep", "note": "product-level PR for the same feature", "confidence": "high"}
+    },
+    "confidence": "high"
+  },
+  "email-triage": {
+    "headline": "SHIPPED · mostly done",
+    "completion_pct": 80,
+    "completion_verbal": "~80% — core triage merged; one open spec left",
+    "cleanup": ["review the open bulk-approval spec #105"],
+    "relationships": [],
+    "strands": {},
+    "confidence": "medium"
+  }
+}

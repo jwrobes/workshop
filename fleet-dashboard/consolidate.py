@@ -318,6 +318,214 @@ def apply_triage_auto(overrides, auto):
     return out
 
 
+# ---------------------------------------------------------------------------
+# PASS 2 — TRACK-ANALYSIS (per track). Feed the track's members_detail
+# ({role,state,source,stage,activity} + each strand's body) + facts; the LLM
+# returns a headline verdict, a completion read, a cleanup list, relationships
+# (competing|progressive|independent — the call deterministic facts CAN'T make),
+# and a per-strand status (keep|close|duplicate|outdated|supplanted). Cached to
+# verdicts.json keyed by track name; offline-safe (no verdict if not run).
+#
+# Completion — do BOTH (decided with Jonathan): the LLM emits its gut % AND a
+# per-strand keep/clip; the collector COMPUTES % = done-kept / total-kept from
+# the clip decisions (a clipped strand isn't "work left"). They cross-check:
+#   * agree (within tolerance) -> HIGH confidence; show the computed % (auditable).
+#   * diverge -> the analysis is shaky -> LOW confidence, render as a question.
+# The divergence signal is the real payoff — a free consistency check.
+# ---------------------------------------------------------------------------
+
+VERDICTS_FILE = "verdicts.json"
+
+# Per-strand dispositions the LLM may assign. Only 'keep' counts a strand as
+# real remaining/finished work; the rest are clippable (dead loose ends).
+_KEEP = "keep"
+_CLIP_STATES = ("close", "duplicate", "outdated", "supplanted")
+# How far LLM gut-% and computed-% may differ before we flag low confidence.
+_COMPLETION_TOLERANCE = 25
+
+
+ANALYZE_PROMPT = """\
+You analyze ONE work-track — a feature whose scattered artifacts (issues,
+spec-PRs, impl-PRs, worktrees) are gathered as members. Judge how DONE it really
+is and what to clean up. You are given each member's deterministic facts
+(role/state/source/stage/activity) and its body (what it's trying to do).
+
+Return, as ONE compact JSON object (no prose, no fence):
+{
+ "headline": "<short verdict, e.g. 'SHIPPED · needs cleanup'>",
+ "completion_pct": <0-100 your gut estimate of REAL completion>,
+ "completion_verbal": "<one line, e.g. '~80% — shipped; close spec #118'>",
+ "cleanup": ["<concrete next action>", ...],
+ "relationships": [{"pair":["<id>","<id>"],
+    "relation":"competing|progressive|independent","confidence":"high|medium|low",
+    "note":"<why>"}],
+ "strands": {"<id>": {"status":"keep|close|duplicate|outdated|supplanted",
+    "note":"<one line>","confidence":"high|medium|low"}},
+ "confidence":"high|medium|low"
+}
+Rules:
+- "keep" = a strand that is real (finished work that counts, or genuine
+  remaining work). close/duplicate/outdated/supplanted = a dead loose end to
+  clip — it should NOT count as "work left".
+- Be concrete in cleanup (close spec-PR #N; reconcile #A vs #B; close #C
+  supplanted by #D). Relationships are the core value — deterministic facts
+  can't tell competing from progressive; the bodies can.
+
+TRACK: __TRACK__
+FACTS: __FACTS__
+MEMBERS:
+__MEMBERS__
+"""
+
+
+def _analyze_member_brief(d):
+    """The clean per-strand input for analysis: the deterministic facts the card
+    already shows + the body (intent). Reasoning over the SAME facts the human
+    sees keeps verdict and card in sync."""
+    return {
+        "id": d.get("id"),
+        "title": (d.get("title") or "")[:120],
+        "role": d.get("role"),
+        "state": d.get("state"),
+        "source": d.get("source"),
+        "stage": d.get("stage"),
+        "activity": d.get("activity"),
+        "body": (d.get("body") or "")[:1200],
+    }
+
+
+def _computed_completion(details, strands):
+    """Compute % done from the LLM's per-strand keep/clip. Only KEPT strands
+    count; a kept strand is 'done' when its state is merged/closed (or activity
+    'done'). Clipped strands (close/duplicate/outdated/supplanted) are excluded —
+    a dead loose end is not 'work left'. Returns (pct or None, kept, done)."""
+    by_id = {d.get("id"): d for d in details}
+    kept, done = 0, 0
+    for sid, s in (strands or {}).items():
+        status = (s.get("status") or "").lower() if isinstance(s, dict) else ""
+        if status != _KEEP:
+            continue                       # clipped -> doesn't count
+        kept += 1
+        d = by_id.get(sid) or {}
+        if d.get("state") in ("merged", "closed") or d.get("activity") == "done":
+            done += 1
+    if kept == 0:
+        return None, 0, 0
+    return round(100 * done / kept), kept, done
+
+
+def run_analyze(track, runner=None):
+    """Analyze ONE track via the `claude` CLI. Returns a verdict dict (see
+    ANALYZE_PROMPT) with a normalized `completion` block that carries BOTH the
+    LLM's gut % and the computed % + a confidence from their agreement. `runner`
+    is injectable for offline tests. On ANY failure returns None (offline-safe —
+    a track with no verdict simply shows the 'not run' placeholder)."""
+    details = track.get("members_detail") or []
+    if not details:
+        return None
+    briefs = [_analyze_member_brief(d) for d in details]
+    # .replace (not %-format): the prompt contains a literal '%' (e.g. '~80% —')
+    # that %-formatting would misread as a conversion.
+    prompt = (ANALYZE_PROMPT
+              .replace("__TRACK__", str(track.get("name")))
+              .replace("__FACTS__", json.dumps(track.get("facts") or {}, indent=0))
+              .replace("__MEMBERS__", json.dumps(briefs, indent=0)))
+    run = runner or _claude_cli
+    try:
+        data = _parse_json(run(prompt))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    strands = data.get("strands") if isinstance(data.get("strands"), dict) else {}
+    # Keep only well-formed per-strand entries for known members.
+    known = {d.get("id") for d in details}
+    strands = {k: v for k, v in strands.items()
+               if k in known and isinstance(v, dict)}
+    llm_pct = data.get("completion_pct")
+    llm_pct = int(llm_pct) if isinstance(llm_pct, (int, float)) else None
+    computed, kept, done = _computed_completion(details, strands)
+    # Confidence from agreement (the cross-check):
+    #  - both %s present + diverge beyond tolerance -> LOW (render as a question).
+    #  - ALL strands clipped (strands given but kept==0): the LLM's gut % would
+    #    then contradict every strand slot with no cross-check -> also LOW, so it
+    #    renders as a question, never asserted as a fact.
+    #  - otherwise a missing %  -> MEDIUM; agreement -> HIGH.
+    all_clipped = bool(strands) and kept == 0
+    if computed is not None and llm_pct is not None \
+            and abs(llm_pct - computed) > _COMPLETION_TOLERANCE:
+        conf = "low"
+    elif all_clipped:
+        conf = "low"
+    elif llm_pct is None or computed is None:
+        conf = "medium"
+    else:
+        conf = "high"
+    return {
+        "headline": (data.get("headline") or "").strip(),
+        "completion": {
+            "llm_pct": llm_pct,
+            "computed_pct": computed,
+            "kept": kept,
+            "done": done,
+            "verbal": (data.get("completion_verbal") or "").strip(),
+            "confidence": conf,
+        },
+        "cleanup": [c for c in (data.get("cleanup") or []) if isinstance(c, str)],
+        "relationships": _normalize_relationships(data.get("relationships")),
+        "strands": strands,
+        "confidence": (data.get("confidence") or "").strip().lower() or "medium",
+    }
+
+
+def _normalize_relationships(rels):
+    """Keep only well-formed relationship dicts, and GUARANTEE `pair` is a list
+    (the template does `pair.map(...)`). The LLM sometimes returns `pair` as a
+    string ('#1 vs #2') or omits it — coerce to a list / [] so a single malformed
+    relationship can't blank the whole track-detail render."""
+    out = []
+    for r in (rels or []):
+        if not isinstance(r, dict):
+            continue
+        pair = r.get("pair")
+        if isinstance(pair, list):
+            r = {**r, "pair": [str(x) for x in pair]}
+        elif isinstance(pair, str) and pair.strip():
+            r = {**r, "pair": [pair.strip()]}   # keep the text, as a single item
+        else:
+            r = {**r, "pair": []}
+        out.append(r)
+    return out
+
+
+def load_verdicts(out_dir):
+    """Per-track LLM verdicts (Pass 2) + a `rollup` block (Pass 3), keyed by track
+    name. Kept SEPARATE from tracks.json (which the grouping pass + overrides
+    rewrite every run) so the two are independent. Missing/bad -> {}."""
+    p = out_dir / VERDICTS_FILE
+    try:
+        d = json.loads(p.read_text())
+        return d if isinstance(d, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_verdicts(out_dir, verdicts):
+    (out_dir / VERDICTS_FILE).write_text(json.dumps(verdicts, indent=2))
+
+
+def stamp_verdicts(tracks, verdicts):
+    """Stamp each track with its cached verdict (`t['verdict']`) so the template
+    just reads it. Offline-safe: a track with no cached verdict is left untouched
+    (no `verdict` key) -> the render shows the 'not run' placeholder."""
+    verdicts = verdicts or {}
+    for t in tracks:
+        v = verdicts.get(t.get("name"))
+        if isinstance(v, dict) and v:
+            t["verdict"] = v
+    return tracks
+
+
 def apply_overrides(tracks, overrides):
     """Apply user corrections (from track-overrides.json) OVER the LLM tracks.
     Overrides win. Supported corrections (all by stable card id):

@@ -683,5 +683,162 @@ class ArchiveOverrideTests(unittest.TestCase):
         self.assertFalse(member.get("archived"))  # member is not hidden
 
 
+# ---------------------------------------------------------------------------
+# PASS 2 — TRACK-ANALYSIS. Per track, feed members_detail + bodies + facts; the
+# LLM returns a headline verdict, a completion read (BOTH its gut % AND the %
+# COMPUTED from its per-strand keep/clip decisions — the cross-check), a cleanup
+# list, relationships, and per-strand status. Cached to verdicts.json keyed by
+# track name. Runner injected so tests stay offline.
+# ---------------------------------------------------------------------------
+def _briefing_track():
+    """A track shaped like the real briefing track: 3 merged impl-PRs, 1 open
+    spec-PR, 2 open issues (stamped with members_detail via stamp_track_facts)."""
+    cards = [
+        pr_card(115, "feat(bosque): Communications Hub", state="MERGED",
+                shipped=True, branch="bosque/comms"),
+        pr_card(117, "Email Triage: tag Digest", state="MERGED", shipped=True),
+        pr_card(119, "briefing curation Stages 2-5", state="MERGED", shipped=True),
+        pr_card(118, "Specs: Stage 2 + Stage 3", state="OPEN", labels=["build-spec"]),
+        issue_card(111, "comms-hub issue"),
+        issue_card(112, "comms-hub issue 2"),
+    ]
+    ids = [consolidate._card_id(c) for c in cards]
+    tracks = [{"name": "briefing", "members": ids}]
+    consolidate.stamp_track_facts(tracks, cards)
+    return tracks[0]
+
+
+def analyze_runner(payload):
+    return lambda prompt: json.dumps(payload)
+
+
+class AnalyzeTests(unittest.TestCase):
+    def _full_payload(self, llm_pct=80, strands=None):
+        t = _briefing_track()
+        ids = [d["id"] for d in t["members_detail"]]
+        strands = strands or {ids[0]: "keep", ids[1]: "keep", ids[2]: "keep",
+                              ids[3]: "close", ids[4]: "supplanted",
+                              ids[5]: "supplanted"}
+        return t, {
+            "headline": "SHIPPED · needs cleanup",
+            "completion_pct": llm_pct,
+            "completion_verbal": "shipped; close spec #118; #111/#112 supplanted",
+            "cleanup": ["close spec-PR #118", "close #111/#112 (supplanted by #119)"],
+            "relationships": [
+                {"pair": [ids[0], ids[2]], "relation": "progressive",
+                 "confidence": "high", "note": "#119 builds on #115"}],
+            "strands": {sid: {"status": st, "note": st + " note",
+                              "confidence": "high"} for sid, st in strands.items()},
+            "confidence": "high",
+        }
+
+    def test_verdict_shape_parsed(self):
+        t, payload = self._full_payload()
+        v = consolidate.run_analyze(t, runner=analyze_runner(payload))
+        self.assertEqual(v["headline"], "SHIPPED · needs cleanup")
+        self.assertEqual(v["completion"]["llm_pct"], 80)
+        self.assertIn("close spec", v["completion"]["verbal"])
+        self.assertEqual(len(v["cleanup"]), 2)
+        self.assertEqual(v["relationships"][0]["relation"], "progressive")
+
+    def test_per_strand_status_parsed(self):
+        t, payload = self._full_payload()
+        v = consolidate.run_analyze(t, runner=analyze_runner(payload))
+        ids = [d["id"] for d in t["members_detail"]]
+        self.assertEqual(v["strands"][ids[3]]["status"], "close")
+        self.assertEqual(v["strands"][ids[4]]["status"], "supplanted")
+
+    def test_computed_pct_from_keep_clip(self):
+        # keep = the 3 merged + (nothing else kept); computed % = done-kept /
+        # total-kept. Here 3 kept (all merged/done) + 0 open kept -> 3/3 = 100%
+        # of the KEPT work is done; the clipped strands don't count as "work left".
+        t, payload = self._full_payload()
+        v = consolidate.run_analyze(t, runner=analyze_runner(payload))
+        # 3 keeps, all done (merged). computed = 100.
+        self.assertEqual(v["completion"]["computed_pct"], 100)
+
+    def test_agreement_is_high_confidence(self):
+        # LLM says ~100 and its clip list implies 100 -> agree -> high, show computed.
+        t, payload = self._full_payload(llm_pct=100)
+        v = consolidate.run_analyze(t, runner=analyze_runner(payload))
+        self.assertEqual(v["completion"]["confidence"], "high")
+
+    def test_divergence_is_low_confidence(self):
+        # LLM guts 40% but its keep/clip implies 100% done -> diverge -> LOW
+        # confidence (render as a question). The free consistency check.
+        t, payload = self._full_payload(llm_pct=40)
+        v = consolidate.run_analyze(t, runner=analyze_runner(payload))
+        self.assertEqual(v["completion"]["confidence"], "low")
+
+    def test_computed_with_open_kept_strand(self):
+        # If an OPEN strand is KEPT (real remaining work), it counts against %.
+        t = _briefing_track()
+        ids = [d["id"] for d in t["members_detail"]]
+        # keep the 3 merged AND the open spec #118 (id[3]); clip the 2 issues.
+        strands = {ids[0]: "keep", ids[1]: "keep", ids[2]: "keep",
+                   ids[3]: "keep", ids[4]: "supplanted", ids[5]: "outdated"}
+        _, payload = self._full_payload(llm_pct=75, strands=strands)
+        v = consolidate.run_analyze(t, runner=analyze_runner(payload))
+        # 4 kept, 3 done (merged) + 1 not-done (open spec) -> 3/4 = 75%.
+        self.assertEqual(v["completion"]["computed_pct"], 75)
+
+    def test_junk_output_returns_none(self):
+        t = _briefing_track()
+        v = consolidate.run_analyze(t, runner=lambda p: "no idea")
+        self.assertIsNone(v)
+
+    def test_cli_failure_returns_none(self):
+        t = _briefing_track()
+        def boom(p):
+            raise OSError("no claude")
+        self.assertIsNone(consolidate.run_analyze(t, runner=boom))
+
+    def test_prose_then_fence(self):
+        t, payload = self._full_payload()
+        resp = "Here's my analysis:\n```json\n" + json.dumps(payload) + "\n```"
+        v = consolidate.run_analyze(t, runner=lambda p: resp)
+        self.assertIsNotNone(v)
+        self.assertEqual(v["headline"], "SHIPPED · needs cleanup")
+
+    def test_relationship_pair_string_is_coerced_to_list(self):
+        # A `pair` returned as a STRING (or missing) must be coerced to a list so
+        # the template's pair.map(...) can't crash the whole track-detail render.
+        t = _briefing_track()
+        payload = {"headline": "H", "completion_pct": 50, "cleanup": [],
+                   "relationships": [
+                       {"pair": "claw#1 vs claw#2", "relation": "competing"},
+                       {"relation": "independent"}],  # pair missing entirely
+                   "strands": {}, "confidence": "high"}
+        v = consolidate.run_analyze(t, runner=analyze_runner(payload))
+        for r in v["relationships"]:
+            self.assertIsInstance(r["pair"], list)
+
+    def test_all_clipped_strands_is_low_confidence(self):
+        # If EVERY strand is clipped (kept==0), computed % is None and the LLM's
+        # gut % would contradict every strand slot -> flag LOW confidence so it
+        # renders as a question, never asserted as a fact.
+        t = _briefing_track()
+        ids = [d["id"] for d in t["members_detail"]]
+        strands = {i: "duplicate" for i in ids}   # nothing kept
+        _, payload = self._full_payload(llm_pct=80, strands=strands)
+        v = consolidate.run_analyze(t, runner=analyze_runner(payload))
+        self.assertIsNone(v["completion"]["computed_pct"])
+        self.assertEqual(v["completion"]["confidence"], "low")
+
+
+class VerdictStampTests(unittest.TestCase):
+    def test_stamp_verdicts_sets_t_verdict(self):
+        t = _briefing_track()
+        verdicts = {"briefing": {"headline": "X", "completion": {}}}
+        consolidate.stamp_verdicts([t], verdicts)
+        self.assertEqual(t["verdict"]["headline"], "X")
+
+    def test_no_verdict_leaves_track_clean(self):
+        # Offline-safe: a track with no cached verdict stamps nothing.
+        t = _briefing_track()
+        consolidate.stamp_verdicts([t], {})
+        self.assertNotIn("verdict", t)
+
+
 if __name__ == "__main__":
     unittest.main()

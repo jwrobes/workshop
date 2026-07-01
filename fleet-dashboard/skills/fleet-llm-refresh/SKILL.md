@@ -41,8 +41,13 @@ pass `--llm-all`; you can also run a single pass ad hoc.
    create/archive become suggestions. Writes `llm-runlog.json` (the "Since last
    analysis" panel) and prints a one-line summary.
 
-3. **Analyze (Pass 2 — when built).** `--analyze` → per-track verdict +
-   completion in `verdicts.json`.
+3. **Analyze (Pass 2 — live).** `python3 collector.py --out ~/.fleet --analyze`
+   Per multi-member track: headline verdict + completion (the LLM's gut % AND
+   the % computed from its per-strand keep/clip — divergence flags low
+   confidence), a cleanup list, relationships (competing/progressive/
+   independent), and a per-strand status → `verdicts.json` (kept SEPARATE from
+   tracks.json). Runs after triage so it sees final membership. A track whose
+   analysis fails keeps its prior cached verdict.
 
 4. **Rollup (Pass 3 — when built).** `--rollup` → product/fleet "where things
    stand" summary (consumes Pass 2; does not re-analyze).

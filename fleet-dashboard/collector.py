@@ -1190,22 +1190,33 @@ def main():
                     help="PASS 1: LLM-triage the Ungrouped strays vs existing "
                          "tracks — auto-attach high-confidence, suggest the rest, "
                          "write llm-runlog.json. On-demand (reuses cache otherwise).")
+    ap.add_argument("--analyze", action="store_true",
+                    help="PASS 2: LLM per-track analysis — headline verdict, "
+                         "completion (LLM gut % + computed %), cleanup list, "
+                         "relationships, per-strand status -> verdicts.json. "
+                         "Runs after triage so it sees final membership.")
     ap.add_argument("--llm-all", action="store_true",
-                    help="run every LLM pass in order (triage -> analyze -> "
-                         "rollup). Order matters: triage changes membership before "
-                         "analysis. (analyze/rollup are later passes.)")
+                    help="run every LLM pass in order (triage -> analyze). Order "
+                         "matters: triage changes membership before analysis.")
     ap.add_argument("--triage-fixture", default=None,
                     help="TEST ONLY: a JSON file of canned triage proposals to "
                          "feed the triage pass INSTEAD of shelling out to claude "
                          "(the injected-runner discipline, at the CLI boundary). "
                          "Implies --triage; keeps e2e gates offline/deterministic.")
+    ap.add_argument("--analyze-fixture", default=None,
+                    help="TEST ONLY: a JSON file mapping track name -> canned "
+                         "analyze payload, fed to the analyze pass instead of "
+                         "claude. Implies --analyze; keeps e2e offline.")
     args = ap.parse_args()
     if args.triage_fixture:
         args.triage = True
-    # --llm-all is the convenience that runs each pass in order. For now it
-    # implies --triage (Pass 1); analyze/rollup wire in as they're built.
+    if args.analyze_fixture:
+        args.analyze = True
+    # --llm-all is the convenience that runs each built pass in order (order
+    # matters: triage changes membership before analyze).
     if args.llm_all:
         args.triage = True
+        args.analyze = True
 
     try:
         cfg = load_config(args.config)
@@ -1473,8 +1484,43 @@ def main():
 
     # Phase 1: deterministic strand facts. Stamp each track with per-member
     # role/state/source/stage + a fact summary so the unified card renders
-    # layer 1 (facts) with no LLM. See UNIFIED-CARD-MODEL.md.
+    # layer 1 (facts) with no LLM. See UNIFIED-CARD-MODEL.md. Must run BEFORE
+    # analyze (Pass 2 reads members_detail).
     consolidate.stamp_track_facts(tracks, kanban)
+
+    # PASS 2 — TRACK-ANALYSIS (on-demand, --analyze / --llm-all). Per multi-member
+    # track: headline verdict + completion (LLM gut % + computed % + agreement
+    # confidence) + cleanup + relationships + per-strand status -> verdicts.json
+    # (kept SEPARATE from tracks.json). Runs after triage so it sees final
+    # membership. Best-effort: a failed track leaves its prior verdict intact.
+    multi = [t for t in tracks if len(t.get("members") or []) >= 2]
+    if getattr(args, "analyze", False):
+        analyze_fx = None
+        if args.analyze_fixture:
+            analyze_fx = json.loads(Path(args.analyze_fixture).read_text())
+        verdicts = consolidate.load_verdicts(out_dir)
+        n_ok = 0
+        for t in multi:
+            runner = None
+            if analyze_fx is not None:
+                # Canned per-track payload (offline e2e); a track absent from the
+                # fixture is simply skipped (leaves any prior verdict intact).
+                payload = analyze_fx.get(t["name"])
+                if payload is None:
+                    continue
+                runner = (lambda _p, _pl=payload: json.dumps(_pl))
+            v = consolidate.run_analyze(t, runner=runner)
+            if v is not None:
+                verdicts[t["name"]] = v
+                n_ok += 1
+        consolidate.save_verdicts(out_dir, verdicts)
+        print(f"analyze: {n_ok}/{len(multi)} track verdict(s) -> "
+              f"{out_dir}/{consolidate.VERDICTS_FILE}")
+
+    # Stamp cached verdicts onto tracks so the template reads t.verdict (offline-
+    # safe: no verdict -> the 'not run' placeholder).
+    _verdicts = consolidate.load_verdicts(out_dir)
+    consolidate.stamp_verdicts(tracks, _verdicts)
 
     status = {
         "generated_at": now.isoformat(timespec="seconds"),

@@ -16,8 +16,9 @@ node e2e_repo_board.mjs
 node e2e_unified_card.mjs
 node e2e_track_detail.mjs
 node e2e_pipeline_tracks.mjs
-# Pass-1 (LLM triage) e2e — each generates its OWN dashboard via a canned
-# --triage-fixture (offline, never the real claude CLI), so these stay
-# deterministic and don't mutate the user's ~/.fleet overrides.
-node e2e_triage.mjs
-node e2e_llm_runlog.mjs
+# LLM e2e (Passes 1-3) — each generates its OWN dashboard via a canned
+# --triage-fixture / --analyze-fixture (offline, never the real claude CLI), so
+# these stay deterministic and don't mutate the user's ~/.fleet overrides.
+node e2e_triage.mjs      # Pass 1 — triage (attach/archive/suggest)
+node e2e_llm_runlog.mjs  # Pass 1 — change-log panel
+node e2e_verdict.mjs     # Pass 2 — per-track verdict in the render slots

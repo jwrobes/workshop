@@ -851,6 +851,18 @@ function unifiedCard(t,repoName){
   const facts=el('<button data-action="open-track" data-track-facts class="mono" style="all:unset;cursor:pointer;display:block;font-size:11px;color:#8c8576;margin:6px 0 0 16px;overflow-wrap:anywhere">'+esc(factSummary(t))+' &nbsp;<span style="color:#a8916a">open →</span></button>');
   facts.onclick=()=>goTo('track',STATE.productId,t.name,repoName);
   head.appendChild(facts);
+  // LLM verdict headline + completion (layer 2) — visually DISTINCT from the
+  // deterministic fact line above (amber pill + %). Only when a verdict is cached.
+  const v=t.verdict;
+  if(v){
+    const comp=v.completion||{};
+    const pct=(comp.computed_pct!=null?comp.computed_pct:comp.llm_pct);
+    const vrow=el('<div data-region="card-verdict" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0 0 16px"></div>');
+    vrow.innerHTML=(v.headline?'<span data-verdict-headline class="mono" style="font-size:10px;letter-spacing:.02em;color:#7a5f28;background:#f6ead0;border:1px solid #e3cf9f;border-radius:4px;padding:2px 7px">'+esc(v.headline)+'</span>':'')
+      +(pct!=null?'<span data-verdict-pct class="mono" style="font-size:10px;color:'+(pct>=70?'#2f7a52':'#a9762a')+'">'+pct+'% complete</span>':'')
+      +((comp.confidence||'').toLowerCase()==='low'?'<span class="mono" style="font-size:9.5px;color:#a9762a">⚠ confirm</span>':'');
+    head.appendChild(vrow);
+  }
   wrap.appendChild(head);
   if(open) wrap.appendChild(strandMap(t,repoName));
   return wrap;
@@ -1198,7 +1210,7 @@ function strandChip(d,repoName){
   chip.onclick=()=>{STATE.strandOpen[d.id]=!STATE.strandOpen[d.id];render();};
   return chip;
 }
-function strandDetailPanel(d,repoName){
+function strandDetailPanel(d,repoName,sv){
   const sd=stateDot(d.state);
   const num=String(d.id).replace(/^.*#/,'#');
   const box=el('<div data-strand-detail="'+attr(d.id)+'" style="border:1px solid #e6e0d5;border-left:3px solid '+sd.d+';border-radius:9px;background:#fff;padding:14px 16px;margin-bottom:10px"></div>');
@@ -1232,11 +1244,106 @@ function strandDetailPanel(d,repoName){
   }
   // Link out.
   if(d.url) box.appendChild(el('<a href="'+attr(d.url)+'" target="_blank" rel="noopener" class="mono" data-strand-link style="display:inline-block;margin-top:12px;font-size:11px;color:#8c6a2a;text-decoration:none;border:1px solid #ddd4c2;border-radius:6px;padding:4px 10px">open on GitHub →</a>'));
-  // RESERVED slot for the Phase-3 LLM take on THIS strand (per UNIFIED-CARD-MODEL
-  // layer 2). Rendered faint until the verdict pass exists.
-  box.appendChild(el('<div data-strand-llm-slot style="margin-top:12px;border-top:1px dashed #ece5d6;padding-top:9px;font-size:10.5px;color:#c2b89f;font-style:italic">LLM take on this strand — added by the strand-analysis pass (Phase 3).</div>'));
+  // PER-STRAND LLM take (Pass 2): the disposition (keep / close / duplicate /
+  // outdated / supplanted) + a one-line note, confidence-tagged. Faint
+  // placeholder when no verdict is cached (offline-safe).
+  const slot=el('<div data-strand-llm-slot style="margin-top:12px;border-top:1px dashed #ece5d6;padding-top:9px"></div>');
+  if(sv&&sv.status){
+    const st=String(sv.status).toLowerCase();
+    const keep=st==='keep';
+    // keep = green (this strand is real); clip states = amber (a loose end).
+    const col=keep?{fg:'#2f7a52',bg:'#e3f1e6',bd:'#bcdcc4'}:{fg:'#a9762a',bg:'#fbf1dc',bd:'#e3cf9f'};
+    slot.setAttribute('data-strand-status',st);
+    slot.innerHTML='<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
+      +'<span class="mono" style="font-size:8.5px;letter-spacing:.08em;text-transform:uppercase;color:'+col.fg+';background:'+col.bg+';border:1px solid '+col.bd+';border-radius:4px;padding:2px 6px">'+esc(st)+'</span>'
+      +confPill(sv.confidence)
+      +'<span style="font-size:12px;color:#6e6757;overflow-wrap:anywhere">'+esc(sv.note||'')+'</span>'
+      +'</div>';
+  }else{
+    slot.setAttribute('style',slot.getAttribute('style')+';font-size:10.5px;color:#c2b89f;font-style:italic');
+    slot.textContent='LLM take on this strand — run the strand-analysis pass (--analyze).';
+  }
+  box.appendChild(slot);
   return box;
 }
+// A short label for a strand id ("#118") for use in verdict prose.
+function shortId(id){return String(id).replace(/^.*#/,'#');}
+// Confidence pill — the trust rule made visible. high = a stated fact (green);
+// low/medium = a QUESTION to resolve (amber), never asserted.
+function confPill(conf){
+  const c=(conf||'').toLowerCase();
+  if(c==='high') return '<span data-conf="high" class="mono" style="font-size:8.5px;letter-spacing:.06em;text-transform:uppercase;color:#2f7a52;background:#e3f1e6;border:1px solid #bcdcc4;border-radius:4px;padding:1px 5px">high</span>';
+  return '<span data-conf="'+esc(c||'medium')+'" class="mono" style="font-size:8.5px;letter-spacing:.06em;text-transform:uppercase;color:#a9762a;background:#fbf1dc;border:1px solid #e3cf9f;border-radius:4px;padding:1px 5px">'+esc(c||'medium')+' · confirm</span>';
+}
+// The TRACK-LEVEL verdict slot. Renders the LLM's headline + completion (the
+// COMPUTED % as the auditable headline, with the LLM's gut % + a confidence from
+// their agreement — divergence renders as a low-confidence question) + cleanup +
+// relationships. Visually DISTINCT from the deterministic facts (layer 1).
+function verdictRegion(t){
+  const v=t.verdict;
+  const box=el('<div data-region="track-verdict" style="margin-top:20px;border-radius:10px;padding:14px 16px"></div>');
+  if(!v){
+    box.setAttribute('style',box.getAttribute('style')+';border:1px dashed #d7cdb8;background:#faf6ee');
+    box.setAttribute('data-verdict','none');
+    box.innerHTML='<div class="mono" style="font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:#a8916a">Analysis</div>'
+      +'<div class="mono" style="font-size:12px;color:#b3a894;margin-top:6px;font-style:italic;line-height:1.5">The strand-analysis pass (Pass 2) summarizes what\'s happening, recommends the next step, and flags what to close / clean up / dedupe. Not run yet — <span class="mono">python3 collector.py --analyze</span>.</div>';
+    return box;
+  }
+  box.setAttribute('data-verdict','shown');
+  // A solid (not dashed) amber card = this is a JUDGMENT (layer 2), set apart
+  // from the dashed deterministic-fact regions.
+  box.setAttribute('style',box.getAttribute('style')+';border:1px solid #d9c9a0;background:linear-gradient(#fffdf6,#fdf6e7)');
+  const comp=v.completion||{};
+  const shownPct=(comp.computed_pct!=null?comp.computed_pct:comp.llm_pct);
+  const cconf=(comp.confidence||'').toLowerCase();
+  // Header: eyebrow + headline verdict + overall confidence.
+  const head=el('<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"></div>');
+  head.innerHTML='<span class="mono" style="font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:#a8916a">LLM verdict</span>'
+    +'<span data-verdict-headline style="font-size:15px;color:#5b4a28;font-weight:500">'+esc(v.headline||'—')+'</span>'
+    +confPill(v.confidence);
+  box.appendChild(head);
+  // Completion: the computed % headline + a bar + the verbal read. When the two
+  // %s DIVERGE (comp.confidence==='low') show it as a QUESTION, not a fact.
+  if(shownPct!=null){
+    const diverged=cconf==='low';
+    const barColor=diverged?'#c9a24a':(shownPct>=70?'#5d8a6f':'#cbab6a');
+    const comprow=el('<div data-region="completion" data-pct="'+shownPct+'" data-conf="'+esc(cconf||'')+'" style="margin-top:12px"></div>');
+    comprow.innerHTML='<div style="display:flex;align-items:baseline;gap:9px">'
+      +'<span class="mono" style="font-size:20px;color:#5b4a28;font-weight:600">'+shownPct+'%</span>'
+      +'<span class="mono" style="font-size:10px;color:#8a7f66">complete'+(comp.kept!=null?' · '+(comp.done||0)+'/'+comp.kept+' kept strands done':'')+'</span>'
+      +(diverged?'<span class="mono" data-completion-question style="font-size:10px;color:#a9762a">⚠ LLM said '+esc(String(comp.llm_pct))+'% — its clip list implies '+shownPct+'%; confirm</span>':'')
+      +'</div>'
+      +'<div style="margin-top:7px;height:7px;border-radius:4px;background:#efe7d2;overflow:hidden"><div style="height:100%;width:'+Math.max(0,Math.min(100,shownPct))+'%;background:'+barColor+'"></div></div>'
+      +(v.completion&&comp.verbal?'<div style="font-size:12px;color:#6e6757;margin-top:8px;line-height:1.5">'+esc(comp.verbal)+'</div>':'');
+    box.appendChild(comprow);
+  }
+  // Cleanup list — concrete next actions.
+  if((v.cleanup||[]).length){
+    const cl=el('<div data-region="cleanup" style="margin-top:13px"></div>');
+    cl.appendChild(el('<div class="mono" style="font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:#a8916a;margin-bottom:5px">Cleanup</div>'));
+    v.cleanup.forEach(c=>cl.appendChild(el('<div data-cleanup-item style="display:flex;gap:8px;font-size:12px;color:#5b5447;padding:2px 0"><span style="color:#cf962f;flex:none">•</span><span style="overflow-wrap:anywhere">'+esc(c)+'</span></div>')));
+    box.appendChild(cl);
+  }
+  // Relationships — competing/progressive/independent, confidence-tagged. A
+  // low-confidence one renders as a QUESTION (⚠ … confirm), not an assertion.
+  if((v.relationships||[]).length){
+    const rl=el('<div data-region="relationships" style="margin-top:13px"></div>');
+    rl.appendChild(el('<div class="mono" style="font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:#a8916a;margin-bottom:5px">Relationships</div>'));
+    v.relationships.forEach(r=>{
+      const pair=(Array.isArray(r.pair)?r.pair:[]).map(shortId).join(' ↔ ');
+      const low=(r.confidence||'').toLowerCase()!=='high';
+      const row=el('<div data-relationship data-relation="'+attr(r.relation||'')+'" style="display:flex;align-items:baseline;gap:8px;font-size:12px;padding:3px 0;color:'+(low?'#8c6a2a':'#5b5447')+'"></div>');
+      row.innerHTML=(low?'<span style="flex:none">⚠</span>':'')
+        +'<span class="mono" style="flex:none;color:#7a6a3f">'+esc(pair)+'</span>'
+        +'<span class="mono" style="flex:none;font-weight:600">'+esc(r.relation||'')+(low?' — confirm':'')+'</span>'
+        +'<span style="color:#8a7f66;overflow-wrap:anywhere">'+esc(r.note||'')+'</span>';
+      rl.appendChild(row);
+    });
+    box.appendChild(rl);
+  }
+  return box;
+}
+
 function renderTrackDetail(app){
   const t=findTrack(STATE.trackName);
   const p=products().find(x=>x.id===STATE.productId)||{};
@@ -1246,12 +1353,9 @@ function renderTrackDetail(app){
   sec.innerHTML='<div class="eyebrow" style="color:#a39c8c;letter-spacing:.16em">'+esc((p.name||'')+(repoName?' · '+repoName:''))+' · track</div>'
     +'<h1 class="mono" style="font-weight:500;font-size:clamp(22px,3.6vw,34px);margin:0;letter-spacing:-.01em;color:#2a2722;overflow-wrap:anywhere">'+esc(t.name)+'</h1>'
     +'<div class="mono" data-track-facts style="font-size:12px;color:#8c8576;margin-top:9px">'+esc(factSummary(t))+'</div>';
-  // RESERVED verdict region (Phase-3 LLM: summary / next step / what to clean,
-  // close, dedupe, what's outdated/supplanted). Faint placeholder for now.
-  const verdict=el('<div data-region="track-verdict" style="margin-top:20px;border:1px dashed #d7cdb8;border-radius:10px;background:#faf6ee;padding:14px 16px"></div>');
-  verdict.innerHTML='<div class="mono" style="font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:#a8916a">Analysis</div>'
-    +'<div class="mono" style="font-size:12px;color:#b3a894;margin-top:6px;font-style:italic;line-height:1.5">The strand-analysis pass (Phase 3) will summarize what\'s happening here, recommend the next step, and flag what to close / clean up / dedupe (outdated, supplanted, duplicate work). Not run yet.</div>';
-  sec.appendChild(verdict);
+  // VERDICT region (Pass-2 LLM): headline + completion + cleanup + relationships,
+  // confidence-tagged. Filled when a verdict is cached; faint placeholder if not.
+  sec.appendChild(verdictRegion(t));
   // PIPELINE LANES: one column per stage; strands placed by their computed stage.
   const stages=(typeof STAGES!=='undefined'?STAGES:[]);
   const details=(t.members_detail||[]);
@@ -1277,7 +1381,7 @@ function renderTrackDetail(app){
   if(openDetails.length){
     const dwrap=el('<div data-region="strand-details" style="margin-top:26px"></div>');
     dwrap.appendChild(el('<div class="mono" style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a917f;margin-bottom:12px">Strand detail</div>'));
-    openDetails.forEach(d=>dwrap.appendChild(strandDetailPanel(d,repoName)));
+    openDetails.forEach(d=>dwrap.appendChild(strandDetailPanel(d,repoName,(t.verdict&&t.verdict.strands&&t.verdict.strands[d.id])||null)));
     sec.appendChild(dwrap);
   }
   app.appendChild(sec);
