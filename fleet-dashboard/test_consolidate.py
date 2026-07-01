@@ -32,6 +32,12 @@ class LooseAndIdTests(unittest.TestCase):
         self.assertEqual(consolidate._card_id(card("x", pr=113)), "claw-playbook#113")
         self.assertEqual(consolidate._card_id(card("y")), "claw-playbook/y")
 
+    def test_card_id_product_level_pr_uses_product_not_qmark(self):
+        # A product-level PR has repo=None -> product#number, NOT ?#number.
+        c = {"github": {"number": 113}, "repo": None, "product": "magic-me",
+             "slug": "communications-hub-morning-briefing"}
+        self.assertEqual(consolidate._card_id(c), "magic-me#113")
+
 
 class LLMConsolidationTests(unittest.TestCase):
     def _runner(self, payload):
@@ -240,6 +246,67 @@ class StrandStageTests(unittest.TestCase):
 
     def test_open_issue_specd(self):
         self.assertEqual(consolidate.strand_stage(issue_card(112, "x")), "spec")
+
+
+class StrayAttachTests(unittest.TestCase):
+    def _briefing_tracks(self):
+        return [{"name": "communications-hub-morning-briefing",
+                 "members": ["claw-playbook#111", "claw-playbook#112",
+                             "claw-playbook#115"]}]
+
+    def test_attach_by_build_slug_branch(self):
+        # The #113 case: product-level PR, build-<slug> branch == track name.
+        stray = {"github": {"number": 113, "branch":
+                 "build-communications-hub-morning-briefing"},
+                 "repo": None, "product": "magic-me", "slug": "x"}
+        tracks = self._briefing_tracks()
+        consolidate.attach_strays_to_tracks([stray], tracks)
+        self.assertIn("magic-me#113", tracks[0]["members"])
+
+    def test_attach_by_closes_member(self):
+        # Body 'closes #112' where #112 is a member.
+        stray = {"github": {"number": 113, "branch": "claude/random-name",
+                 "body": "Implements the hub. closes #112"},
+                 "repo": None, "product": "magic-me", "slug": "x"}
+        tracks = self._briefing_tracks()
+        consolidate.attach_strays_to_tracks([stray], tracks)
+        self.assertIn("magic-me#113", tracks[0]["members"])
+
+    def test_does_not_attach_unrelated(self):
+        stray = {"github": {"number": 200, "branch": "build-something-else",
+                 "body": "unrelated"}, "repo": "claw-playbook", "slug": "x"}
+        tracks = self._briefing_tracks()
+        consolidate.attach_strays_to_tracks([stray], tracks)
+        self.assertNotIn("claw-playbook#200", tracks[0]["members"])
+
+    def test_skips_card_already_in_a_track(self):
+        # #115 is already a member; must not be duplicated even if its branch
+        # would match.
+        member = {"github": {"number": 115,
+                  "branch": "build-communications-hub-morning-briefing"},
+                  "repo": "claw-playbook", "slug": "x"}
+        tracks = self._briefing_tracks()
+        consolidate.attach_strays_to_tracks([member], tracks)
+        self.assertEqual(tracks[0]["members"].count("claw-playbook#115"), 1)
+
+    def test_skips_already_stamped_track(self):
+        stray = {"github": {"number": 113,
+                 "branch": "build-communications-hub-morning-briefing"},
+                 "repo": None, "product": "magic-me", "track": "somewhere"}
+        tracks = self._briefing_tracks()
+        consolidate.attach_strays_to_tracks([stray], tracks)
+        self.assertNotIn("magic-me#113", tracks[0]["members"])
+
+    def test_closes_parsing_variants(self):
+        self.assertEqual(consolidate._closes_numbers(
+            "Closes #112, fixes #90 and resolves #7"), {112, 90, 7})
+        self.assertEqual(consolidate._closes_numbers("mentions #5 only"), set())
+
+    def test_branch_slug_strips_prefix(self):
+        self.assertEqual(consolidate._branch_slug(
+            "build-communications-hub-morning-briefing"),
+            "communications-hub-morning-briefing")
+        self.assertEqual(consolidate._branch_slug("bosque/build-spec-007"), "007")
 
 
 class StrandActivityTests(unittest.TestCase):

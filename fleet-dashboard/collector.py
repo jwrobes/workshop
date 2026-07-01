@@ -1397,6 +1397,10 @@ def main():
     tracks = consolidate.load_tracks(out_dir)
     overrides = consolidate.load_overrides(out_dir, repo_dir)
     tracks = consolidate.apply_overrides(tracks, overrides)
+    # Deterministic stray-attach: a loose card whose build-<slug> branch matches
+    # a track name, or that 'closes #<member>', joins that track (catches e.g. a
+    # product-level PR the LLM pass never saw). No LLM; overrides already won.
+    consolidate.attach_strays_to_tracks(kanban, tracks)
     consolidate.attach_tracks_to_cards(kanban, tracks)
     # Phase 1: deterministic strand facts. Stamp each track with per-member
     # role/state/source/stage + a fact summary so the unified card renders

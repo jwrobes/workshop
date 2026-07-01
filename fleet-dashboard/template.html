@@ -196,9 +196,12 @@ function trackColumn(t){
   return ((t.facts||{}).furthest_stage==='shipped')?'completed':'active';
 }
 function cardId(c){
+  // Mirrors collector _card_id. A product-level PR has repo=null -> use
+  // product#number (e.g. magic-me#113), not the ambiguous ?#113.
   const n=(c.github||{}).number;
-  if(n!=null) return (c.repo||'?')+'#'+n;
-  return (c.repo||c.product||'?')+'/'+(c.slug||'');
+  const scope=c.repo||c.product||'?';
+  if(n!=null) return scope+'#'+n;
+  return scope+'/'+(c.slug||'');
 }
 function cardById(id){return kanban().find(c=>cardId(c)===id)||null;}
 // Pending UI corrections live in localStorage until the user downloads them as
@@ -1256,7 +1259,38 @@ function renderTracks(app){
     });
     sec.appendChild(box);
   });
+  // UNGROUPED: real in-flight/shipped cards that are in NO track — so a stray
+  // like a product-level PR (that deterministic attach didn't catch) can be
+  // given a track by hand. Assigning writes the same corrections file.
+  const ungrouped=ungroupedCards();
+  const ubox=el('<div data-region="ungrouped" style="margin-top:26px;border:1px dashed #ddd4c2;border-radius:10px;overflow:hidden"></div>');
+  ubox.appendChild(el('<div style="display:flex;align-items:baseline;gap:10px;padding:11px 15px;background:#f6f2ea;border-bottom:1px solid #ece5d6"><span class="mono" style="font-size:13px;color:#2a2722">Ungrouped</span><span class="mono" style="font-size:11px;color:#a39c8c" data-ungrouped-count="'+ungrouped.length+'">'+ungrouped.length+' card'+(ungrouped.length===1?'':'s')+' in no track</span></div>'));
+  if(!ungrouped.length){
+    ubox.appendChild(el('<div class="mono" style="font-size:11px;color:#a3b39a;padding:11px 15px">Nothing ungrouped — every live artifact is in a track.</div>'));
+  }else{
+    ungrouped.forEach(c=>{
+      const id=cardId(c),label=c.title||c.slug||id;
+      const row=el('<div data-ungrouped-card="'+attr(id)+'" style="display:flex;align-items:center;gap:10px;padding:9px 15px;border-top:1px solid #f1ece1"></div>');
+      const stg=planStage(c).key;
+      row.innerHTML='<span class="mono" style="font-size:12px;color:#3b372f;flex:1;overflow-wrap:anywhere">'+esc(String(label).slice(0,80))+'</span>'
+        +'<span class="mono" style="font-size:9px;letter-spacing:.06em;color:#a8916a">'+esc(stg)+'</span>'
+        +'<span class="mono" style="font-size:10px;color:#b3ab9b">'+esc(id)+'</span>';
+      const as=el('<button data-action="assign-track" style="font-size:10.5px;border:1px solid #d2b06a;background:#fff;border-radius:5px;padding:3px 8px;cursor:pointer;color:#8c6a2a">give a track</button>');
+      as.onclick=()=>{const to=prompt('Assign "'+label+'" to which track? (existing name, or a new one)','');if(to===null||!to.trim())return;const o=loadCorr();o.reassign=o.reassign||{};o.reassign[id]=to.trim();saveCorr(o);render();};
+      row.appendChild(as);ubox.appendChild(row);
+    });
+  }
+  sec.appendChild(ubox);
   app.appendChild(sec);
+}
+// Cards that are real strays worth grouping by hand: forge-backed (a PR/issue)
+// but in NO track. We deliberately EXCLUDE plain local plan cards (no github) —
+// each is its own anchor, not a scattered strand, and listing all ~60 of them
+// would bury the actual strays (like the #113 product-level PR). A PR/issue with
+// no track is exactly the "belongs to some effort but wasn't grouped" case.
+function ungroupedCards(){
+  return kanban().filter(c=>!c.track&&(c.github||{}).number!=null)
+    .sort((a,b)=>String(a.title||a.slug||'').localeCompare(String(b.title||b.slug||'')));
 }
 // Build track-overrides.json from localStorage and trigger a browser download.
 function downloadCorrections(){

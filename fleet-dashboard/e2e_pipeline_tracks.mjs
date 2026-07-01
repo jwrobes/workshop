@@ -65,6 +65,25 @@ const looseStrands = await p.evaluate(() => {
 check('briefing strands are NOT loose chips in the pipeline map',
   looseStrands === 0, `${looseStrands} loose strand chips`);
 
+// --- The #113 product-level PR (same effort) is NOT loose in spec'd. It was
+//     deterministically attached to the track, so it must render only inside
+//     the track chip — not as its own spec'd card at a different stage. ---
+await p.locator('[data-stage="spec"]').first().click();
+await p.waitForTimeout(150);
+const stray113 = await p.evaluate(() => {
+  const map = document.querySelector('[data-region="pipeline-map"]');
+  if (!map) return -1;
+  // The loose #113 card rendered its title "Communications Hub & Morning
+  // Briefing" with a "PR #113" meta. If attach worked, no such loose chip.
+  return [...map.querySelectorAll('[data-plan]')]
+    .filter(c => /Communications Hub & Morning Briefing/i.test(c.textContent)
+      && /#113/.test(c.textContent)).length;
+});
+check('PR #113 is NOT a loose spec’d card (it attached to the track)',
+  stray113 === 0, `${stray113} loose #113 chips`);
+await p.locator('[data-stage="spec"]').first().click();  // close it again
+await p.waitForTimeout(100);
+
 // --- A fully-shipped track shows as one chip in the SHIPPED stop. ---
 const shippedTrackChips = await p.evaluate(() =>
   document.querySelectorAll('[data-stage-cards="shipped"] [data-pm-track]').length);
@@ -87,6 +106,28 @@ await briefChip.first().click();
 await p.waitForTimeout(150);
 const onTrack = await p.evaluate((t) => STATE.level === 'track' && STATE.trackName === t, TRACK);
 check('clicking a pipeline track chip opens the track detail page', onTrack);
+
+// --- #113 is now a MEMBER of the briefing track (deterministic attach). ---
+const has113 = await p.evaluate(() => {
+  const t = (DATA.tracks || []).find(x => x.name === 'communications-hub-morning-briefing');
+  return !!(t && (t.members || []).includes('magic-me#113'));
+});
+check('#113 is a member of the briefing track (deterministic stray-attach)', has113);
+
+// --- The Work-tracks view lists UNGROUPED strays (so they can be hand-assigned),
+//     and #113 is NOT among them (it got attached). ---
+await p.evaluate(() => goTo('tracks'));
+await p.waitForTimeout(200);
+const ungrouped = await p.evaluate(() => ({
+  section: !!document.querySelector('[data-region="ungrouped"]'),
+  count: document.querySelectorAll('[data-ungrouped-card]').length,
+  has113: !!document.querySelector('[data-ungrouped-card="magic-me#113"]'),
+  hasAssign: !!document.querySelector('[data-region="ungrouped"] [data-action="assign-track"]'),
+}));
+check('Work-tracks view has an Ungrouped section listing strays',
+  ungrouped.section && ungrouped.count > 0, `${ungrouped.count} ungrouped`);
+check('ungrouped strays have a "give a track" control', ungrouped.hasAssign);
+check('#113 is NOT in Ungrouped (it was attached to its track)', ungrouped.has113 === false);
 
 await p.screenshot({ path: join(homedir(), '.fleet', 'e2e-pipeline-tracks.png'), fullPage: true });
 await b.close();

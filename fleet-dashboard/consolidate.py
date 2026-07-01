@@ -67,11 +67,14 @@ def _card_brief(c):
 
 def _card_id(c):
     """A stable identifier for a card across runs: prefer the GitHub ref
-    (repo#number) since slugs/titles drift; fall back to repo/slug."""
+    (repo#number) since slugs/titles drift; fall back to repo/slug. A product-
+    level PR has repo=None — use product#number (e.g. magic-me#113), NOT the
+    ambiguous ?#113, so its id is stable and doesn't collide across products."""
     gh = c.get("github") or {}
+    scope = c.get("repo") or c.get("product") or "?"
     if gh.get("number") is not None:
-        return f"{c.get('repo') or '?'}#{gh['number']}"
-    return f"{c.get('repo') or c.get('product') or '?'}/{c.get('slug') or ''}"
+        return f"{scope}#{gh['number']}"
+    return f"{scope}/{c.get('slug') or ''}"
 
 
 CONSOLIDATE_PROMPT = """\
@@ -193,6 +196,84 @@ def apply_overrides(tracks, overrides):
         out.append({"name": name, "members": sorted(members),
                     "source": "override" if is_override else "llm"})
     return sorted(out, key=lambda t: t["name"])
+
+
+def _norm_slug(s):
+    """Normalize a slug/branch/name for matching: lowercase, unify -/_ /space,
+    collapse repeats. So 'Communications_Hub  Morning' ~ 'communications-hub-
+    morning'."""
+    s = re.sub(r"[\s_]+", "-", (s or "").strip().lower())
+    return re.sub(r"-+", "-", s).strip("-")
+
+
+def _branch_slug(branch):
+    """The feature slug of a build-<slug> branch, stripped of common prefixes.
+    'build-communications-hub-morning-briefing' -> 'communications-hub-morning-
+    briefing'. Auto-generated branches (claude/…) yield the raw tail (rarely a
+    track name), so they won't false-match."""
+    if not branch:
+        return ""
+    tail = branch.split("/")[-1]
+    for pref in ("build-spec-", "build-", "spec-"):
+        if tail.lower().startswith(pref):
+            tail = tail[len(pref):]
+            break
+    return _norm_slug(tail)
+
+
+def _closes_numbers(body):
+    """PR/issue numbers this card closes/fixes/resolves, from its body:
+    'closes #112', 'fixes #90', 'resolves #7'. Returns a set of ints."""
+    if not body:
+        return set()
+    return {int(n) for n in re.findall(
+        r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)", body, re.I)}
+
+
+def attach_strays_to_tracks(cards, tracks):
+    """DETERMINISTIC stray-attach (no LLM): a LOOSE card that is obviously part
+    of an existing track — but wasn't grouped (often a product-level PR the LLM
+    pass never saw) — is added to that track's members. Two signals, per
+    TRACK-MODEL's deterministic-join rule:
+      1. its build-<slug> branch normalizes to the track NAME, OR
+      2. its body 'closes/fixes #N' where #N is a member of that track.
+    Mutates `tracks` in place (extends members) and returns it. Idempotent:
+    a card already in a track is skipped; overrides still win (they ran first).
+    """
+    multi = [t for t in tracks if len(t.get("members") or []) >= 2]
+    if not multi:
+        return tracks
+    already = {m for t in multi for m in (t.get("members") or [])}
+    # Index tracks by normalized name, and each member number -> its track.
+    by_name = {_norm_slug(t["name"]): t for t in multi}
+    num_to_track = {}
+    for t in multi:
+        for m in (t.get("members") or []):
+            mo = re.search(r"#(\d+)$", str(m))
+            if mo:
+                num_to_track[int(mo.group(1))] = t
+    for c in cards:
+        cid = _card_id(c)
+        if cid in already or c.get("track"):
+            continue
+        gh = c.get("github") or {}
+        target = None
+        # 1. build-<slug> branch matches a track name.
+        bslug = _branch_slug(gh.get("branch") or c.get("branch"))
+        if bslug and bslug in by_name:
+            target = by_name[bslug]
+        # 2. 'closes #N' where #N is a track member (same repo/product scope).
+        if target is None:
+            body = gh.get("body") or c.get("body") or ""
+            for n in _closes_numbers(body):
+                cand = num_to_track.get(n)
+                if cand is not None:
+                    target = cand
+                    break
+        if target is not None:
+            target.setdefault("members", []).append(cid)
+            already.add(cid)
+    return tracks
 
 
 def attach_tracks_to_cards(cards, tracks):
