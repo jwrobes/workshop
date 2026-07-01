@@ -41,7 +41,14 @@ import sys
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+import consolidate
+
 STALE_DAYS = 14
+# A merged PR anchors a track only if it merged within this window — recent
+# shipped work (possibly broken, worth revisiting). Older merges are archive,
+# not tracks. This is the deterministic scope that keeps the board usable (see
+# TRACK-MODEL.md); without it, ALL merge history floods consolidation (77 tracks).
+MERGED_RECENT_DAYS = 30
 DEFAULT_CONFIG = Path(__file__).parent / "fleet.config.json"
 
 
@@ -210,6 +217,14 @@ class Forge(ABC):
         {number, title, labels:[str], createdAt, url}. [] when none/unavailable."""
         return []
 
+    def list_merged_prs(self, repo_slug, limit=60):
+        """Return recently-MERGED PR dicts for repo_slug:
+        {number, title, headRefName, labels:[str], mergedAt, url}. [] when
+        none/unavailable. A merged *impl* PR is the 'shipped' signal (Phase 4a);
+        a closed-not-merged PR is NOT here (a closed spec-PR is normal, not
+        shipped). Default no-op so offline mode + GitLab stub keep working."""
+        return []
+
 
 class GitHubForge(Forge):
     """GitHub forge wrapping the `gh` CLI. This is the ONLY place `gh` is
@@ -286,7 +301,7 @@ class GitHubForge(Forge):
             return []
         code, out = run(["gh", "pr", "list", "--repo", repo_slug,
                          "--state", "open", "--limit", "100", "--json",
-                         "number,title,headRefName,labels,createdAt,isDraft,url"],
+                         "number,title,body,headRefName,labels,createdAt,isDraft,url"],
                         timeout=30)
         if code != 0 or not out:
             return []
@@ -295,6 +310,7 @@ class GitHubForge(Forge):
         except json.JSONDecodeError:
             return []
         return [{"number": p.get("number"), "title": p.get("title") or "",
+                 "body": p.get("body") or "",
                  "headRefName": p.get("headRefName") or "",
                  "labels": self._label_names(p), "createdAt": p.get("createdAt"),
                  "isDraft": bool(p.get("isDraft")), "url": p.get("url")}
@@ -306,7 +322,7 @@ class GitHubForge(Forge):
         # `gh issue list` excludes PRs by default (good — PRs come from list_open_prs).
         code, out = run(["gh", "issue", "list", "--repo", repo_slug,
                          "--state", "open", "--limit", "100", "--json",
-                         "number,title,labels,createdAt,url"], timeout=30)
+                         "number,title,body,labels,createdAt,url"], timeout=30)
         if code != 0 or not out:
             return []
         try:
@@ -314,9 +330,30 @@ class GitHubForge(Forge):
         except json.JSONDecodeError:
             return []
         return [{"number": i.get("number"), "title": i.get("title") or "",
+                 "body": i.get("body") or "",
                  "labels": self._label_names(i), "createdAt": i.get("createdAt"),
                  "url": i.get("url")}
                 for i in issues]
+
+    def list_merged_prs(self, repo_slug, limit=60):
+        if not repo_slug:
+            return []
+        code, out = run(["gh", "pr", "list", "--repo", repo_slug,
+                         "--state", "merged", "--limit", str(limit), "--json",
+                         "number,title,body,headRefName,labels,mergedAt,url"],
+                        timeout=30)
+        if code != 0 or not out:
+            return []
+        try:
+            prs = json.loads(out)
+        except json.JSONDecodeError:
+            return []
+        return [{"number": p.get("number"), "title": p.get("title") or "",
+                 "body": p.get("body") or "",
+                 "headRefName": p.get("headRefName") or "",
+                 "labels": self._label_names(p), "mergedAt": p.get("mergedAt"),
+                 "url": p.get("url")}
+                for p in prs]
 
 
 class GitLabForge(Forge):
@@ -747,37 +784,104 @@ def merge_forge_items_into_cards(cards, forge_items, now, repo_to_product=None):
     configured product get product=None (the unaffiliated bucket).
     Returns the (possibly extended) card list."""
     repo_to_product = repo_to_product or {}
-    # Index local cards by (repo, normalized slug) and (repo, normalized title).
+    # Index local cards by (repo, slug) and (repo, title) for repo-level matches.
+    # ALSO index product-level cards (repo=None) by (product, slug)/(product,
+    # title): a Magic Me plan card lives at product level, but the PRs/branches
+    # that implement it live in a member repo (claw-playbook). Without this, the
+    # impl/spec PR can't find its plan card and scatters as a `remote-only` card
+    # ("the real work is buried, not under Magic Me"). The product index lets a
+    # member-repo item attach to its product-level plan via the shared slug.
     by_slug, by_title = {}, {}
+    by_prod_slug, by_prod_title = {}, {}
     for c in cards:
         rk = norm(c.get("repo") or "")
         by_slug.setdefault((rk, norm(c.get("slug") or "")), []).append(c)
         by_title.setdefault((rk, norm(c.get("title") or "")), []).append(c)
+        # Product-level cards (no repo) are the canonical plan; index by product.
+        if c.get("level") == "product" and c.get("product"):
+            pk = c["product"]
+            by_prod_slug.setdefault((pk, norm(c.get("slug") or "")), []).append(c)
+            by_prod_title.setdefault((pk, norm(c.get("title") or "")), []).append(c)
 
     for it in forge_items:
         rk = norm(it.get("repo") or "")
-        # Collect candidate matches: branch-slug first, then title.
+        pk = repo_to_product.get(rk)  # product this item's repo belongs to
+        # Collect candidate matches, most-specific first:
+        #   1. repo-level card by branch-slug, 2. repo-level card by title,
+        #   3. product-level plan card by branch-slug, 4. by title.
         matches = []
         for cand in branch_slug_candidates(it.get("branch")):
             matches += by_slug.get((rk, cand), [])
         if not matches:
             matches += by_title.get((rk, norm(it.get("title") or "")), [])
+        if not matches and pk:
+            for cand in branch_slug_candidates(it.get("branch")):
+                matches += by_prod_slug.get((pk, cand), [])
+            if not matches:
+                matches += by_prod_title.get((pk, norm(it.get("title") or "")), [])
         # De-dupe candidate cards (a card could match by both slug and title).
         uniq = []
         for m in matches:
             if m not in uniq:
                 uniq.append(m)
 
+        is_merged_item = bool(it.get("merged"))
+        # `branch` (the PR head ref) is carried onto the card so strand-fact
+        # source detection (bosque/web/dev) has a real signal — the title alone
+        # can't distinguish a Bosque PR from a web one. Issues have branch=None.
         gh = {"kind": it.get("kind"), "number": it.get("number"),
               "title": it.get("title"), "url": it.get("url"),
-              "state": "OPEN", "labels": it.get("labels") or [],
-              "isDraft": bool(it.get("isDraft")), "createdAt": it.get("createdAt")}
+              "state": "MERGED" if is_merged_item else "OPEN",
+              "labels": it.get("labels") or [], "branch": it.get("branch"),
+              # The PR/issue description — the richest "what is this trying to do"
+              # signal for the strand detail panel (and the future LLM verdict).
+              # Truncated so a long body can't bloat the inlined status.json.
+              "body": (it.get("body") or "")[:2000],
+              "isDraft": bool(it.get("isDraft")), "createdAt": it.get("createdAt"),
+              "mergedAt": it.get("mergedAt")}
 
         if len(uniq) == 1:
             # Unambiguous match -> attach (no duplicate card).
-            uniq[0]["github"] = gh
+            card = uniq[0]
+            # Phase 4a: a merged impl PR is the 'shipped' signal — it wins over a
+            # prior open-PR attachment (a track can have both; shipped is later).
+            # Don't downgrade a card already marked shipped to an open PR.
+            already_shipped = card.get("shipped")
+            if is_merged_item:
+                card["github"] = gh
+                card["shipped"] = True
+                card["shipped_pr"] = it.get("number")
+                card["shipped_at"] = it.get("mergedAt")
+            elif not already_shipped:
+                card["github"] = gh
+        elif is_merged_item:
+            # An UNMATCHED merged PR is shipped work whose (often auto-generated)
+            # branch name matched no plan slug — e.g. `claude/trusting-bohr-...`.
+            # RECENT ones (<= MERGED_RECENT_DAYS) anchor a track — they must NOT
+            # vanish (that hid the real communications-hub feature #115/#117/#119).
+            # OLD merges are archive: dropped, so they don't flood consolidation
+            # (the 77-track wall). See TRACK-MODEL.md.
+            mage = _age_days(it.get("mergedAt"), now)
+            if mage is None or mage > MERGED_RECENT_DAYS:
+                continue
+            slug = (next(iter(branch_slug_candidates(it.get("branch"))), None)
+                    or norm(it.get("title") or "")) or str(it.get("number"))
+            cards.append({
+                "level": "repo",
+                "product": repo_to_product.get(norm(it.get("repo") or "")),
+                "repo": it.get("repo"),
+                "status": "shipped",
+                "title": it.get("title") or f"{it.get('repo')}#{it.get('number')}",
+                "path": it.get("url") or "", "slug": slug, "goal": None,
+                "body": "", "workbench": None, "source": "merged-unmatched",
+                "github": gh, "flags": [], "shipped": True,
+                "shipped_pr": it.get("number"), "shipped_at": it.get("mergedAt"),
+            })
+            continue
         else:
             # No match, OR ambiguous (>1) -> remote-only card (never false-merge).
+            # (Open PRs/issues with no local footprint ARE surfaced — that's
+            # genuine GitHub-only work; only merged history is suppressed above.)
             age = _age_days(it.get("createdAt"), now)
             is_spec = _is_build_spec(it.get("labels"), it.get("title"))
             dangling = bool(is_spec and not it.get("has_impl_pr")
@@ -832,7 +936,8 @@ def collect_forge_items(cfg, forge, products_out):
                 items.append({
                     "repo": repo.get("name") or slug.split("/")[-1],
                     "kind": "pr", "number": p.get("number"),
-                    "title": p.get("title"), "branch": p.get("headRefName"),
+                    "title": p.get("title"), "body": p.get("body"),
+                    "branch": p.get("headRefName"),
                     "labels": p.get("labels"), "createdAt": p.get("createdAt"),
                     "isDraft": p.get("isDraft"), "url": p.get("url"),
                     "has_impl_pr": has_impl,
@@ -841,10 +946,32 @@ def collect_forge_items(cfg, forge, products_out):
                 items.append({
                     "repo": repo.get("name") or slug.split("/")[-1],
                     "kind": "issue", "number": i.get("number"),
-                    "title": i.get("title"), "branch": None,
+                    "title": i.get("title"), "body": i.get("body"), "branch": None,
                     "labels": i.get("labels"), "createdAt": i.get("createdAt"),
                     "isDraft": False, "url": i.get("url"),
                     "has_impl_pr": False,
+                })
+            # Phase 4a: recently-MERGED impl PRs are the 'shipped' signal. A
+            # merged *impl* PR (NOT a build-spec PR) attaches to its track/card
+            # and marks it shipped. A merged build-spec PR is excluded — merging
+            # a spec isn't shipping the feature. (Closed-not-merged PRs never get
+            # here, so a closed spec-PR is correctly NOT treated as shipped.)
+            try:
+                merged = forge.list_merged_prs(slug)
+            except NotImplementedError:
+                merged = []
+            for p in merged:
+                if _is_build_spec(p.get("labels"), p.get("title")):
+                    continue
+                items.append({
+                    "repo": repo.get("name") or slug.split("/")[-1],
+                    "kind": "pr", "number": p.get("number"),
+                    "title": p.get("title"), "body": p.get("body"),
+                    "branch": p.get("headRefName"),
+                    "labels": p.get("labels"), "createdAt": p.get("mergedAt"),
+                    "isDraft": False, "url": p.get("url"),
+                    "has_impl_pr": False, "merged": True,
+                    "mergedAt": p.get("mergedAt"),
                 })
     return items
 
@@ -1055,7 +1182,46 @@ def main():
     ap.add_argument("--no-local", action="store_true",
                     help="forge-only mode: product->repo->PR+Kanban from the API, "
                          "no local worktrees (cloud-portable)")
+    ap.add_argument("--consolidate", action="store_true",
+                    help="run the LLM work-track consolidation pass (Phase 5), "
+                         "caching tracks.json. Normal runs reuse the cache so "
+                         "they stay fast + offline; corrections always apply.")
+    ap.add_argument("--triage", action="store_true",
+                    help="PASS 1: LLM-triage the Ungrouped strays vs existing "
+                         "tracks — auto-attach high-confidence, suggest the rest, "
+                         "write llm-runlog.json. On-demand (reuses cache otherwise).")
+    ap.add_argument("--analyze", action="store_true",
+                    help="PASS 2: LLM per-track analysis — headline verdict, "
+                         "completion (LLM gut % + computed %), cleanup list, "
+                         "relationships, per-strand status -> verdicts.json. "
+                         "Runs after triage so it sees final membership.")
+    ap.add_argument("--rollup", action="store_true",
+                    help="PASS 3: product/fleet rollup over the Pass-2 verdicts "
+                         "(consumes verdicts.json, does not re-analyze).")
+    ap.add_argument("--llm-all", action="store_true",
+                    help="run every LLM pass in order (triage -> analyze -> "
+                         "rollup). Order matters: triage changes membership before "
+                         "analysis; rollup consumes analysis.")
+    ap.add_argument("--triage-fixture", default=None,
+                    help="TEST ONLY: a JSON file of canned triage proposals to "
+                         "feed the triage pass INSTEAD of shelling out to claude "
+                         "(the injected-runner discipline, at the CLI boundary). "
+                         "Implies --triage; keeps e2e gates offline/deterministic.")
+    ap.add_argument("--analyze-fixture", default=None,
+                    help="TEST ONLY: a JSON file mapping track name -> canned "
+                         "analyze payload, fed to the analyze pass instead of "
+                         "claude. Implies --analyze; keeps e2e offline.")
     args = ap.parse_args()
+    if args.triage_fixture:
+        args.triage = True
+    if args.analyze_fixture:
+        args.analyze = True
+    # --llm-all is the convenience that runs each built pass in order (order
+    # matters: triage changes membership before analyze; rollup consumes analyze).
+    if args.llm_all:
+        args.triage = True
+        args.analyze = True
+        args.rollup = True
 
     try:
         cfg = load_config(args.config)
@@ -1166,11 +1332,20 @@ def main():
                     flags.append("no-workbench-pair")
                 if not in_workspace_dir:
                     flags.append("orphan")
-            # NOTE (v1-faithful behavior): under --no-gh, `pr` is always None, so a
-            # dirty/ahead-unmerged worktree is flagged `unprotected` even if an open
-            # PR would protect it online. Offline mode cannot know PR state; this
-            # matches the v1 engine. Treat offline `unprotected` as "PR state unknown".
-            if dirty or (ahead and not pr and merged is False):
+            # `unprotected` means FEATURE-BRANCH work at risk (uncommitted or
+            # unmerged-ahead with no PR safety net). It must NOT fire on a
+            # default-branch (main/master) checkout: a dirty main clone is just
+            # local edits on main, not feature work about to be lost — flagging
+            # it buried the real actionable items under ~7 false positives.
+            # A dirty default branch gets the quieter `dirty-default-branch`.
+            is_default_branch = base is not None and branch == base
+            # NOTE (v1-faithful): under --no-gh, `pr` is always None, so an
+            # ahead-unmerged feature branch reads `unprotected` even if an open
+            # PR would protect it online. Offline can't know PR state.
+            if is_default_branch:
+                if dirty:
+                    flags.append("dirty-default-branch")
+            elif dirty or (ahead and not pr and merged is False):
                 flags.append("unprotected")
             if kind == "clone" and behind:
                 flags.append("behind-origin")
@@ -1244,6 +1419,124 @@ def main():
     for c in kanban:
         c["readiness"] = card_readiness(c)
 
+    # Phase 5: work-track consolidation. The LLM pass is on-demand (--consolidate)
+    # and cached to tracks.json so normal runs stay fast + offline. User
+    # corrections (track-overrides.json, downloaded from the UI) ALWAYS win and
+    # are applied every run — so a wrong grouping you fixed stays fixed, fully
+    # reversible by editing/deleting the file.
+    repo_dir = Path(__file__).parent
+    if args.consolidate:
+        llm_tracks = consolidate.run_llm_consolidation(kanban)
+        consolidate.save_tracks(out_dir, llm_tracks)
+        print(f"consolidate: {len(llm_tracks)} LLM track(s) -> {out_dir}/tracks.json")
+
+    # A single deterministic build of tracks from the cache + overrides. Called
+    # again after triage so auto-attaches take effect (the "re-stamp" step).
+    def _build_tracks():
+        # Clear any track stamp from a PRIOR build so this one recomputes
+        # membership from scratch. Critical: after a triage auto-attach we build
+        # AGAIN; the kanban cards are mutated in place, so a stray stamped in
+        # build 1 would make build 2's attach_strays_to_tracks skip it (it skips
+        # already-stamped cards) — silently dropping e.g. #113 from its track.
+        for c in kanban:
+            c["track"] = None
+        tks = consolidate.load_tracks(out_dir)
+        ovr = consolidate.load_overrides(out_dir, repo_dir)
+        tks = consolidate.apply_overrides(tks, ovr)
+        # Deterministic stray-attach: a loose card whose build-<slug> branch
+        # matches a track name, or that 'closes #<member>', joins that track
+        # (catches a product-level PR the LLM pass never saw). Overrides won first.
+        consolidate.attach_strays_to_tracks(kanban, tks)
+        consolidate.attach_tracks_to_cards(kanban, tks)
+        # Archive is a soft, reversible flag (an overrides `archive` list): mark
+        # the cards so the UI drops them from board/pipeline/Ungrouped but keeps
+        # them in status.json. Recomputed each run -> unarchive just works.
+        consolidate.stamp_archived(kanban, ovr)
+        return tks, ovr
+
+    tracks, overrides = _build_tracks()
+
+    # PASS 1 — TRIAGE (on-demand, --triage / --llm-all). Sweep the Ungrouped
+    # forge-backed strays against the existing tracks; HIGH-confidence attaches
+    # auto-apply (folded into track-overrides.json as _source llm-triage) and we
+    # RE-BUILD so membership reflects them before facts are stamped; medium/low +
+    # all create/archive become suggestions surfaced in the UI. A change-log
+    # (llm-runlog.json) records what happened. Best-effort + offline-safe.
+    if getattr(args, "triage", False):
+        ungrouped = [c for c in kanban
+                     if not c.get("track") and not c.get("archived")
+                     and (c.get("github") or {}).get("number") is not None]
+        # Injected runner (offline test) vs the real claude CLI. The fixture is
+        # a canned triage payload — the same shape run_triage's runner returns.
+        fixture_runner = None
+        if args.triage_fixture:
+            _fx = Path(args.triage_fixture).read_text()
+            fixture_runner = lambda _prompt: _fx
+        triage = consolidate.run_triage(ungrouped, tracks, cards=kanban,
+                                        runner=fixture_runner)
+        if triage["auto"]:
+            overrides = consolidate.apply_triage_auto(overrides, triage["auto"])
+            # Persist so the auto-attaches are durable + editable like any
+            # correction (this is the file Jonathan downloads/inspects/undoes).
+            (out_dir / consolidate.OVERRIDES_FILE).write_text(
+                json.dumps(overrides, indent=2))
+            tracks, overrides = _build_tracks()   # re-stamp: attaches take effect
+        runlog = consolidate.build_runlog(now.isoformat(timespec="seconds"), triage)
+        consolidate.save_runlog(out_dir, runlog)
+        print(f"triage: {len(triage['auto'])} auto-attach(es), "
+              f"{len(triage['suggestions'])} suggestion(s) -> "
+              f"{out_dir}/{consolidate.RUNLOG_FILE}")
+
+    # Phase 1: deterministic strand facts. Stamp each track with per-member
+    # role/state/source/stage + a fact summary so the unified card renders
+    # layer 1 (facts) with no LLM. See UNIFIED-CARD-MODEL.md. Must run BEFORE
+    # analyze (Pass 2 reads members_detail).
+    consolidate.stamp_track_facts(tracks, kanban)
+
+    # PASS 2 — TRACK-ANALYSIS (on-demand, --analyze / --llm-all). Per multi-member
+    # track: headline verdict + completion (LLM gut % + computed % + agreement
+    # confidence) + cleanup + relationships + per-strand status -> verdicts.json
+    # (kept SEPARATE from tracks.json). Runs after triage so it sees final
+    # membership. Best-effort: a failed track leaves its prior verdict intact.
+    multi = [t for t in tracks if len(t.get("members") or []) >= 2]
+    if getattr(args, "analyze", False):
+        analyze_fx = None
+        if args.analyze_fixture:
+            analyze_fx = json.loads(Path(args.analyze_fixture).read_text())
+        verdicts = consolidate.load_verdicts(out_dir)
+        n_ok = 0
+        for t in multi:
+            runner = None
+            if analyze_fx is not None:
+                # Canned per-track payload (offline e2e); a track absent from the
+                # fixture is simply skipped (leaves any prior verdict intact).
+                payload = analyze_fx.get(t["name"])
+                if payload is None:
+                    continue
+                runner = (lambda _p, _pl=payload: json.dumps(_pl))
+            v = consolidate.run_analyze(t, runner=runner)
+            if v is not None:
+                verdicts[t["name"]] = v
+                n_ok += 1
+        consolidate.save_verdicts(out_dir, verdicts)
+        print(f"analyze: {n_ok}/{len(multi)} track verdict(s) -> "
+              f"{out_dir}/{consolidate.VERDICTS_FILE}")
+
+    # PASS 3 — ROLLUP (on-demand, --rollup / --llm-all). CONSUMES the Pass-2
+    # verdicts (never re-invokes the LLM per track): a product/fleet picture —
+    # per-track completion + a near-done/mid/early/stuck bucket distribution.
+    if getattr(args, "rollup", False):
+        verdicts = consolidate.load_verdicts(out_dir)
+        rollup = consolidate.build_rollup(multi, verdicts)
+        verdicts["rollup"] = rollup
+        consolidate.save_verdicts(out_dir, verdicts)
+        print(f"rollup: {rollup['counts']} across {len(rollup['tracks'])} track(s)")
+
+    # Stamp cached verdicts onto tracks so the template reads t.verdict (offline-
+    # safe: no verdict -> the 'not run' placeholder). Also surface the rollup.
+    _verdicts = consolidate.load_verdicts(out_dir)
+    consolidate.stamp_verdicts(tracks, _verdicts)
+
     status = {
         "generated_at": now.isoformat(timespec="seconds"),
         "mode": "forge-only" if not local else "local",
@@ -1252,6 +1545,13 @@ def main():
         "unaffiliated": unaffiliated,
         "kanban": kanban,
         "initiatives": initiatives,
+        "tracks": tracks,
+        # The most recent LLM run's change-log ('Since last analysis' panel).
+        # None until a --triage/--llm-all run has written llm-runlog.json.
+        "llm_runlog": consolidate.load_runlog(out_dir),
+        # Pass-3 product/fleet rollup (per-track completion + bucket dist), or
+        # None if --rollup hasn't run. Per-track verdicts are stamped on tracks.
+        "rollup": _verdicts.get("rollup"),
     }
 
     (out_dir / "status.json").write_text(json.dumps(status, indent=2))

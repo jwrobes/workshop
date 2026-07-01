@@ -1,0 +1,24 @@
+{
+  "proposals": [
+    {
+      "id": "claw-playbook#84",
+      "action": "attach",
+      "track": "email-triage",
+      "confidence": "high",
+      "reason": "LLM fallback for the email parsers is part of the email-triage effort (fuzzy: no closes-ref, auto-named branch)"
+    },
+    {
+      "id": "claw-playbook#85",
+      "action": "attach",
+      "track": "email-triage",
+      "confidence": "medium",
+      "reason": "bosque Dockerfile deps might be for the email-triage build — unsure"
+    },
+    {
+      "id": "yogada-shop#7",
+      "action": "archive",
+      "confidence": "high",
+      "reason": "explicitly deferred to Phase 2 — declutter"
+    }
+  ]
+}

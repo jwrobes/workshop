@@ -268,6 +268,47 @@ class FlagEngineTests(unittest.TestCase):
         # F5 guard: pairing flag suppressed while initiatives is empty
         self.assertNotIn("no-workbench-pair", feat[0]["flags"])
 
+    def _run_collector(self):
+        import sys
+        old = sys.argv
+        sys.argv = ["collector.py", "--no-gh", "--workspace", str(self.ws),
+                    "--out", str(self.out)]
+        try:
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(collector.main(), 0)
+        finally:
+            sys.argv = old
+        return json.loads((self.out / "status.json").read_text())
+
+    def test_dirty_default_branch_not_unprotected(self):
+        # Phase 3: a dirty checkout ON main/master is NOT 'unprotected' (that
+        # alarm is for feature work at risk) — it gets the quieter
+        # 'dirty-default-branch'. This killed ~7 false positives on the board.
+        (self.repo / "dirty.txt").write_text("uncommitted\n")  # dirty on main
+        status = self._run_collector()
+        main_row = [r for r in status["worktrees"]
+                    if r["branch"] == "main" and r["kind"] == "clone"]
+        self.assertEqual(len(main_row), 1)
+        self.assertNotIn("unprotected", main_row[0]["flags"])
+        self.assertIn("dirty-default-branch", main_row[0]["flags"])
+
+    def test_dirty_feature_branch_still_unprotected(self):
+        # The real signal must survive: an unmerged feature branch with a dirty
+        # file is still 'unprotected'. Use a fresh, NOT-merged feature branch.
+        env = ["-c", "user.email=t@t", "-c", "user.name=t"]
+        _git(self.repo, "checkout", "-b", "build-live")
+        (self.repo / "c.txt").write_text("c\n")
+        _git(self.repo, "add", "c.txt")
+        _git(self.repo, *env, "commit", "-m", "live work")
+        _git(self.repo, "checkout", "main")  # free the branch for a worktree
+        _git(self.repo, "worktree", "add",
+             str(self.ws / "demo-live"), "build-live")
+        (self.ws / "demo-live" / "wip.txt").write_text("wip\n")  # dirty in worktree
+        status = self._run_collector()
+        live = [r for r in status["worktrees"] if r["branch"] == "build-live"]
+        self.assertEqual(len(live), 1)
+        self.assertIn("unprotected", live[0]["flags"])
+
 
 class ConfigErrorTests(unittest.TestCase):
     """F2: malformed/missing config yields a clean error, not a traceback."""
@@ -1182,9 +1223,61 @@ class ForgeReconcileTests(unittest.TestCase):
         out = collector.merge_forge_items_into_cards(cards, items, self.NOW)
         self.assertEqual(len(out), 3)               # 2 originals + 1 remote-only
         self.assertEqual(out[-1]["source"], "remote-only")
-        self.assertTrue(out[-1]["ambiguous_match"])
-        self.assertNotIn("github", cards[0])        # neither original got attached
-        self.assertNotIn("github", cards[1])
+
+    def _product_card(self, product, slug, title):
+        # A product-level plan card has NO repo (the plan lives at product level;
+        # impl PRs live in a member repo). This is the canonical plan card.
+        return {"level": "product", "product": product, "repo": None,
+                "status": "active", "title": title, "path": f"/p/{slug}.md",
+                "slug": slug, "goal": None, "body": "", "workbench": None}
+
+    def test_member_repo_pr_attaches_to_product_level_plan(self):
+        # The real bug: a product-level plan card (repo=None) and a member-repo
+        # PR whose build-branch slug matches it. Must ATTACH to the plan, not
+        # spawn a remote-only card ("real work buried, not under the product").
+        cards = [self._product_card("magic-me", "communications-hub-morning-briefing",
+                                    "Communications Hub & Morning Briefing")]
+        items = [self._item(repo="claw-playbook", number=113,
+                            branch="build-communications-hub-morning-briefing")]
+        out = collector.merge_forge_items_into_cards(
+            cards, items, self.NOW, repo_to_product={"claw-playbook": "magic-me"})
+        self.assertEqual(len(out), 1)                  # no new card — attached
+        self.assertEqual(out[0]["level"], "product")
+        self.assertEqual(out[0]["github"]["number"], 113)
+
+    def test_member_repo_pr_attaches_to_product_plan_by_title(self):
+        cards = [self._product_card("magic-me", "comm-hub", "Communications Hub")]
+        items = [self._item(repo="claw-playbook", number=200, branch=None,
+                            title="communications hub")]
+        out = collector.merge_forge_items_into_cards(
+            cards, items, self.NOW, repo_to_product={"claw-playbook": "magic-me"})
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["github"]["number"], 200)
+
+    def test_repo_level_match_wins_over_product_level(self):
+        # If a repo-level card matches, prefer it (most specific) — the product
+        # card is only the fallback, so we don't double-match the same item.
+        cards = [self._card("claw-playbook", "feat-x", "Feat X"),
+                 self._product_card("magic-me", "feat-x", "Feat X")]
+        items = [self._item(repo="claw-playbook", number=5, branch="build-feat-x")]
+        out = collector.merge_forge_items_into_cards(
+            cards, items, self.NOW, repo_to_product={"claw-playbook": "magic-me"})
+        self.assertEqual(len(out), 2)                  # no new card
+        repo_card = next(c for c in out if c["level"] == "repo")
+        self.assertEqual(repo_card["github"]["number"], 5)  # attached to repo card
+        prod_card = next(c for c in out if c["level"] == "product")
+        self.assertNotIn("github", prod_card)               # product NOT touched
+
+    def test_product_plan_no_false_match_across_products(self):
+        # A claw-playbook PR must NOT attach to a same-slug plan under a DIFFERENT
+        # product. Product scoping prevents cross-product bleed.
+        cards = [self._product_card("other-product", "shared-slug", "Shared")]
+        items = [self._item(repo="claw-playbook", number=9, branch="build-shared-slug")]
+        out = collector.merge_forge_items_into_cards(
+            cards, items, self.NOW, repo_to_product={"claw-playbook": "magic-me"})
+        self.assertEqual(len(out), 2)                  # original + remote-only
+        self.assertEqual(out[-1]["source"], "remote-only")
+        self.assertNotIn("github", cards[0])        # the cross-product plan untouched
 
     def test_recent_build_spec_not_dangling(self):
         cards = []

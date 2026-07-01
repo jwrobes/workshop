@@ -165,13 +165,67 @@ function mdToHtml(src){
 function $(id){return document.getElementById(id);}
 function slug(s){return String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');}
 
-const STATE={level:'fleet',productId:null,repoId:null,planId:null,doneOpen:false,mapExpanded:{},mapAll:false};
+const STATE={level:'fleet',productId:null,repoId:null,planId:null,doneOpen:false,mapExpanded:{},mapAll:false,trackOpen:{},trackName:null,strandOpen:{},archivedOpen:false};
 
 function products(){return (DATA&&DATA.products)||[];}
 function kanban(){return (DATA&&DATA.kanban)||[];}
 function worktrees(){return (DATA&&DATA.worktrees)||[];}
 function unaffiliated(){return (DATA&&DATA.unaffiliated)||[];}
-function plansFor(pid){return kanban().filter(c=>c.product===pid);}
+// Board/pipeline/repo views show plan-bearing cards INCLUDING shipped merged
+// work. `merged-unmatched` cards (shipped PRs whose branch matched no plan) have
+// status 'shipped' — they belong in the SHIPPED pipeline stage + the (collapsed)
+// Completed column, NOT in ACTIVE/BACKLOG, so they don't flood the board. They
+// also appear in the Work-tracks view. (Earlier they were excluded entirely,
+// which wrongly showed SHIPPED: 0 on a repo that had 28 merged PRs.)
+function isMergedUnmatched(c){return c.source==='merged-unmatched';}
+// Archive (Pass-1 triage): a soft, reversible flag (collector stamps c.archived
+// from the overrides `archive` list). Archived cards are DROPPED from the board /
+// pipeline / Ungrouped surfaces so they don't clutter — but they stay in
+// DATA.kanban, so the Work-tracks "Archived" section can list them + unarchive.
+function archivedCards(){return kanban().filter(c=>c.archived);}
+function plansFor(pid){return kanban().filter(c=>c.product===pid&&!c.archived);}
+// Work-tracks (Phase 5): consolidated groupings. Mirrors collector's _card_id.
+function tracks(){return (DATA&&DATA.tracks)||[];}
+function tracksMulti(){return tracks().filter(t=>(t.members||[]).length>=2);}
+// A track belongs to a product if any member card is in that product (used to
+// scope the Pass-3 rollup to a product page).
+function tracksInProduct(t,pid){return (t.members||[]).some(id=>{const c=cardById(id);return c&&c.product===pid;});}
+function trackByName(name){return tracks().find(t=>t.name===name)||null;}
+// Which board column a unified track card lands in. Driven by the STRANDS'
+// collective activity, not the furthest-along stage: a track is Completed only
+// when EVERY strand is done; any active (in-flight) strand -> Active; else any
+// backlog (queued, not-started) strand -> Backlog. So a track with 3 shipped PRs
+// but an open spec + open issues is Active (live work), not Completed. The
+// collector computes this as facts.placement (consolidate.strand_activity).
+function trackColumn(t){
+  const pl=(t.facts||{}).placement;
+  if(pl==='active'||pl==='backlog'||pl==='completed') return pl;
+  // Fallback for tracks stamped before placement existed.
+  return ((t.facts||{}).furthest_stage==='shipped')?'completed':'active';
+}
+function cardId(c){
+  // Mirrors collector _card_id. A product-level PR has repo=null -> use
+  // product#number (e.g. magic-me#113), not the ambiguous ?#113.
+  const n=(c.github||{}).number;
+  const scope=c.repo||c.product||'?';
+  if(n!=null) return scope+'#'+n;
+  return scope+'/'+(c.slug||'');
+}
+function cardById(id){return kanban().find(c=>cardId(c)===id)||null;}
+// Pending UI corrections live in localStorage until the user downloads them as
+// track-overrides.json (no server). Shape mirrors collector.apply_overrides.
+function loadCorr(){try{return JSON.parse(localStorage.getItem('fleetTrackOverrides')||'{}');}catch(e){return {};}}
+function saveCorr(o){localStorage.setItem('fleetTrackOverrides',JSON.stringify(o));}
+// A HUMAN reassign: set the target AND clear any `_source:'llm-triage'` tag on
+// that id, so this becomes a human-owned correction. Critical for "human wins":
+// otherwise the next triage run sees the id still marked llm-triage and would
+// revert the human's track back to the LLM's proposal.
+function humanReassign(o,id,track){o.reassign=o.reassign||{};o.reassign[id]=track;if(o._source&&o._source[id])delete o._source[id];}
+// The LLM change-log ("Since last analysis" panel). Keyed by the run's
+// generated_at so a dismiss sticks until the NEXT run overwrites the log.
+function llmRunlog(){return (DATA&&DATA.llm_runlog)||null;}
+function runlogDismissed(){const r=llmRunlog();return !!r&&localStorage.getItem('fleetRunlogDismissed')===(r.generated_at||'');}
+function dismissRunlog(){const r=llmRunlog();if(r)localStorage.setItem('fleetRunlogDismissed',r.generated_at||'');}
 
 function worktreeForCard(card){
   const t=(card.title||'').toLowerCase();
@@ -265,6 +319,9 @@ function planStage(card){
     return {key:'spec',stuck:null};
   }
   if(card.status==='completed'||card.status==='done') return {key:'shipped',stuck:null};
+  // Phase 4a: a merged IMPL PR attached by the collector ships the card, even
+  // when the plan card has no local worktree (the common product-plan case).
+  if(card.shipped) return {key:'shipped',stuck:null};
   if(card.status==='blocked') return {key:'executing',stuck:'6d'};
   if(card.status==='backlog') return {key:'spec',stuck:null};
   const w=worktreeForCard(card),pr=(w&&w.pr)||{};
@@ -344,7 +401,11 @@ function buildPrompt(card,prod,mode){
 
 function goTo(level,productId,planId,repoId){
   STATE.level=level;STATE.productId=productId??null;STATE.planId=planId??null;STATE.repoId=repoId??null;
-  STATE.doneOpen=false;STATE.mapExpanded={};STATE.mapAll=false;
+  STATE.doneOpen=false;STATE.mapExpanded={};STATE.mapAll=false;STATE.trackOpen={};STATE.strandOpen={};
+  // The track detail view carries the track name in the planId slot (a track
+  // has no plan). Lift it to STATE.trackName so crumbs + render read it cleanly.
+  if(level==='track'){STATE.trackName=planId??null;STATE.planId=null;}
+  else STATE.trackName=null;
   // When opening a plan, resolve its real product/repo up front so crumbs +
   // back-link are correct even when navigated from the fleet map (null product).
   if(level==='plan'){
@@ -359,6 +420,11 @@ function renderCrumbs(){
   const c=$('crumbs');c.innerHTML='';
   const root=el('<button class="crumb root">fleet</button>');root.onclick=()=>goTo('fleet');c.appendChild(root);
   if(STATE.level==='fleet') return;
+  if(STATE.level==='tracks'){
+    c.appendChild(el('<span class="sep">/</span>'));
+    c.appendChild(el('<button class="crumb" style="color:#23211c">work tracks</button>'));
+    return;
+  }
   const pid=STATE.productId;
   const pname=pid==='unaffiliated'?'unaffiliated':((products().find(p=>p.id===pid)||{}).name||pid);
   c.appendChild(el('<span class="sep">/</span>'));
@@ -370,10 +436,14 @@ function renderCrumbs(){
     rb.onclick=()=>goTo('repo',pid,null,STATE.repoId);c.appendChild(rb);
   }
   if(STATE.level==='plan'){c.appendChild(el('<span class="sep">/</span>'));c.appendChild(el('<button class="crumb" style="color:#23211c">'+esc(STATE.planId)+'</button>'));}
+  if(STATE.level==='track'){c.appendChild(el('<span class="sep">/</span>'));c.appendChild(el('<button class="crumb" style="color:#23211c">'+esc(STATE.trackName)+'</button>'));}
 }
 
 // ---------- PIPELINE MAP (shared) ----------
-function inFlight(plans){return plans.filter(c=>c.status==='active'||c.status==='backlog'||c.status==='blocked'||isRemoteOnly(c));}
+// Cards the pipeline map shows: in-flight work PLUS shipped work (so the SHIPPED
+// stage reflects reality — a repo that merged 28 PRs must not read SHIPPED 0).
+// planStage() routes each to its stage; shipped cards land only in SHIPPED.
+function inFlight(plans){return plans.filter(c=>c.status==='active'||c.status==='backlog'||c.status==='blocked'||c.shipped||c.status==='completed'||c.status==='done'||isRemoteOnly(c));}
 function mapChip(card,prod){
   const pm=pathMeta(planPath(card)),stg=planStage(card),w=worktreeForCard(card),pr=(w&&w.pr)||{};
   const a=cardAttention(card);
@@ -396,20 +466,73 @@ function mapChip(card,prod){
   chip.onclick=()=>goTo('plan',pid,card.title,repoForCard(card));
   return chip;
 }
+// Pipeline ITEMS: the map shows a TRACK as ONE unit at its track_stage (all
+// its strands count once), plus each untracked card at its own planStage. So a
+// 6-strand track is a single chip, consistent with the track-aware board.
+function pipelineItems(plans){
+  const items=[];const seenTrack={};
+  plans.forEach(c=>{
+    const tn=c.track;
+    if(tn){
+      const t=trackByName(tn);
+      if(t&&(t.members||[]).length>=2){
+        if(!seenTrack[tn]){seenTrack[tn]=1;
+          items.push({kind:'track',track:t,
+            stageKey:((t.facts||{}).pipeline_stage)||'spec'});}
+        return;  // strand represented by the track item, not its own chip
+      }
+    }
+    items.push({kind:'card',card:c,stageKey:planStage(c).key});
+  });
+  return items;
+}
+// Does a pipeline item need attention / is it stuck? For a track, aggregate
+// across its member cards (so the stage's status reflects the whole track).
+function itemStuck(it){
+  if(it.kind==='card') return !!planStage(it.card).stuck;
+  return (it.track.members||[]).some(id=>{const c=cardById(id);return c&&planStage(c).stuck;});
+}
+function itemAttention(it){
+  if(it.kind==='card') return !!cardAttention(it.card);
+  return (it.track.members||[]).some(id=>{const c=cardById(id);return c&&cardAttention(c);});
+}
 function pipelineGroups(plans){
+  const items=pipelineItems(plans);
   return STAGES.map(s=>{
-    const ps=plans.filter(p=>planStage(p).key===s.key);
-    const stuckN=ps.filter(p=>planStage(p).stuck).length;
-    const attnN=ps.filter(p=>cardAttention(p)).length;
+    const its=items.filter(it=>it.stageKey===s.key);
+    const stuckN=its.filter(itemStuck).length;
+    const attnN=its.filter(itemAttention).length;
     let statusLabel,statusColor,statusDot,statusAnim='',hasFlag=true;
     if(stuckN){statusLabel=stuckN+' stuck';statusColor='#b5701f';statusDot='#d99a2c';statusAnim='animation:pulseAmber 1.8s ease-in-out infinite;';}
     else if(attnN){statusLabel=attnN+' needs you';statusColor='#a9762a';statusDot='#cf962f';}
-    else if(ps.length){statusLabel='on track';statusColor='#6f8a78';statusDot='#9fc0a8';hasFlag=false;}
+    else if(its.length){statusLabel='on track';statusColor='#6f8a78';statusDot='#9fc0a8';hasFlag=false;}
     else{statusLabel='empty';statusColor='#bcb3a1';statusDot='#dcd3c2';hasFlag=false;}
     const isOpen=STATE.mapAll||!!STATE.mapExpanded[s.key];
-    return {key:s.key,name:s.name,color:s.color,count:ps.length,plans:ps,
+    return {key:s.key,name:s.name,color:s.color,count:its.length,items:its,
       statusLabel,statusColor,statusDot,statusAnim,hasFlag,isOpen};
   });
+}
+// Render a pipeline item — either a normal card chip or a TRACK chip.
+function mapItemChip(it,prod){
+  return it.kind==='track'?trackMapChip(it.track,prod):mapChip(it.card,prod);
+}
+// A track as a single pipeline chip: shows track identity + fact summary; opens
+// the track detail page (where the strands live), not a lone plan.
+function trackMapChip(t,prod){
+  const f=t.facts||{};
+  const chip=el('<button class="pmchip" data-pm-track="'+attr(t.name)+'" data-path="track" title="'+attr(t.name)+'"></button>');
+  chip.style.borderLeft='3px solid #b08d4e';
+  let meta='<div style="display:flex;align-items:center;gap:5px;margin-top:6px;flex-wrap:wrap">'
+    +'<span class="mono" style="font-size:8px;letter-spacing:.06em;text-transform:uppercase;color:#7a6a3f;background:#efe7d2;padding:1px 5px;border-radius:4px">track</span>'
+    +'<span class="mono" style="font-size:8.5px;color:#8c8576">'+(f.count||0)+' strands'+(f.merged?' · '+f.merged+' merged':'')+'</span>';
+  if(itemStuck({kind:'track',track:t})) meta+='<span class="mono" style="display:inline-flex;align-items:center;gap:3px;font-size:8.5px;color:#b5701f"><span style="width:5px;height:5px;border-radius:50%;background:#d99a2c;animation:pulseAmber 1.8s ease-in-out infinite"></span>stuck</span>';
+  else if(itemAttention({kind:'track',track:t})) meta+='<span style="width:6px;height:6px;border-radius:50%;background:#cf962f;box-shadow:0 0 0 2.5px rgba(207,150,47,.16)"></span>';
+  meta+='</div>';
+  chip.innerHTML='<div class="mono" style="font-size:10.5px;color:#33302a;line-height:1.25;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(t.name)+'</div>'+meta;
+  const pid=(prod&&prod.id)||STATE.productId;
+  const repoName=STATE.repoId||((t.members_detail&&t.members_detail[0]&&(t.members_detail[0].id||'').split('#')[0])||null);
+  chip.onclick=()=>goTo('track',pid,t.name,repoName);
+  return chip;
 }
 function renderMap(scopeLabel,plans,prod){
   const wrap=el('<section class="pmwrap" data-region="pipeline-map" data-scope="'+attr(scopeLabel)+'"></section>');
@@ -441,7 +564,7 @@ function renderMap(scopeLabel,plans,prod){
     const detail=el('<div class="pmdetail"></div>');
     groups.forEach(g=>{
       const col=el('<div class="pmcol" data-stage-cards="'+g.key+'"></div>');
-      if(g.isOpen) g.plans.forEach(c=>col.appendChild(mapChip(c,prod)));
+      if(g.isOpen) g.items.forEach(it=>col.appendChild(mapItemChip(it,prod)));
       detail.appendChild(col);
     });
     box.appendChild(detail);wrap.appendChild(box);
@@ -453,7 +576,7 @@ function renderMap(scopeLabel,plans,prod){
       stage.appendChild(el('<div style="position:absolute;left:-8px;top:14px;width:13px;height:13px;border-radius:50%;background:#fffdf9;border:3px solid '+g.color+'"></div>'));
       stage.appendChild(el('<div style="display:flex;align-items:baseline;gap:8px;margin-bottom:8px;flex-wrap:wrap"><span class="mono" style="font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:'+g.color+'">'+g.name+'</span><span class="mono" style="font-size:10px;color:#bcb3a1">'+g.count+'</span>'+(g.hasFlag?'<span class="mono" style="font-size:9px;color:'+g.statusColor+'">· '+g.statusLabel+'</span>':'')+'</div>'));
       const stk=el('<div class="colstack" style="gap:7px"></div>');
-      g.plans.forEach(c=>stk.appendChild(mapChip(c,prod)));
+      g.items.forEach(it=>stk.appendChild(mapItemChip(it,prod)));
       stage.appendChild(stk);box.appendChild(stage);
     });
     wrap.appendChild(box);
@@ -484,17 +607,117 @@ function attnPanel(plans,onOpen){
 }
 
 // ---------- L1 FLEET ----------
+// The "Since last analysis" change-log panel (Pass-1 triage). Shows what the
+// last LLM run DID — auto-attaches (already applied, undoable) vs suggestions
+// (pending your review) — so LLM state changes are never silent. Dismissible;
+// returns null when there's no run, no changes, or it was dismissed.
+function runlogPanel(){
+  const r=llmRunlog();
+  if(!r||!(r.changes||[]).length||runlogDismissed()) return null;
+  const auto=(r.changes||[]).filter(c=>c.kind==='auto');
+  const sugg=(r.changes||[]).filter(c=>c.kind==='suggest');
+  const at=(r.generated_at||'').replace('T',' ').slice(11,16);
+  const box=el('<div data-region="llm-runlog" data-auto="'+auto.length+'" data-suggestions="'+sugg.length+'" style="margin:22px 0 4px;border:1px solid #d9c9a0;border-radius:10px;background:linear-gradient(#fffdf6,#fdf6e7);overflow:hidden"></div>');
+  const head=el('<div style="display:flex;align-items:center;gap:11px;padding:12px 16px;border-bottom:1px solid #ecdfbf"></div>');
+  head.innerHTML='<span class="mono" style="font-size:10px;letter-spacing:.13em;text-transform:uppercase;color:#a9762a">LLM triage</span>'
+    +'<span style="font-size:14px;color:#5b4a28;font-weight:500">Since last analysis'+(at?' ('+at+')':'')+'</span>'
+    +'<span class="mono" style="font-size:11px;color:#8a7f66">'+auto.length+' applied · '+sugg.length+' to review</span>';
+  const rev=el('<button data-action="review-suggestions" style="margin-left:auto;font-size:11px;border:1px solid #d2b06a;background:#e7c06a;color:#3b372f;border-radius:6px;padding:5px 11px;cursor:pointer">Review in Work-tracks →</button>');
+  rev.onclick=()=>goTo('tracks');
+  const dis=el('<button data-action="dismiss-runlog" style="font-size:11px;border:1px solid #ddd4c2;background:transparent;color:#8c8576;border-radius:6px;padding:5px 10px;cursor:pointer">Dismiss</button>');
+  dis.onclick=()=>{dismissRunlog();render();};
+  head.appendChild(rev);head.appendChild(dis);box.appendChild(head);
+  const list=el('<div style="padding:6px 0"></div>');
+  (r.changes||[]).forEach(c=>{
+    const isAuto=c.kind==='auto';
+    // AUTO = done (a check); SUGGEST = pending (a question mark) — visually
+    // distinct per the trust rule so you never mistake a proposal for a fact.
+    const badge=isAuto
+      ?'<span data-change-kind="auto" style="flex:none;font-size:9px;letter-spacing:.08em;text-transform:uppercase;color:#2f7a52;background:#e3f1e6;border:1px solid #bcdcc4;border-radius:4px;padding:2px 6px">✓ applied</span>'
+      :'<span data-change-kind="suggest" style="flex:none;font-size:9px;letter-spacing:.08em;text-transform:uppercase;color:#a9762a;background:#fbf1dc;border:1px solid #e3cf9f;border-radius:4px;padding:2px 6px">? '+esc(c.action)+'</span>';
+    const detail=c.action==='attach'?('→ '+esc(c.track||'?')):(c.action==='create'?('new track '+esc(c.track||'?')):'archive');
+    const row=el('<div data-change="'+attr(c.id)+'" style="display:flex;align-items:center;gap:10px;padding:7px 16px"></div>');
+    row.innerHTML=badge
+      +'<span class="mono" style="font-size:11px;color:#6e6757;flex:none">'+esc(c.id)+'</span>'
+      +'<span class="mono" style="font-size:11px;color:#8c6a2a;flex:none">'+detail+'</span>'
+      +'<span style="font-size:12px;color:#8a7f66;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(c.reason||'')+'</span>';
+    list.appendChild(row);
+  });
+  box.appendChild(list);
+  return box;
+}
+
+// The ROLLUP panel (Pass 3): the portfolio picture — a near-done/mid/early/stuck
+// bucket distribution + the per-track completion %s. `scope` filters to a
+// product's tracks (by name) when given; otherwise the whole fleet. Returns null
+// when no rollup is cached (offline-safe) or no tracks fall in scope.
+const _BUCKET_META={'near-done':{label:'near done',color:'#5d8a6f',bg:'#e9f0e9'},
+  'mid':{label:'in progress',color:'#a9762a',bg:'#fbf1dc'},
+  'early':{label:'early',color:'#8c8576',bg:'#f3f0e8'},
+  'stuck':{label:'needs a decision',color:'#c0632f',bg:'#f7e4da'}};
+function rollupPanel(scopeNames){
+  const r=(DATA&&DATA.rollup)||null;
+  if(!r||!(r.tracks||[]).length) return null;
+  let rows=r.tracks;
+  if(scopeNames){const set=new Set(scopeNames);rows=rows.filter(t=>set.has(t.name));}
+  if(!rows.length) return null;
+  // Recompute counts within scope.
+  const counts={'near-done':0,'mid':0,'early':0,'stuck':0};
+  rows.forEach(t=>{counts[t.bucket]=(counts[t.bucket]||0)+1;});
+  const box=el('<div data-region="rollup" data-track-count="'+rows.length+'" style="margin:20px 0 6px;border:1px solid #e6e0d5;border-radius:10px;background:#fffdf9;overflow:hidden"></div>');
+  const head=el('<div style="display:flex;align-items:center;gap:11px;padding:12px 16px;border-bottom:1px solid #ece5d6"></div>');
+  head.innerHTML='<span class="mono" style="font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:#a8916a">Portfolio · LLM rollup</span>'
+    +'<span class="mono" style="font-size:11px;color:#8a7f66">'+rows.length+' track'+(rows.length===1?'':'s')+' analyzed</span>';
+  box.appendChild(head);
+  // Distribution bar: one segment per non-empty bucket, sized by count.
+  const total=rows.length;
+  const dist=el('<div data-region="rollup-distribution" style="display:flex;height:10px;margin:14px 16px 8px;border-radius:5px;overflow:hidden;background:#efe7d2"></div>');
+  ['near-done','mid','early','stuck'].forEach(k=>{
+    if(!counts[k]) return;
+    const m=_BUCKET_META[k];
+    dist.appendChild(el('<div data-bucket="'+k+'" data-count="'+counts[k]+'" title="'+attr(m.label+': '+counts[k])+'" style="width:'+(100*counts[k]/total)+'%;background:'+m.color+'"></div>'));
+  });
+  box.appendChild(dist);
+  // Legend.
+  const legend=el('<div style="display:flex;flex-wrap:wrap;gap:12px;padding:0 16px 12px"></div>');
+  ['stuck','near-done','mid','early'].forEach(k=>{
+    if(!counts[k]) return;const m=_BUCKET_META[k];
+    legend.appendChild(el('<span class="mono" style="display:inline-flex;align-items:center;gap:6px;font-size:11px;color:#6e6757"><span style="width:8px;height:8px;border-radius:2px;background:'+m.color+'"></span>'+esc(m.label)+' · '+counts[k]+'</span>'));
+  });
+  box.appendChild(legend);
+  // Per-track rows (highest completion first; nulls last). Click -> track page.
+  const list=el('<div style="border-top:1px solid #f1ece1"></div>');
+  rows.forEach(t=>{
+    const m=_BUCKET_META[t.bucket]||_BUCKET_META.early;
+    const pct=(t.pct!=null?t.pct:null);
+    const row=el('<button data-rollup-track="'+attr(t.name)+'" data-bucket="'+attr(t.bucket)+'" style="all:unset;cursor:pointer;box-sizing:border-box;width:100%;display:flex;align-items:center;gap:11px;padding:9px 16px;border-top:1px solid #f6f2ea"></button>');
+    row.innerHTML='<span class="mono" style="flex:none;font-size:9px;letter-spacing:.05em;text-transform:uppercase;color:'+m.color+';background:'+m.bg+';border-radius:4px;padding:2px 7px;min-width:92px;text-align:center">'+esc(m.label)+'</span>'
+      +'<span class="mono" style="flex:1;font-size:12px;color:#3b372f;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(t.name)+'</span>'
+      +(t.headline?'<span class="mono" style="flex:none;font-size:10px;color:#a39c8c;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(t.headline)+'</span>':'')
+      +'<span class="mono" style="flex:none;font-size:12px;color:'+(pct!=null&&pct>=70?'#2f7a52':'#8c6a2a')+';min-width:44px;text-align:right">'+(pct!=null?pct+'%':'—')+'</span>';
+    row.onclick=()=>{const tk=(tracks()||[]).find(x=>x.name===t.name);const repo=tk&&tk.members_detail&&tk.members_detail[0]&&(tk.members_detail[0].id||'').split('#')[0];goTo('track',STATE.productId||(products()[0]||{}).id,t.name,repo);};
+    list.appendChild(row);
+  });
+  box.appendChild(list);
+  return box;
+}
+
 function renderFleet(app){
   const ps=products();
   const totalActive=ps.reduce((n,p)=>n+productActive(p.id),0);
   const totalAttn=ps.reduce((n,p)=>n+productAttention(p.id),0);
-  // pipeline map over ALL in-flight plans
-  app.appendChild(renderMap('whole fleet',inFlight(kanban()),null));
+  // pipeline map over ALL in-flight plans (archived cards are soft-hidden here
+  // too, consistent with the product/repo boards which filter via plansFor).
+  app.appendChild(renderMap('whole fleet',inFlight(kanban().filter(c=>!c.archived)),null));
+  const rl=runlogPanel();if(rl)app.appendChild(rl);
   const sec=el('<section data-view="fleet"></section>');
   sec.innerHTML='<div style="padding:34px 0 8px"><div class="eyebrow">The fleet</div>'
     +'<h1 class="title">Where things stand</h1>'
     +'<p class="lede">'+totalActive+' plans in flight across '+ps.length+' products. '
     +(totalAttn===0?'Everything is healthy.':totalAttn+' item'+(totalAttn===1?'':'s')+' want a decision from you — everything else is healthy.')+'</p></div>';
+  // The rollup fills "Where things stand" with track-completion intelligence
+  // (Pass 3) when it's been run — the portfolio picture across tracks.
+  const roll=rollupPanel(null);if(roll)sec.appendChild(roll);
   const grid=el('<div class="grid"></div>');
   ps.forEach(p=>{
     const ac=productActive(p.id),at=productAttention(p.id),edge=at>0?'#d7a23f':'#7faa8c';
@@ -512,7 +735,18 @@ function renderFleet(app){
   u.innerHTML='<div><span class="serif" style="font-size:21px;font-weight:500;font-style:italic;color:#6e6757">unaffiliated</span><div class="prepo">no product yet</div></div>'
     +'<div style="display:flex;align-items:baseline;gap:7px"><span class="pbig" style="color:#6e6757">'+unaffiliated().length+'</span><span style="font-size:12px;color:#8c8576">repos</span></div>';
   u.onclick=()=>goTo('product','unaffiliated');grid.appendChild(u);
-  sec.appendChild(grid);app.appendChild(sec);
+  sec.appendChild(grid);
+  // Work-tracks entry: scattered artifacts the LLM consolidated into one effort.
+  const trk=tracksMulti();
+  if(trk.length){
+    const b=el('<button data-region="tracks-entry" style="margin-top:20px;width:100%;text-align:left;border:1px dashed #d7cdb8;border-radius:10px;background:#faf6ee;padding:14px 16px;cursor:pointer;display:flex;align-items:center;justify-content:space-between"></button>');
+    const grouped=trk.reduce((n,t)=>n+t.members.length,0);
+    b.innerHTML='<span><span class="mono" style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#9a917f">Work tracks</span>'
+      +'<span class="mono" style="font-size:12px;color:#6e6757;margin-left:10px">'+trk.length+' tracks unify '+grouped+' scattered artifacts</span></span>'
+      +'<span class="mono" style="font-size:11px;color:#a9762a">review / fix grouping →</span>';
+    b.onclick=()=>goTo('tracks');sec.appendChild(b);
+  }
+  app.appendChild(sec);
 }
 
 // ---------- L2 PRODUCT ----------
@@ -525,6 +759,11 @@ function renderProduct(app){
   const repoNames=(p.repos||[]).map(r=>r.name||(r.slug||'').split('/').pop()).join(' · ');
   sec.innerHTML='<div class="eyebrow" style="color:#a39c8c;letter-spacing:.16em">'+esc(repoNames)+'</div><h1 class="title" style="font-weight:500">'+esc(p.name)+'</h1>';
   sec.appendChild(attnPanel(plans,c=>goTo('plan',p.id,c.title,repoForCard(c))));
+
+  // Product-scoped rollup (Pass 3): where THIS product's tracks stand. Scope by
+  // the tracks whose members are this product's cards.
+  const prodTrackNames=tracksMulti().filter(t=>tracksInProduct(t,p.id)).map(t=>t.name);
+  const proll=rollupPanel(prodTrackNames);if(proll)sec.appendChild(proll);
 
   // REPOS grid
   const reposWrap=el('<div data-region="repos" style="margin-top:34px"></div>');
@@ -553,9 +792,18 @@ function reposOf(p){
     const ps=plans.filter(c=>repoForCard(c)===name);
     const active=ps.filter(c=>c.status==='active').length;
     const attn=ps.filter(c=>cardAttention(c)).length;
-    const wt=worktrees().filter(w=>w.repo===name&&w.kind==='worktree').length;
-    return {name,planCount:ps.length,active,attn,worktrees:wt};
-  }).filter(r=>r.planCount>0||r.worktrees>0);
+    // Match worktree rows to this repo case-insensitively: a clone's repo name
+    // comes from its filesystem dir (e.g. `Yogada`) which can differ in case
+    // from the config-derived product-repo name (`yogada`). Without this the
+    // repo's worktrees/activity don't link and the repo can vanish from the grid.
+    const lc=(name||'').toLowerCase();
+    const rows=worktrees().filter(w=>(w.repo||'').toLowerCase()===lc);
+    const wt=rows.filter(w=>w.kind==='worktree').length;
+    // A member repo with local activity (e.g. a dirty/behind clone) but no plans
+    // or worktrees would otherwise vanish; count any flagged row so it surfaces.
+    const activity=rows.filter(w=>(w.flags||[]).length).length;
+    return {name,planCount:ps.length,active,attn,worktrees:wt,activity};
+  }).filter(r=>r.planCount>0||r.worktrees>0||r.activity>0);
 }
 
 // ---------- L3 REPO ----------
@@ -571,10 +819,14 @@ function renderRepo(app){
   // board
   const narrow=window.innerWidth<760;
   const board=el('<div class="board" data-region="board" style="grid-template-columns:'+(narrow?'1fr':'1fr 1fr 1fr')+'"></div>');
-  const active=rplans.filter(c=>c.status==='active'),backlog=rplans.filter(c=>c.status==='backlog'),completed=rplans.filter(c=>c.status==='completed'||c.status==='done');
-  board.appendChild(kanbanCol('active',active,repoName));
-  board.appendChild(kanbanCol('backlog',backlog,repoName));
-  board.appendChild(kanbanCol('completed',completed,repoName));
+  // Track-aware split: a card belonging to a multi-member track is NOT rendered
+  // as its own row — instead ONE unified card represents the whole track, placed
+  // in the column its furthest-along stage implies. Loose (untracked) cards fall
+  // into their status column as before. Guarantees each member appears once.
+  const g=boardGroups(rplans);
+  board.appendChild(kanbanCol('active',g.active,repoName));
+  board.appendChild(kanbanCol('backlog',g.backlog,repoName));
+  board.appendChild(kanbanCol('completed',g.completed,repoName));
   sec.appendChild(board);
 
   // worktrees (local-only)
@@ -601,11 +853,116 @@ function wtMeta(w){
   if(f.includes('stale')) return {label:'stale',color:'#9a917f',dot:'#c2b89f'};
   return {label:'clean',color:'#5d8a6f',dot:'#7faa8c'};
 }
-function kanbanCol(kind,plans,repoName){
+// Split this repo's plans into the 3 board columns, collapsing multi-member
+// tracks into a single unified card per track. Returns {active,backlog,completed}
+// where each is {loose:[card], tracks:[trackObj]}.
+function boardGroups(rplans){
+  const cols={active:{loose:[],tracks:[]},backlog:{loose:[],tracks:[]},
+              completed:{loose:[],tracks:[]}};
+  const seenTrack={};  // track name -> already placed (dedupe across members)
+  const statusCol=c=>(c.status==='backlog')?'backlog'
+    :((c.status==='completed'||c.status==='done'||c.status==='shipped'||c.shipped)?'completed':'active');
+  rplans.forEach(c=>{
+    const tn=c.track;
+    if(tn){
+      const t=trackByName(tn);
+      // A real (2+ member, fact-stamped) track collapses to a unified card.
+      if(t&&(t.members||[]).length>=2){
+        if(!seenTrack[tn]){seenTrack[tn]=1;cols[trackColumn(t)].tracks.push(t);}
+        return;  // this member is represented by the unified card, not a row
+      }
+    }
+    cols[statusCol(c)].loose.push(c);
+  });
+  return cols;
+}
+// One unified card for a whole track: collapsed headline + fact summary, and an
+// expandable strand map (grouped by role) showing each member's state + source
+// + pipeline stage. This is layer 1 (deterministic facts) of UNIFIED-CARD-MODEL.
+const ROLE_ORDER=['spec-PR','impl-PR','issue','worktree','plan','?'];
+const ROLE_LABEL={'spec-PR':'SPECS','impl-PR':'IMPL','issue':'ISSUES','worktree':'WORKTREE','plan':'PLAN','?':'OTHER'};
+function stateDot(state){
+  if(state==='merged') return {c:'#5d8a6f',d:'#7faa8c'};
+  if(state==='open') return {c:'#9a6f22',d:'#cf962f'};
+  if(state==='dirty') return {c:'#a8916a',d:'#cbab6a'};
+  if(state==='closed') return {c:'#a39c8c',d:'#cabfa9'};
+  return {c:'#6e6757',d:'#b9b0a0'};
+}
+function factSummary(t){
+  const f=t.facts||{};const parts=[];
+  parts.push((f.count||0)+' artifact'+((f.count===1)?'':'s'));
+  if(f.merged) parts.push(f.merged+' merged');
+  // The useful factual flag (not a verdict): impl merged yet spec-PR still open.
+  if(f.impl_merged_spec_open){
+    const spec=(t.members_detail||[]).find(d=>d.role==='spec-PR'&&d.state==='open');
+    parts.push('spec-PR'+(spec?' '+spec.id.replace(/^.*#/,'#'):'')+' open');
+  }
+  if((f.sources||[]).length>1) parts.push((f.sources||[]).join('/'));
+  return parts.join(' · ');
+}
+function unifiedCard(t,repoName){
+  const open=!!STATE.trackOpen[t.name];
+  const wrap=el('<div class="kcard" data-unified-track="'+attr(t.name)+'" style="display:block;padding:0;cursor:default"></div>');
+  // Header: the CHEVRON toggles the inline strand preview; the TRACK NAME opens
+  // the full track detail view (its own page). Two distinct affordances.
+  const head=el('<div style="display:block;box-sizing:border-box;padding:11px 13px"></div>');
+  const row=el('<div style="display:flex;align-items:center;gap:7px"></div>');
+  const chev=el('<button data-action="toggle-track" title="preview strands" style="all:unset;cursor:pointer;flex:none;font-size:9px;color:#9a917f;transform:rotate('+(open?'90deg':'0deg')+');transition:transform .2s">&#9654;</button>');
+  chev.onclick=(e)=>{e.stopPropagation();STATE.trackOpen[t.name]=!STATE.trackOpen[t.name];render();};
+  const name=el('<button data-action="open-track" class="t" style="all:unset;cursor:pointer;flex:1;min-width:0;overflow-wrap:anywhere">'+esc(t.name)+'</button>');
+  name.onclick=()=>goTo('track',STATE.productId,t.name,repoName);
+  row.appendChild(chev);row.appendChild(name);
+  row.appendChild(el('<span class="mono" style="flex:none;font-size:9px;letter-spacing:.06em;text-transform:uppercase;color:#7a6a3f;background:#efe7d2;padding:2px 6px;border-radius:4px">track</span>'));
+  head.appendChild(row);
+  const facts=el('<button data-action="open-track" data-track-facts class="mono" style="all:unset;cursor:pointer;display:block;font-size:11px;color:#8c8576;margin:6px 0 0 16px;overflow-wrap:anywhere">'+esc(factSummary(t))+' &nbsp;<span style="color:#a8916a">open →</span></button>');
+  facts.onclick=()=>goTo('track',STATE.productId,t.name,repoName);
+  head.appendChild(facts);
+  // LLM verdict headline + completion (layer 2) — visually DISTINCT from the
+  // deterministic fact line above (amber pill + %). Only when a verdict is cached.
+  const v=t.verdict;
+  if(v){
+    const comp=v.completion||{};
+    const pct=(comp.computed_pct!=null?comp.computed_pct:comp.llm_pct);
+    const vrow=el('<div data-region="card-verdict" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0 0 16px"></div>');
+    vrow.innerHTML=(v.headline?'<span data-verdict-headline class="mono" style="font-size:10px;letter-spacing:.02em;color:#7a5f28;background:#f6ead0;border:1px solid #e3cf9f;border-radius:4px;padding:2px 7px">'+esc(v.headline)+'</span>':'')
+      +(pct!=null?'<span data-verdict-pct class="mono" style="font-size:10px;color:'+(pct>=70?'#2f7a52':'#a9762a')+'">'+pct+'% complete</span>':'')
+      +((comp.confidence||'').toLowerCase()==='low'?'<span class="mono" style="font-size:9.5px;color:#a9762a">⚠ confirm</span>':'');
+    head.appendChild(vrow);
+  }
+  wrap.appendChild(head);
+  if(open) wrap.appendChild(strandMap(t,repoName));
+  return wrap;
+}
+function strandMap(t,repoName){
+  const box=el('<div data-region="strand-map" style="border-top:1px solid #ece5d6;padding:8px 13px 11px"></div>');
+  const details=(t.members_detail||[]).slice().sort((a,b)=>ROLE_ORDER.indexOf(a.role)-ROLE_ORDER.indexOf(b.role));
+  let curRole=null;
+  details.forEach(d=>{
+    if(d.role!==curRole){
+      curRole=d.role;
+      box.appendChild(el('<div class="mono" style="font-size:9px;letter-spacing:.12em;color:#a39c8c;margin:9px 0 3px">'+esc(ROLE_LABEL[d.role]||d.role)+'</div>'));
+    }
+    const sd=stateDot(d.state);
+    const num=String(d.id).replace(/^.*#/,'#');
+    const row=el('<div data-strand-member="'+attr(d.id)+'" data-strand-role="'+attr(d.role)+'" data-strand-state="'+attr(d.state)+'" data-strand-source="'+attr(d.source||'—')+'" data-strand-stage="'+attr(d.stage)+'" style="display:flex;align-items:center;gap:8px;padding:3px 0;overflow:hidden"></div>');
+    row.innerHTML='<span style="flex:none;width:6px;height:6px;border-radius:50%;background:'+sd.d+'"></span>'
+      +'<span class="mono" style="flex:none;font-size:11px;color:'+sd.c+'">'+esc(num)+'</span>'
+      +'<span class="mono" style="flex:1;min-width:0;font-size:11px;color:#5b5447;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(String(d.title).slice(0,60))+'</span>'
+      +'<span class="mono" style="flex:none;font-size:10px;color:'+sd.c+'">'+esc(d.state)+'</span>'
+      +(d.source&&d.source!=='—'?'<span class="mono" data-strand-source-tag style="flex:none;font-size:9px;color:#7a6a3f;background:#f2ede2;padding:1px 5px;border-radius:3px">'+esc(d.source)+'</span>':'')
+      +'<span class="mono" data-strand-stage-tag style="flex:none;font-size:9px;color:#9a917f">'+esc(d.stage)+'</span>';
+    box.appendChild(row);
+  });
+  return box;
+}
+function kanbanCol(kind,group,repoName){
+  // group is {loose:[card], tracks:[trackObj]} (see boardGroups).
+  const plans=group.loose, trks=group.tracks;
   const col=el('<div data-column="'+kind+'"></div>');
   if(kind==='active'){
-    col.appendChild(el('<div class="col-h"><span style="width:8px;height:8px;border-radius:50%;background:#6f9d80"></span><span class="lbl" style="color:#5e7d6a">Active</span><span class="n">'+plans.length+'</span></div>'));
+    col.appendChild(el('<div class="col-h"><span style="width:8px;height:8px;border-radius:50%;background:#6f9d80"></span><span class="lbl" style="color:#5e7d6a">Active</span><span class="n">'+(plans.length+trks.length)+'</span></div>'));
     const cs=el('<div class="colstack"></div>');
+    trks.forEach(t=>cs.appendChild(unifiedCard(t,repoName)));
     plans.forEach(c=>{
       const w=worktreeForCard(c),pr=prMeta(w&&w.pr),a=cardAttention(c);
       const k=el('<button class="kcard" data-plan-id="'+attr(c.title)+'" data-status="active" data-attention="'+(!!a)+'"></button>');
@@ -616,8 +973,9 @@ function kanbanCol(kind,plans,repoName){
     });
     col.appendChild(cs);
   }else if(kind==='backlog'){
-    col.appendChild(el('<div class="col-h"><span style="width:8px;height:8px;border-radius:50%;border:1.5px solid #c2b89f;box-sizing:border-box"></span><span class="lbl" style="color:#9a917f">Backlog</span><span class="n">'+plans.length+'</span></div>'));
+    col.appendChild(el('<div class="col-h"><span style="width:8px;height:8px;border-radius:50%;border:1.5px solid #c2b89f;box-sizing:border-box"></span><span class="lbl" style="color:#9a917f">Backlog</span><span class="n">'+(plans.length+trks.length)+'</span></div>'));
     const cs=el('<div class="colstack"></div>');
+    trks.forEach(t=>cs.appendChild(unifiedCard(t,repoName)));
     plans.forEach(c=>{
       const k=el('<button class="bcard" data-plan-id="'+attr(c.title)+'" data-status="backlog"></button>');
       k.innerHTML='<span class="mono" style="font-size:12.5px;color:#5b5447;overflow-wrap:anywhere">'+esc(c.title)+'</span>';
@@ -626,11 +984,12 @@ function kanbanCol(kind,plans,repoName){
     col.appendChild(cs);
   }else{
     const head=el('<button style="all:unset;cursor:pointer;display:flex;align-items:center;gap:8px;margin-bottom:12px;width:100%"></button>');
-    head.innerHTML='<span style="font-size:10px;color:#9a917f;transform:rotate('+(STATE.doneOpen?'90deg':'0deg')+');transition:transform .2s">&#9654;</span><span class="lbl mono" style="color:#9a917f">Completed</span><span class="n">'+plans.length+'</span>';
+    head.innerHTML='<span style="font-size:10px;color:#9a917f;transform:rotate('+(STATE.doneOpen?'90deg':'0deg')+');transition:transform .2s">&#9654;</span><span class="lbl mono" style="color:#9a917f">Completed</span><span class="n">'+(plans.length+trks.length)+'</span>';
     head.onclick=()=>{STATE.doneOpen=!STATE.doneOpen;render();};
     col.appendChild(head);
     if(STATE.doneOpen){
       const cs=el('<div class="colstack" style="animation:fadeIn .2s ease"></div>');
+      trks.forEach(t=>cs.appendChild(unifiedCard(t,repoName)));
       plans.slice(0,12).forEach(c=>{
         const k=el('<button class="ccard" data-plan-id="'+attr(c.title)+'" data-status="completed"></button>');
         k.innerHTML='<span style="flex:none;width:14px;height:14px;border-radius:50%;background:#e3ebe2;color:#5d8a6f;display:inline-flex;align-items:center;justify-content:center;font-size:8px">&#10003;</span><span class="mono" style="flex:1;min-width:0;font-size:12px;color:#8a8273;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(c.title)+'</span>';
@@ -888,12 +1247,395 @@ function render(){
   const app=$('app');app.innerHTML='';
   if(!DATA){app.appendChild(el('<p class="empty">No data — run <code>python3 collector.py</code>.</p>'));return;}
   if(STATE.level==='fleet') renderFleet(app);
+  else if(STATE.level==='tracks') renderTracks(app);
   else if(STATE.level==='product') renderProduct(app);
   else if(STATE.level==='repo') renderRepo(app);
   else if(STATE.level==='plan') renderPlan(app);
+  else if(STATE.level==='track') renderTrackDetail(app);
+}
+
+// ---------- TRACK DETAIL (full page): strands along the pipeline ----------
+// Clicking a track's name on the board opens this. Strands are laid out in the
+// 5 pipeline stage lanes (spec'd..shipped) as compact chips; click a chip to
+// expand its full detail. A reserved region at the top is where the Phase-3 LLM
+// verdict (summary / next step / what to clean/close/dedupe) will render.
+function findTrack(name){return (tracks()||[]).find(t=>t.name===name)||null;}
+function stageMeta(key){return (typeof STAGES!=='undefined'?STAGES:[]).find(s=>s.key===key)||{key,name:key,color:'#b3a997'};}
+function strandChip(d,repoName){
+  const sd=stateDot(d.state);
+  const num=String(d.id).replace(/^.*#/,'#');
+  const opened=!!STATE.strandOpen[d.id];
+  const chip=el('<button data-strand-member="'+attr(d.id)+'" data-strand-role="'+attr(d.role)+'" data-strand-state="'+attr(d.state)+'" data-strand-source="'+attr(d.source||'—')+'" data-strand-stage="'+attr(d.stage)+'" data-open="'+opened+'" '
+    +'style="all:unset;box-sizing:border-box;cursor:pointer;display:block;width:100%;border:1px solid '+(opened?sd.d:'#e6e0d5')+';border-left:3px solid '+sd.d+';border-radius:7px;background:'+(opened?'#faf6ee':'#fff')+';padding:8px 9px;margin-bottom:7px"></button>');
+  chip.innerHTML='<span style="display:flex;align-items:center;gap:6px">'
+    +'<span class="mono" style="flex:none;font-size:11px;color:'+sd.c+'">'+esc(num)+'</span>'
+    +'<span class="mono" style="flex:none;font-size:8.5px;letter-spacing:.06em;text-transform:uppercase;color:#8c8576">'+esc(d.role)+'</span>'
+    +(d.source&&d.source!=='—'?'<span class="mono" data-strand-source-tag style="flex:none;font-size:8.5px;color:#7a6a3f;background:#f2ede2;padding:1px 5px;border-radius:3px;margin-left:auto">'+esc(d.source)+'</span>':'<span style="margin-left:auto"></span>')+'</span>'
+    +'<span class="mono" style="display:block;font-size:11px;color:#4a463d;margin-top:5px;line-height:1.35;overflow-wrap:anywhere">'+esc(String(d.title).slice(0,90))+'</span>'
+    +'<span class="mono" style="display:block;font-size:9px;color:'+sd.c+';margin-top:5px">'+esc(d.state)+'</span>';
+  chip.onclick=()=>{STATE.strandOpen[d.id]=!STATE.strandOpen[d.id];render();};
+  return chip;
+}
+function strandDetailPanel(d,repoName,sv){
+  const sd=stateDot(d.state);
+  const num=String(d.id).replace(/^.*#/,'#');
+  const box=el('<div data-strand-detail="'+attr(d.id)+'" style="border:1px solid #e6e0d5;border-left:3px solid '+sd.d+';border-radius:9px;background:#fff;padding:14px 16px;margin-bottom:10px"></div>');
+  // Header: id + full title + close.
+  const head=el('<div style="display:flex;align-items:flex-start;gap:10px"></div>');
+  head.innerHTML='<span class="mono" style="flex:none;font-size:13px;color:'+sd.c+';font-weight:600">'+esc(num)+'</span>'
+    +'<span class="mono" style="flex:1;min-width:0;font-size:13px;color:#2a2722;line-height:1.4;overflow-wrap:anywhere">'+esc(d.title)+'</span>';
+  const close=el('<button title="collapse" style="all:unset;cursor:pointer;flex:none;font-size:14px;color:#b3ab9b;line-height:1">&times;</button>');
+  close.onclick=()=>{STATE.strandOpen[d.id]=false;render();};
+  head.appendChild(close);box.appendChild(head);
+  // Fact chips: role · state · source · stage · dates · branch.
+  const facts=el('<div class="mono" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;font-size:10px"></div>');
+  const tag=(label,color,bg)=>'<span style="color:'+(color||'#6e6757')+';background:'+(bg||'#f3f0e8')+';padding:2px 7px;border-radius:4px">'+esc(label)+'</span>';
+  let ft=tag(d.role,'#7a6a3f','#efe7d2')+tag(d.state,sd.c,'#f3f0e8')+tag('stage: '+d.stage,'#9a917f','#f3f0e8');
+  if(d.source&&d.source!=='—') ft+=tag('source: '+d.source,'#7a6a3f','#f2ede2');
+  (d.labels||[]).forEach(l=>{ft+=tag(l,'#5d8a6f','#e9f0e9');});
+  facts.innerHTML=ft;box.appendChild(facts);
+  // Dates + branch line.
+  const metaBits=[];
+  if(d.merged_at) metaBits.push('merged '+String(d.merged_at).slice(0,10));
+  else if(d.created_at) metaBits.push('opened '+String(d.created_at).slice(0,10));
+  if(d.branch) metaBits.push('branch: '+d.branch);
+  if(metaBits.length) box.appendChild(el('<div class="mono" style="font-size:10px;color:#a39c8c;margin-top:8px;overflow-wrap:anywhere">'+esc(metaBits.join('  ·  '))+'</div>'));
+  // The description — "what this strand is trying to do".
+  const body=(d.body||'').trim();
+  if(body){
+    box.appendChild(el('<div class="mono" style="font-size:9px;letter-spacing:.1em;color:#b3ab9b;margin:12px 0 4px">DESCRIPTION</div>'));
+    box.appendChild(el('<div data-strand-body style="font-size:12px;color:#5b5447;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere;max-height:260px;overflow:auto">'+esc(body)+'</div>'));
+  }else{
+    box.appendChild(el('<div class="mono" data-strand-body style="font-size:11px;color:#c2b89f;margin-top:10px;font-style:italic">No description on the '+(d.role==='issue'?'issue':(d.role==='plan'?'plan':'PR'))+'.</div>'));
+  }
+  // Link out.
+  if(d.url) box.appendChild(el('<a href="'+attr(d.url)+'" target="_blank" rel="noopener" class="mono" data-strand-link style="display:inline-block;margin-top:12px;font-size:11px;color:#8c6a2a;text-decoration:none;border:1px solid #ddd4c2;border-radius:6px;padding:4px 10px">open on GitHub →</a>'));
+  // PER-STRAND LLM take (Pass 2): the disposition (keep / close / duplicate /
+  // outdated / supplanted) + a one-line note, confidence-tagged. Faint
+  // placeholder when no verdict is cached (offline-safe).
+  const slot=el('<div data-strand-llm-slot style="margin-top:12px;border-top:1px dashed #ece5d6;padding-top:9px"></div>');
+  if(sv&&sv.status){
+    const st=String(sv.status).toLowerCase();
+    const keep=st==='keep';
+    // keep = green (this strand is real); clip states = amber (a loose end).
+    const col=keep?{fg:'#2f7a52',bg:'#e3f1e6',bd:'#bcdcc4'}:{fg:'#a9762a',bg:'#fbf1dc',bd:'#e3cf9f'};
+    slot.setAttribute('data-strand-status',st);
+    slot.innerHTML='<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
+      +'<span class="mono" style="font-size:8.5px;letter-spacing:.08em;text-transform:uppercase;color:'+col.fg+';background:'+col.bg+';border:1px solid '+col.bd+';border-radius:4px;padding:2px 6px">'+esc(st)+'</span>'
+      +confPill(sv.confidence)
+      +'<span style="font-size:12px;color:#6e6757;overflow-wrap:anywhere">'+esc(sv.note||'')+'</span>'
+      +'</div>';
+  }else{
+    slot.setAttribute('style',slot.getAttribute('style')+';font-size:10.5px;color:#c2b89f;font-style:italic');
+    slot.textContent='LLM take on this strand — run the strand-analysis pass (--analyze).';
+  }
+  box.appendChild(slot);
+  return box;
+}
+// A short label for a strand id ("#118") for use in verdict prose.
+function shortId(id){return String(id).replace(/^.*#/,'#');}
+// Confidence pill — the trust rule made visible. high = a stated fact (green);
+// low/medium = a QUESTION to resolve (amber), never asserted.
+function confPill(conf){
+  const c=(conf||'').toLowerCase();
+  if(c==='high') return '<span data-conf="high" class="mono" style="font-size:8.5px;letter-spacing:.06em;text-transform:uppercase;color:#2f7a52;background:#e3f1e6;border:1px solid #bcdcc4;border-radius:4px;padding:1px 5px">high</span>';
+  return '<span data-conf="'+esc(c||'medium')+'" class="mono" style="font-size:8.5px;letter-spacing:.06em;text-transform:uppercase;color:#a9762a;background:#fbf1dc;border:1px solid #e3cf9f;border-radius:4px;padding:1px 5px">'+esc(c||'medium')+' · confirm</span>';
+}
+// The TRACK-LEVEL verdict slot. Renders the LLM's headline + completion (the
+// COMPUTED % as the auditable headline, with the LLM's gut % + a confidence from
+// their agreement — divergence renders as a low-confidence question) + cleanup +
+// relationships. Visually DISTINCT from the deterministic facts (layer 1).
+function verdictRegion(t){
+  const v=t.verdict;
+  const box=el('<div data-region="track-verdict" style="margin-top:20px;border-radius:10px;padding:14px 16px"></div>');
+  if(!v){
+    box.setAttribute('style',box.getAttribute('style')+';border:1px dashed #d7cdb8;background:#faf6ee');
+    box.setAttribute('data-verdict','none');
+    box.innerHTML='<div class="mono" style="font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:#a8916a">Analysis</div>'
+      +'<div class="mono" style="font-size:12px;color:#b3a894;margin-top:6px;font-style:italic;line-height:1.5">The strand-analysis pass (Pass 2) summarizes what\'s happening, recommends the next step, and flags what to close / clean up / dedupe. Not run yet — <span class="mono">python3 collector.py --analyze</span>.</div>';
+    return box;
+  }
+  box.setAttribute('data-verdict','shown');
+  // A solid (not dashed) amber card = this is a JUDGMENT (layer 2), set apart
+  // from the dashed deterministic-fact regions.
+  box.setAttribute('style',box.getAttribute('style')+';border:1px solid #d9c9a0;background:linear-gradient(#fffdf6,#fdf6e7)');
+  const comp=v.completion||{};
+  const shownPct=(comp.computed_pct!=null?comp.computed_pct:comp.llm_pct);
+  const cconf=(comp.confidence||'').toLowerCase();
+  // Header: eyebrow + headline verdict + overall confidence.
+  const head=el('<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"></div>');
+  head.innerHTML='<span class="mono" style="font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:#a8916a">LLM verdict</span>'
+    +'<span data-verdict-headline style="font-size:15px;color:#5b4a28;font-weight:500">'+esc(v.headline||'—')+'</span>'
+    +confPill(v.confidence);
+  box.appendChild(head);
+  // Completion: the computed % headline + a bar + the verbal read. When the two
+  // %s DIVERGE (comp.confidence==='low') show it as a QUESTION, not a fact.
+  if(shownPct!=null){
+    const diverged=cconf==='low';
+    const barColor=diverged?'#c9a24a':(shownPct>=70?'#5d8a6f':'#cbab6a');
+    const comprow=el('<div data-region="completion" data-pct="'+shownPct+'" data-conf="'+esc(cconf||'')+'" style="margin-top:12px"></div>');
+    comprow.innerHTML='<div style="display:flex;align-items:baseline;gap:9px">'
+      +'<span class="mono" style="font-size:20px;color:#5b4a28;font-weight:600">'+shownPct+'%</span>'
+      +'<span class="mono" style="font-size:10px;color:#8a7f66">complete'+(comp.kept!=null?' · '+(comp.done||0)+'/'+comp.kept+' kept strands done':'')+'</span>'
+      +(diverged?'<span class="mono" data-completion-question style="font-size:10px;color:#a9762a">⚠ LLM said '+esc(String(comp.llm_pct))+'% — its clip list implies '+shownPct+'%; confirm</span>':'')
+      +'</div>'
+      +'<div style="margin-top:7px;height:7px;border-radius:4px;background:#efe7d2;overflow:hidden"><div style="height:100%;width:'+Math.max(0,Math.min(100,shownPct))+'%;background:'+barColor+'"></div></div>'
+      +(v.completion&&comp.verbal?'<div style="font-size:12px;color:#6e6757;margin-top:8px;line-height:1.5">'+esc(comp.verbal)+'</div>':'');
+    box.appendChild(comprow);
+  }
+  // Cleanup list — concrete next actions.
+  if((v.cleanup||[]).length){
+    const cl=el('<div data-region="cleanup" style="margin-top:13px"></div>');
+    cl.appendChild(el('<div class="mono" style="font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:#a8916a;margin-bottom:5px">Cleanup</div>'));
+    v.cleanup.forEach(c=>cl.appendChild(el('<div data-cleanup-item style="display:flex;gap:8px;font-size:12px;color:#5b5447;padding:2px 0"><span style="color:#cf962f;flex:none">•</span><span style="overflow-wrap:anywhere">'+esc(c)+'</span></div>')));
+    box.appendChild(cl);
+  }
+  // Relationships — competing/progressive/independent, confidence-tagged. A
+  // low-confidence one renders as a QUESTION (⚠ … confirm), not an assertion.
+  if((v.relationships||[]).length){
+    const rl=el('<div data-region="relationships" style="margin-top:13px"></div>');
+    rl.appendChild(el('<div class="mono" style="font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:#a8916a;margin-bottom:5px">Relationships</div>'));
+    v.relationships.forEach(r=>{
+      const pair=(Array.isArray(r.pair)?r.pair:[]).map(shortId).join(' ↔ ');
+      const low=(r.confidence||'').toLowerCase()!=='high';
+      const row=el('<div data-relationship data-relation="'+attr(r.relation||'')+'" style="display:flex;align-items:baseline;gap:8px;font-size:12px;padding:3px 0;color:'+(low?'#8c6a2a':'#5b5447')+'"></div>');
+      row.innerHTML=(low?'<span style="flex:none">⚠</span>':'')
+        +'<span class="mono" style="flex:none;color:#7a6a3f">'+esc(pair)+'</span>'
+        +'<span class="mono" style="flex:none;font-weight:600">'+esc(r.relation||'')+(low?' — confirm':'')+'</span>'
+        +'<span style="color:#8a7f66;overflow-wrap:anywhere">'+esc(r.note||'')+'</span>';
+      rl.appendChild(row);
+    });
+    box.appendChild(rl);
+  }
+  return box;
+}
+
+function renderTrackDetail(app){
+  const t=findTrack(STATE.trackName);
+  const p=products().find(x=>x.id===STATE.productId)||{};
+  const sec=el('<section data-view="track" data-track="'+attr(STATE.trackName||'')+'" style="padding-top:30px"></section>');
+  if(!t){sec.innerHTML='<p class="empty">Track not found.</p>';app.appendChild(sec);return;}
+  const repoName=STATE.repoId||(t.members_detail&&t.members_detail[0]&&(t.members_detail[0].id||'').split('#')[0])||'';
+  sec.innerHTML='<div class="eyebrow" style="color:#a39c8c;letter-spacing:.16em">'+esc((p.name||'')+(repoName?' · '+repoName:''))+' · track</div>'
+    +'<h1 class="mono" style="font-weight:500;font-size:clamp(22px,3.6vw,34px);margin:0;letter-spacing:-.01em;color:#2a2722;overflow-wrap:anywhere">'+esc(t.name)+'</h1>'
+    +'<div class="mono" data-track-facts style="font-size:12px;color:#8c8576;margin-top:9px">'+esc(factSummary(t))+'</div>';
+  // VERDICT region (Pass-2 LLM): headline + completion + cleanup + relationships,
+  // confidence-tagged. Filled when a verdict is cached; faint placeholder if not.
+  sec.appendChild(verdictRegion(t));
+  // PIPELINE LANES: one column per stage; strands placed by their computed stage.
+  const stages=(typeof STAGES!=='undefined'?STAGES:[]);
+  const details=(t.members_detail||[]);
+  const byStage={};stages.forEach(s=>byStage[s.key]=[]);
+  details.forEach(d=>{(byStage[d.stage]||(byStage[d.stage]=[])).push(d);});
+  const narrow=window.innerWidth<820;
+  const lanesWrap=el('<div style="margin-top:24px"></div>');
+  lanesWrap.appendChild(el('<div class="mono" style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a917f;margin-bottom:12px">Pipeline · strands by stage</div>'));
+  const lanes=el('<div data-region="pipeline-lanes" style="display:grid;grid-template-columns:repeat('+(narrow?1:stages.length)+',1fr);gap:'+(narrow?'14px':'10px')+'"></div>');
+  stages.forEach(s=>{
+    const items=byStage[s.key]||[];
+    const lane=el('<div data-lane="'+attr(s.key)+'"></div>');
+    lane.appendChild(el('<div style="display:flex;align-items:center;gap:6px;margin-bottom:9px;padding-bottom:7px;border-bottom:2px solid '+s.color+'"><span style="width:7px;height:7px;border-radius:50%;background:'+s.color+'"></span><span class="mono" style="font-size:11px;color:#5b5447">'+esc(s.name)+'</span><span class="mono" style="font-size:10px;color:#b3ab9b;margin-left:auto">'+items.length+'</span></div>'));
+    if(!items.length) lane.appendChild(el('<div class="mono" style="font-size:10px;color:#cdc4b1;padding:2px 0">—</div>'));
+    items.forEach(d=>lane.appendChild(strandChip(d,repoName)));
+    lanes.appendChild(lane);
+  });
+  lanesWrap.appendChild(lanes);
+  sec.appendChild(lanesWrap);
+  // EXPANDED strand detail panels (full-width, below the lanes so they have room
+  // for the description + metadata). Shown for whichever chips are open.
+  const openDetails=details.filter(d=>STATE.strandOpen[d.id]);
+  if(openDetails.length){
+    const dwrap=el('<div data-region="strand-details" style="margin-top:26px"></div>');
+    dwrap.appendChild(el('<div class="mono" style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a917f;margin-bottom:12px">Strand detail</div>'));
+    openDetails.forEach(d=>dwrap.appendChild(strandDetailPanel(d,repoName,(t.verdict&&t.verdict.strands&&t.verdict.strands[d.id])||null)));
+    sec.appendChild(dwrap);
+  }
+  app.appendChild(sec);
+}
+
+// ---------- WORK TRACKS (Phase 5): review + fix LLM groupings ----------
+function renderTracks(app){
+  const corr=loadCorr();
+  const sec=el('<section data-view="tracks" style="padding-top:30px"></section>');
+  sec.innerHTML='<div class="eyebrow" style="color:#a39c8c;letter-spacing:.16em">fleet · consolidation</div>'
+    +'<h1 class="title" style="font-weight:500">Work tracks</h1>'
+    +'<p class="lede">Scattered artifacts the LLM grouped into one effort. Wrong grouping? Reassign or split a card — then download your corrections; they win on the next run.</p>';
+  // Pending-corrections bar + download. Archive entries (soft-hide) count too —
+  // they ride the SAME download-corrections flow as reassign/split.
+  const nPend=Object.keys(corr.reassign||{}).length+((corr.split||[]).length)+((corr.archive||[]).length);
+  const bar=el('<div data-region="corrections-bar" style="display:flex;align-items:center;gap:12px;margin:14px 0 6px;padding:10px 14px;border-radius:8px;background:'+(nPend?'#fbf3e2':'#f3f0e8')+';border:1px solid '+(nPend?'#e3cf9f':'#e6e0d5')+'"></div>');
+  bar.innerHTML='<span class="mono" style="font-size:12px;color:#6e6757" data-pending="'+nPend+'">'+(nPend?nPend+' pending correction'+(nPend===1?'':'s'):'no pending corrections')+'</span>';
+  const dl=el('<button data-action="download-corrections" style="margin-left:auto;font-size:12px;border:1px solid #d2b06a;background:#e7c06a;color:#3b372f;border-radius:6px;padding:6px 12px;cursor:pointer">Download corrections</button>');
+  dl.onclick=()=>downloadCorrections();
+  const clr=el('<button data-action="clear-corrections" style="font-size:12px;border:1px solid #ddd4c2;background:transparent;color:#8c8576;border-radius:6px;padding:6px 12px;cursor:pointer">Clear</button>');
+  clr.onclick=()=>{saveCorr({});render();};
+  bar.appendChild(dl);if(nPend)bar.appendChild(clr);
+  sec.appendChild(bar);
+  // Track list.
+  tracksMulti().forEach(t=>{
+    const box=el('<div data-track="'+attr(t.name)+'" style="margin-top:16px;border:1px solid #e6e0d5;border-radius:10px;overflow:hidden"></div>');
+    box.appendChild(el('<div style="display:flex;align-items:baseline;gap:10px;padding:11px 15px;background:#faf6ee;border-bottom:1px solid #ece5d6"><span class="mono" style="font-size:13px;color:#2a2722">'+esc(t.name)+'</span><span class="mono" style="font-size:11px;color:#a39c8c">'+t.members.length+' artifacts'+(t.source==='override'?' · corrected':'')+'</span></div>'));
+    t.members.forEach(id=>{
+      const c=cardById(id);
+      const label=c?(c.title||c.slug||id):id;
+      const row=el('<div data-track-member="'+attr(id)+'" style="display:flex;align-items:center;gap:10px;padding:9px 15px;border-top:1px solid #f1ece1"></div>');
+      row.innerHTML='<span class="mono" style="font-size:12px;color:#3b372f;flex:1;overflow-wrap:anywhere">'+esc(String(label).slice(0,80))+'</span>'
+        +'<span class="mono" style="font-size:10px;color:#b3ab9b">'+esc(id)+'</span>';
+      const re=el('<button data-action="reassign" style="font-size:10.5px;border:1px solid #ddd4c2;background:#fff;border-radius:5px;padding:3px 8px;cursor:pointer;color:#8c6a2a">reassign</button>');
+      re.onclick=()=>{const to=prompt('Move "'+label+'" to which track? (name, or blank to pull into its own)',t.name);if(to===null)return;const o=loadCorr();if(to.trim())humanReassign(o,id,to.trim());else{o.split=o.split||[];if(o.split.indexOf(id)<0)o.split.push(id);if(o._source&&o._source[id])delete o._source[id];}saveCorr(o);render();};
+      row.appendChild(re);box.appendChild(row);
+    });
+    sec.appendChild(box);
+  });
+  // TRIAGE SUGGESTIONS: the medium/low attaches + all create/archive proposals
+  // from the last LLM run (auto-attaches already applied — they're in the tracks
+  // above). Each is accept/dismiss: accepting stages the SAME kind of correction
+  // a human would (reassign / archive), so it rides the download flow.
+  const sbox=triageSuggestionsBox();
+  if(sbox) sec.appendChild(sbox);
+  // UNGROUPED: real in-flight/shipped cards that are in NO track — so a stray
+  // like a product-level PR (that deterministic attach didn't catch) can be
+  // given a track by hand. Assigning writes the same corrections file.
+  const ungrouped=ungroupedCards();
+  const ubox=el('<div data-region="ungrouped" style="margin-top:26px;border:1px dashed #ddd4c2;border-radius:10px;overflow:hidden"></div>');
+  ubox.appendChild(el('<div style="display:flex;align-items:baseline;gap:10px;padding:11px 15px;background:#f6f2ea;border-bottom:1px solid #ece5d6"><span class="mono" style="font-size:13px;color:#2a2722">Ungrouped</span><span class="mono" style="font-size:11px;color:#a39c8c" data-ungrouped-count="'+ungrouped.length+'">'+ungrouped.length+' card'+(ungrouped.length===1?'':'s')+' in no track</span></div>'));
+  if(!ungrouped.length){
+    ubox.appendChild(el('<div class="mono" style="font-size:11px;color:#a3b39a;padding:11px 15px">Nothing ungrouped — every live artifact is in a track.</div>'));
+  }else{
+    ungrouped.forEach(c=>{
+      const id=cardId(c),label=c.title||c.slug||id;
+      const row=el('<div data-ungrouped-card="'+attr(id)+'" style="display:flex;align-items:center;gap:10px;padding:9px 15px;border-top:1px solid #f1ece1"></div>');
+      const stg=planStage(c).key;
+      row.innerHTML='<span class="mono" style="font-size:12px;color:#3b372f;flex:1;overflow-wrap:anywhere">'+esc(String(label).slice(0,80))+'</span>'
+        +'<span class="mono" style="font-size:9px;letter-spacing:.06em;color:#a8916a">'+esc(stg)+'</span>'
+        +'<span class="mono" style="font-size:10px;color:#b3ab9b">'+esc(id)+'</span>';
+      const as=el('<button data-action="assign-track" style="font-size:10.5px;border:1px solid #d2b06a;background:#fff;border-radius:5px;padding:3px 8px;cursor:pointer;color:#8c6a2a">give a track</button>');
+      as.onclick=()=>{const to=prompt('Assign "'+label+'" to which track? (existing name, or a new one)','');if(to===null||!to.trim())return;const o=loadCorr();humanReassign(o,id,to.trim());saveCorr(o);render();};
+      const ar=el('<button data-action="archive" style="font-size:10.5px;border:1px solid #ddd4c2;background:#fff;border-radius:5px;padding:3px 8px;cursor:pointer;color:#8c8576">archive</button>');
+      ar.onclick=()=>{stageArchive(id);};
+      row.appendChild(as);row.appendChild(ar);ubox.appendChild(row);
+    });
+  }
+  sec.appendChild(ubox);
+  // ARCHIVED: soft-hidden artifacts (still in the data, dropped from the board).
+  // Collapsible so it doesn't clutter. Each has an "unarchive" that stages
+  // removal from the archive list -> download -> the collector restores it.
+  sec.appendChild(archivedBox());
+  app.appendChild(sec);
+}
+
+// Stage an archive (soft-hide) into the corrections `archive` list — same
+// download-corrections flow as reassign/split. Idempotent.
+function stageArchive(id){
+  const o=loadCorr();o.archive=o.archive||[];
+  if(o.archive.indexOf(id)<0)o.archive.push(id);
+  saveCorr(o);render();
+}
+// Stage an UNARCHIVE: remove the id from the pending archive list. (A card
+// archived by a PREVIOUS downloaded run carries c.archived=true from the
+// collector; to bring it back you clear it from track-overrides.json — which
+// this stages once the download is re-applied.)
+function stageUnarchive(id){
+  const o=loadCorr();o.archive=(o.archive||[]).filter(x=>x!==id);
+  saveCorr(o);render();
+}
+// Triage suggestions that the human hasn't yet accepted/dismissed. Dismissed
+// ids live in localStorage (per suggestion id) so they stay hidden.
+function dismissedSuggestions(){try{return JSON.parse(localStorage.getItem('fleetDismissedSuggestions')||'[]');}catch(e){return [];}}
+function dismissSuggestion(id){const d=dismissedSuggestions();if(d.indexOf(id)<0)d.push(id);localStorage.setItem('fleetDismissedSuggestions',JSON.stringify(d));render();}
+function triageSuggestions(){
+  const r=llmRunlog();if(!r)return [];
+  const dis=dismissedSuggestions();
+  return (r.changes||[]).filter(c=>c.kind==='suggest'&&dis.indexOf(c.id)<0);
+}
+function triageSuggestionsBox(){
+  const sugg=triageSuggestions();
+  if(!sugg.length) return null;
+  const box=el('<div data-region="triage-suggestions" style="margin-top:26px;border:1px solid #e3cf9f;border-radius:10px;overflow:hidden"></div>');
+  box.appendChild(el('<div style="display:flex;align-items:baseline;gap:10px;padding:11px 15px;background:#fbf1dc;border-bottom:1px solid #ecdfbf"><span class="mono" style="font-size:13px;color:#2a2722">Triage suggestions</span><span class="mono" style="font-size:11px;color:#a9762a" data-suggestion-count="'+sugg.length+'">'+sugg.length+' proposal'+(sugg.length===1?'':'s')+' to review</span></div>'));
+  sugg.forEach(c=>{
+    const cd=cardById(c.id);const label=cd?(cd.title||cd.slug||c.id):c.id;
+    const verb=c.action==='attach'?('attach → '+esc(c.track||'?')):(c.action==='create'?('create track '+esc(c.track||'?')):'archive');
+    const row=el('<div data-suggestion="'+attr(c.id)+'" data-suggestion-action="'+attr(c.action)+'" style="display:flex;align-items:center;gap:10px;padding:9px 15px;border-top:1px solid #f1ece1"></div>');
+    row.innerHTML='<span class="mono" style="flex:none;font-size:9px;letter-spacing:.06em;text-transform:uppercase;color:#a9762a;background:#fff;border:1px solid #e3cf9f;border-radius:4px;padding:2px 6px">'+esc(c.action)+'</span>'
+      +'<span class="mono" style="font-size:12px;color:#3b372f;flex:1;overflow-wrap:anywhere">'+esc(String(label).slice(0,70))+'</span>'
+      +'<span class="mono" style="font-size:10.5px;color:#8c6a2a;flex:none">'+verb+'</span>'
+      +'<span class="mono" style="font-size:10px;color:#b3ab9b;flex:none">'+esc(c.confidence||'')+'</span>';
+    const acc=el('<button data-action="accept-suggestion" style="font-size:10.5px;border:1px solid #d2b06a;background:#e7c06a;color:#3b372f;border-radius:5px;padding:3px 8px;cursor:pointer">accept</button>');
+    acc.onclick=()=>{acceptSuggestion(c);};
+    const dis=el('<button data-action="dismiss-suggestion" style="font-size:10.5px;border:1px solid #ddd4c2;background:#fff;border-radius:5px;padding:3px 8px;cursor:pointer;color:#8c8576">dismiss</button>');
+    dis.onclick=()=>{dismissSuggestion(c.id);};
+    row.appendChild(acc);row.appendChild(dis);box.appendChild(row);
+  });
+  return box;
+}
+// Accepting a suggestion stages the SAME correction a human would make by hand
+// (so it's reversible + rides the download flow), then dismisses it from the
+// queue. attach/create -> reassign to the (new-or-existing) track; archive ->
+// the archive list.
+function acceptSuggestion(c){
+  if(c.action==='archive'){stageArchive(c.id);}
+  else if((c.action==='attach'||c.action==='create')&&c.track){
+    const o=loadCorr();o.reassign=o.reassign||{};o.reassign[c.id]=c.track;saveCorr(o);
+  }
+  dismissSuggestion(c.id);   // also re-renders
+}
+function archivedBox(){
+  const arch=archivedCards();
+  const staged=(loadCorr().archive||[]);
+  // Also show cards the human just STAGED to archive this session (not yet
+  // downloaded/applied, so still c.archived=false) so the action has feedback.
+  const stagedCards=staged.map(id=>cardById(id)).filter(c=>c&&!c.archived);
+  const all=arch.concat(stagedCards);
+  const box=el('<div data-region="archived" data-archived-count="'+all.length+'" style="margin-top:26px;border:1px dashed #d7cdb8;border-radius:10px;overflow:hidden"></div>');
+  const head=el('<button data-action="toggle-archived" style="width:100%;text-align:left;display:flex;align-items:baseline;gap:10px;padding:11px 15px;background:#f3f0e8;border:none;border-bottom:1px solid #ece5d6;cursor:pointer"></button>');
+  const open=STATE.archivedOpen;
+  head.innerHTML='<span class="mono" style="font-size:13px;color:#2a2722">Archived</span>'
+    +'<span class="mono" style="font-size:11px;color:#a39c8c">'+all.length+' soft-hidden artifact'+(all.length===1?'':'s')+'</span>'
+    +'<span class="mono" style="margin-left:auto;font-size:11px;color:#a9762a">'+(open?'hide ▲':'show ▼')+'</span>';
+  head.onclick=()=>{STATE.archivedOpen=!STATE.archivedOpen;render();};
+  box.appendChild(head);
+  if(open){
+    if(!all.length){
+      box.appendChild(el('<div class="mono" style="font-size:11px;color:#a3b39a;padding:11px 15px">Nothing archived.</div>'));
+    }else{
+      all.forEach(c=>{
+        const id=cardId(c),label=c.title||c.slug||id;
+        const isStaged=!c.archived;   // staged this session, not yet applied
+        const row=el('<div data-archived-card="'+attr(id)+'" style="display:flex;align-items:center;gap:10px;padding:9px 15px;border-top:1px solid #f1ece1;opacity:.85"></div>');
+        row.innerHTML='<span class="mono" style="font-size:12px;color:#6e6757;flex:1;overflow-wrap:anywhere;text-decoration:line-through">'+esc(String(label).slice(0,80))+'</span>'
+          +(isStaged?'<span class="mono" style="flex:none;font-size:9px;color:#a9762a">pending</span>':'')
+          +'<span class="mono" style="font-size:10px;color:#b3ab9b">'+esc(id)+'</span>';
+        const un=el('<button data-action="unarchive" style="font-size:10.5px;border:1px solid #d2b06a;background:#fff;border-radius:5px;padding:3px 8px;cursor:pointer;color:#8c6a2a">unarchive</button>');
+        un.onclick=()=>{stageUnarchive(id);};
+        row.appendChild(un);box.appendChild(row);
+      });
+    }
+  }
+  return box;
+}
+// Cards that are real strays worth grouping by hand: forge-backed (a PR/issue)
+// but in NO track. We deliberately EXCLUDE plain local plan cards (no github) —
+// each is its own anchor, not a scattered strand, and listing all ~60 of them
+// would bury the actual strays (like the #113 product-level PR). A PR/issue with
+// no track is exactly the "belongs to some effort but wasn't grouped" case.
+function ungroupedCards(){
+  return kanban().filter(c=>!c.track&&!c.archived&&(c.github||{}).number!=null)
+    .sort((a,b)=>String(a.title||a.slug||'').localeCompare(String(b.title||b.slug||'')));
+}
+// Build track-overrides.json from localStorage and trigger a browser download.
+function downloadCorrections(){
+  const o=loadCorr();
+  const blob=new Blob([JSON.stringify(o,null,2)],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download='track-overrides.json';document.body.appendChild(a);a.click();a.remove();
 }
 let _rt;
 window.addEventListener('resize',()=>{clearTimeout(_rt);_rt=setTimeout(render,120);});
+// Expose the router + data for headless verification (verify_ui.mjs). Harmless
+// in normal use; lets a test drive navigation and assert against the source data.
+window.goTo=goTo;window.DATA=DATA;window.STATE=STATE;
+window.saveCorr=saveCorr;window.loadCorr=loadCorr;
 render();
 </script>
 </body>
