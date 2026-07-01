@@ -183,14 +183,17 @@ function plansFor(pid){return kanban().filter(c=>c.product===pid);}
 function tracks(){return (DATA&&DATA.tracks)||[];}
 function tracksMulti(){return tracks().filter(t=>(t.members||[]).length>=2);}
 function trackByName(name){return tracks().find(t=>t.name===name)||null;}
-// Which board column a unified track card lands in: driven by the track's
-// furthest-along stage (a mostly-shipped track goes to Completed). Same mapping
-// the pipeline uses, collapsed to the 3 board columns.
+// Which board column a unified track card lands in. Driven by the STRANDS'
+// collective activity, not the furthest-along stage: a track is Completed only
+// when EVERY strand is done; any active (in-flight) strand -> Active; else any
+// backlog (queued, not-started) strand -> Backlog. So a track with 3 shipped PRs
+// but an open spec + open issues is Active (live work), not Completed. The
+// collector computes this as facts.placement (consolidate.strand_activity).
 function trackColumn(t){
-  const st=((t.facts||{}).furthest_stage)||'spec';
-  if(st==='shipped') return 'completed';
-  if(st==='spec') return 'backlog';
-  return 'active';  // routed / executing / review -> in flight
+  const pl=(t.facts||{}).placement;
+  if(pl==='active'||pl==='backlog'||pl==='completed') return pl;
+  // Fallback for tracks stamped before placement existed.
+  return ((t.facts||{}).furthest_stage==='shipped')?'completed':'active';
 }
 function cardId(c){
   const n=(c.github||{}).number;

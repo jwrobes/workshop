@@ -242,6 +242,63 @@ class StrandStageTests(unittest.TestCase):
         self.assertEqual(consolidate.strand_stage(issue_card(112, "x")), "spec")
 
 
+class StrandActivityTests(unittest.TestCase):
+    def test_open_pr_is_active(self):
+        self.assertEqual(consolidate.strand_activity(pr_card(118, "x")), "active")
+
+    def test_open_spec_pr_is_active(self):
+        self.assertEqual(consolidate.strand_activity(
+            pr_card(118, "Specs: Stage 2")), "active")
+
+    def test_open_issue_is_backlog(self):
+        self.assertEqual(consolidate.strand_activity(issue_card(111, "x")), "backlog")
+
+    def test_merged_pr_is_done(self):
+        self.assertEqual(consolidate.strand_activity(
+            pr_card(115, "x", state="MERGED", shipped=True)), "done")
+
+    def test_dirty_worktree_is_active(self):
+        self.assertEqual(consolidate.strand_activity(wt_card("b", dirty=3)), "active")
+
+    def test_clean_worktree_is_done(self):
+        self.assertEqual(consolidate.strand_activity(wt_card("b")), "done")
+
+
+class TrackPlacementTests(unittest.TestCase):
+    def _place(self, cards):
+        tracks = [{"name": "t", "members": [consolidate._card_id(c) for c in cards]}]
+        consolidate.stamp_track_facts(tracks, cards)
+        return tracks[0]["facts"]["placement"]
+
+    def test_all_done_is_completed(self):
+        self.assertEqual(self._place([
+            pr_card(1, "a", state="MERGED", shipped=True),
+            pr_card(2, "b", state="MERGED", shipped=True)]), "completed")
+
+    def test_any_active_is_active_even_with_shipped(self):
+        # The briefing case: 3 merged impl + open spec-PR + open issues -> Active,
+        # NOT Completed. A shipped strand does not make the whole track done.
+        self.assertEqual(self._place([
+            pr_card(115, "a", state="MERGED", shipped=True),
+            pr_card(117, "b", state="MERGED", shipped=True),
+            pr_card(119, "c", state="MERGED", shipped=True),
+            pr_card(118, "Specs: Stage 2"),          # open spec-PR -> active
+            issue_card(111, "d"), issue_card(112, "e")]), "active")
+
+    def test_only_backlog_open_is_backlog(self):
+        # Shipped work + only open ISSUES (queued, nobody working) -> Backlog.
+        self.assertEqual(self._place([
+            pr_card(1, "a", state="MERGED", shipped=True),
+            issue_card(2, "b"), issue_card(3, "c")]), "backlog")
+
+    def test_activity_counts_present(self):
+        tracks = [{"name": "t", "members": ["claw-playbook#1", "claw-playbook#2"]}]
+        consolidate.stamp_track_facts(tracks, [
+            pr_card(1, "a"), issue_card(2, "b")])
+        self.assertEqual(tracks[0]["facts"]["activity_counts"],
+                         {"active": 1, "backlog": 1, "done": 0})
+
+
 class TrackFactsTests(unittest.TestCase):
     def _briefing_track(self):
         # The communications-hub track: 3 merged impl PRs, 1 open spec-PR, 2 issues.

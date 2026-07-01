@@ -74,12 +74,12 @@ check('pipeline SHIPPED stop shows a non-zero count (not "0")',
   shippedShown !== null && shippedShown > 0, `shown=${shippedShown}`);
 
 // --- 5. The specific briefing PRs are FINDABLE on this board. ---
-// Expand Completed, then EXPAND the briefing unified track card (the briefing
-// PRs are now strands inside one track card, not loose rows — see
-// UNIFIED-CARD-MODEL.md). Then look for #119 / #117 / #115 by rendered text.
-const completedHead = p.locator('[data-region="board"] >> text=Completed').first();
-if (await completedHead.count()) { await completedHead.click(); await p.waitForTimeout(150); }
+// The briefing PRs are now strands inside ONE unified track card (not loose
+// rows). That track still has live strands (open spec + open issues), so it
+// lands in the ACTIVE column (always expanded) — NOT Completed. Expand the
+// track card's inline preview, then look for #119 / #117 / #115 by text.
 const brief = p.locator('[data-unified-track="communications-hub-morning-briefing"]');
+check('briefing track card is on the board', await brief.count() > 0);
 if (await brief.count()) {
   const toggle = brief.locator('[data-action="toggle-track"]').first();
   if (await toggle.count()) { await toggle.click(); await p.waitForTimeout(120); }

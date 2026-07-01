@@ -41,10 +41,9 @@ await p.locator('[data-product="magic-me"]').first().click();
 await p.waitForTimeout(150);
 await p.locator('[data-repo="claw-playbook"]').first().click();
 await p.waitForTimeout(150);
-const completedHead = p.locator('[data-region="board"] >> text=Completed').first();
-if (await completedHead.count()) { await completedHead.click(); await p.waitForTimeout(150); }
-
-// Click the track name (the open-track affordance), NOT the chevron preview.
+// The briefing track has live strands, so it sits in the ACTIVE column (always
+// expanded) — no Completed-expand needed. Click the track name (the open-track
+// affordance), NOT the chevron preview.
 const nameBtn = p.locator(`[data-unified-track="${TRACK}"] [data-action="open-track"]`).first();
 check('track name is clickable on the board', await nameBtn.count() > 0);
 await nameBtn.click();

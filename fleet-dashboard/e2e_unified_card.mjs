@@ -44,13 +44,14 @@ await p.waitForTimeout(150);
 const onRepo = await p.evaluate(() => STATE.level === 'repo' && STATE.repoId === 'claw-playbook');
 check('clicked into claw-playbook repo board', onRepo);
 
-// --- Expand the Completed column (the briefing work is shipped). ---
-const completedHead = p.locator('[data-region="board"] >> text=Completed').first();
-if (await completedHead.count()) { await completedHead.click(); await p.waitForTimeout(150); }
-
 // The track under test. Members after overrides:
 //   #118 open spec-PR, #111/#112 open issues, #115/#117/#119 merged impl-PRs.
+// Because it still has live strands (open spec + open issues), the whole track
+// is NOT Completed — it lands in the ACTIVE column (always expanded). This is
+// the placement fix: a shipped strand doesn't make the whole track done.
 const TRACK = 'communications-hub-morning-briefing';
+check('briefing track lands in the ACTIVE column (it has live strands)',
+  await p.locator(`[data-column="active"] [data-unified-track="${TRACK}"]`).count() === 1);
 
 // --- ASSERTION 1: exactly ONE unified card for this track on the board. ---
 const uni = p.locator(`[data-view="repo"] [data-unified-track="${TRACK}"]`);

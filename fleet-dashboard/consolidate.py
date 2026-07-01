@@ -320,6 +320,36 @@ def strand_stage(card):
     return _STAGE_SPEC
 
 
+def strand_activity(card):
+    """How 'live' a strand is, for deciding a track's board column:
+      - 'active':  work is in flight — an open PR (spec or impl, sitting
+        in-review), a dirty/ahead worktree, or a plan card marked active.
+      - 'backlog': queued but not started — an open ISSUE (spec'd, nobody's
+        picked it up), or a plan card marked backlog.
+      - 'done':    merged / closed / shipped — nothing left on this strand.
+    The point (Jonathan's rule): a track is only truly Completed when ALL its
+    strands are done; if anything's active it's Active; if the rest are just
+    backlog it's Backlog. (Whether an active strand is REALLY needed — vs a
+    duplicate/supplanted loose end to clip — is a fuzzy call left to the LLM.)"""
+    role = strand_role(card)
+    state = strand_state(card)
+    if state in ("merged", "closed"):
+        return "done"
+    if role == "worktree":
+        return "active" if state in ("dirty", "ahead") else "done"
+    if role == "issue":
+        return "backlog" if state == "open" else "done"
+    if role in ("spec-PR", "impl-PR"):
+        return "active" if state == "open" else "done"
+    # A local plan card: reflect its column.
+    status = (card.get("status") or "").lower()
+    if status == "backlog":
+        return "backlog"
+    if status in ("completed", "done", "shipped"):
+        return "done"
+    return "active"
+
+
 def strand_detail(card):
     """The full deterministic fact-row for one member — plus every helpful field
     we can surface to describe what the strand is TRYING TO DO (body, labels,
@@ -337,6 +367,7 @@ def strand_detail(card):
         "state": strand_state(card),
         "source": strand_source(card),
         "stage": strand_stage(card),
+        "activity": strand_activity(card),
         "url": gh.get("url") or card.get("path") or "",
         "body": body[:2000],
         "labels": gh.get("labels") or [],
@@ -369,6 +400,17 @@ def track_facts(details):
     for d in details:
         if _STAGE_ORDER.get(d["stage"], 0) > _STAGE_ORDER.get(furthest, 0):
             furthest = d["stage"]
+    # Board column (Jonathan's rule): a track is Completed only when EVERY strand
+    # is done; any active strand -> Active; else any backlog strand -> Backlog.
+    # `furthest_stage` (kept for the pipeline map) is NOT the placement signal —
+    # a track with a shipped strand but open issues is still live, not done.
+    activities = {strand_activity_of(d) for d in details}
+    if "active" in activities:
+        placement = "active"
+    elif "backlog" in activities:
+        placement = "backlog"
+    else:
+        placement = "completed"
     return {
         "count": len(details),
         "roles": roles,
@@ -377,7 +419,19 @@ def track_facts(details):
         "merged": merged,
         "impl_merged_spec_open": bool(open_spec and merged),
         "furthest_stage": furthest,
+        "placement": placement,
+        "activity_counts": {a: sum(1 for d in details
+                                   if strand_activity_of(d) == a)
+                            for a in ("active", "backlog", "done")},
     }
+
+
+def strand_activity_of(detail):
+    """Read a strand's activity from an already-computed detail dict, falling
+    back to 'done' for placeholder rows (unknown members) so they don't wrongly
+    keep a finished track out of Completed."""
+    a = detail.get("activity")
+    return a if a in ("active", "backlog", "done") else "done"
 
 
 def stamp_track_facts(tracks, cards):
