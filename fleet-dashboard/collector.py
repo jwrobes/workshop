@@ -301,7 +301,7 @@ class GitHubForge(Forge):
             return []
         code, out = run(["gh", "pr", "list", "--repo", repo_slug,
                          "--state", "open", "--limit", "100", "--json",
-                         "number,title,headRefName,labels,createdAt,isDraft,url"],
+                         "number,title,body,headRefName,labels,createdAt,isDraft,url"],
                         timeout=30)
         if code != 0 or not out:
             return []
@@ -310,6 +310,7 @@ class GitHubForge(Forge):
         except json.JSONDecodeError:
             return []
         return [{"number": p.get("number"), "title": p.get("title") or "",
+                 "body": p.get("body") or "",
                  "headRefName": p.get("headRefName") or "",
                  "labels": self._label_names(p), "createdAt": p.get("createdAt"),
                  "isDraft": bool(p.get("isDraft")), "url": p.get("url")}
@@ -321,7 +322,7 @@ class GitHubForge(Forge):
         # `gh issue list` excludes PRs by default (good — PRs come from list_open_prs).
         code, out = run(["gh", "issue", "list", "--repo", repo_slug,
                          "--state", "open", "--limit", "100", "--json",
-                         "number,title,labels,createdAt,url"], timeout=30)
+                         "number,title,body,labels,createdAt,url"], timeout=30)
         if code != 0 or not out:
             return []
         try:
@@ -329,6 +330,7 @@ class GitHubForge(Forge):
         except json.JSONDecodeError:
             return []
         return [{"number": i.get("number"), "title": i.get("title") or "",
+                 "body": i.get("body") or "",
                  "labels": self._label_names(i), "createdAt": i.get("createdAt"),
                  "url": i.get("url")}
                 for i in issues]
@@ -338,7 +340,7 @@ class GitHubForge(Forge):
             return []
         code, out = run(["gh", "pr", "list", "--repo", repo_slug,
                          "--state", "merged", "--limit", str(limit), "--json",
-                         "number,title,headRefName,labels,mergedAt,url"],
+                         "number,title,body,headRefName,labels,mergedAt,url"],
                         timeout=30)
         if code != 0 or not out:
             return []
@@ -347,6 +349,7 @@ class GitHubForge(Forge):
         except json.JSONDecodeError:
             return []
         return [{"number": p.get("number"), "title": p.get("title") or "",
+                 "body": p.get("body") or "",
                  "headRefName": p.get("headRefName") or "",
                  "labels": self._label_names(p), "mergedAt": p.get("mergedAt"),
                  "url": p.get("url")}
@@ -830,6 +833,10 @@ def merge_forge_items_into_cards(cards, forge_items, now, repo_to_product=None):
               "title": it.get("title"), "url": it.get("url"),
               "state": "MERGED" if is_merged_item else "OPEN",
               "labels": it.get("labels") or [], "branch": it.get("branch"),
+              # The PR/issue description — the richest "what is this trying to do"
+              # signal for the strand detail panel (and the future LLM verdict).
+              # Truncated so a long body can't bloat the inlined status.json.
+              "body": (it.get("body") or "")[:2000],
               "isDraft": bool(it.get("isDraft")), "createdAt": it.get("createdAt"),
               "mergedAt": it.get("mergedAt")}
 
@@ -929,7 +936,8 @@ def collect_forge_items(cfg, forge, products_out):
                 items.append({
                     "repo": repo.get("name") or slug.split("/")[-1],
                     "kind": "pr", "number": p.get("number"),
-                    "title": p.get("title"), "branch": p.get("headRefName"),
+                    "title": p.get("title"), "body": p.get("body"),
+                    "branch": p.get("headRefName"),
                     "labels": p.get("labels"), "createdAt": p.get("createdAt"),
                     "isDraft": p.get("isDraft"), "url": p.get("url"),
                     "has_impl_pr": has_impl,
@@ -938,7 +946,7 @@ def collect_forge_items(cfg, forge, products_out):
                 items.append({
                     "repo": repo.get("name") or slug.split("/")[-1],
                     "kind": "issue", "number": i.get("number"),
-                    "title": i.get("title"), "branch": None,
+                    "title": i.get("title"), "body": i.get("body"), "branch": None,
                     "labels": i.get("labels"), "createdAt": i.get("createdAt"),
                     "isDraft": False, "url": i.get("url"),
                     "has_impl_pr": False,
@@ -958,7 +966,8 @@ def collect_forge_items(cfg, forge, products_out):
                 items.append({
                     "repo": repo.get("name") or slug.split("/")[-1],
                     "kind": "pr", "number": p.get("number"),
-                    "title": p.get("title"), "branch": p.get("headRefName"),
+                    "title": p.get("title"), "body": p.get("body"),
+                    "branch": p.get("headRefName"),
                     "labels": p.get("labels"), "createdAt": p.get("mergedAt"),
                     "isDraft": False, "url": p.get("url"),
                     "has_impl_pr": False, "merged": True,

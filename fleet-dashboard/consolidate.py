@@ -321,16 +321,28 @@ def strand_stage(card):
 
 
 def strand_detail(card):
-    """The full deterministic fact-row for one member."""
+    """The full deterministic fact-row for one member — plus every helpful field
+    we can surface to describe what the strand is TRYING TO DO (body, labels,
+    dates, branch). The strand detail panel renders these; the Phase-3 LLM reads
+    the same block."""
+    gh = card.get("github") or {}
+    # Description: prefer the PR/issue body (the real intent); fall back to the
+    # local plan card's body/goal when there's no forge object (a plan strand).
+    body = (gh.get("body") or card.get("body") or card.get("goal") or "").strip()
     return {
         "id": _card_id(card),
-        "title": (card.get("github") or {}).get("title") or card.get("title")
-        or card.get("slug") or _card_id(card),
+        "title": gh.get("title") or card.get("title") or card.get("slug")
+        or _card_id(card),
         "role": strand_role(card),
         "state": strand_state(card),
         "source": strand_source(card),
         "stage": strand_stage(card),
-        "url": (card.get("github") or {}).get("url") or card.get("path") or "",
+        "url": gh.get("url") or card.get("path") or "",
+        "body": body[:2000],
+        "labels": gh.get("labels") or [],
+        "branch": gh.get("branch") or card.get("branch") or "",
+        "created_at": gh.get("createdAt"),
+        "merged_at": gh.get("mergedAt"),
     }
 
 

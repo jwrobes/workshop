@@ -149,12 +149,12 @@ class AttachTests(unittest.TestCase):
 
 
 def pr_card(number, title, state="OPEN", labels=None, branch=None,
-            shipped=False, repo="claw-playbook"):
+            shipped=False, repo="claw-playbook", body=""):
     """A card carrying a github PR object, like the collector produces."""
     return {"repo": repo, "shipped": shipped,
             "github": {"kind": "pr", "number": number, "title": title,
                        "state": state, "labels": labels or [], "branch": branch,
-                       "url": f"https://gh/{repo}/pull/{number}"}}
+                       "body": body, "url": f"https://gh/{repo}/pull/{number}"}}
 
 
 def issue_card(number, title, state="OPEN", repo="claw-playbook"):
@@ -283,6 +283,26 @@ class TrackFactsTests(unittest.TestCase):
         d118 = by_id["claw-playbook#118"]
         self.assertEqual((d118["role"], d118["state"], d118["stage"]),
                          ("spec-PR", "open", "review"))
+
+    def test_detail_carries_body_and_metadata(self):
+        # The panel needs "what is this trying to do" — body, labels, branch.
+        c = pr_card(115, "feat(bosque): Communications Hub", state="MERGED",
+                    shipped=True, labels=["ready"], branch="bosque/comms",
+                    body="Adds the morning-briefing pipeline: digest + calendar.")
+        d = consolidate.strand_detail(c)
+        self.assertIn("morning-briefing pipeline", d["body"])
+        self.assertEqual(d["labels"], ["ready"])
+        self.assertEqual(d["branch"], "bosque/comms")
+
+    def test_detail_body_falls_back_to_plan_body(self):
+        # A local plan strand has no github object — use its card body/goal.
+        d = consolidate.strand_detail(
+            {"repo": "r", "slug": "p", "title": "Plan", "body": "The plan text."})
+        self.assertEqual(d["body"], "The plan text.")
+
+    def test_detail_body_truncated(self):
+        d = consolidate.strand_detail(pr_card(1, "x", body="z" * 5000))
+        self.assertEqual(len(d["body"]), 2000)
 
     def test_unknown_member_id_still_listed(self):
         tracks = [{"name": "t", "members": ["ghost#999", "x#1"]}]

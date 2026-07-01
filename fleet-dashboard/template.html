@@ -165,7 +165,7 @@ function mdToHtml(src){
 function $(id){return document.getElementById(id);}
 function slug(s){return String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');}
 
-const STATE={level:'fleet',productId:null,repoId:null,planId:null,doneOpen:false,mapExpanded:{},mapAll:false,trackOpen:{}};
+const STATE={level:'fleet',productId:null,repoId:null,planId:null,doneOpen:false,mapExpanded:{},mapAll:false,trackOpen:{},trackName:null,strandOpen:{}};
 
 function products(){return (DATA&&DATA.products)||[];}
 function kanban(){return (DATA&&DATA.kanban)||[];}
@@ -377,7 +377,11 @@ function buildPrompt(card,prod,mode){
 
 function goTo(level,productId,planId,repoId){
   STATE.level=level;STATE.productId=productId??null;STATE.planId=planId??null;STATE.repoId=repoId??null;
-  STATE.doneOpen=false;STATE.mapExpanded={};STATE.mapAll=false;STATE.trackOpen={};
+  STATE.doneOpen=false;STATE.mapExpanded={};STATE.mapAll=false;STATE.trackOpen={};STATE.strandOpen={};
+  // The track detail view carries the track name in the planId slot (a track
+  // has no plan). Lift it to STATE.trackName so crumbs + render read it cleanly.
+  if(level==='track'){STATE.trackName=planId??null;STATE.planId=null;}
+  else STATE.trackName=null;
   // When opening a plan, resolve its real product/repo up front so crumbs +
   // back-link are correct even when navigated from the fleet map (null product).
   if(level==='plan'){
@@ -408,6 +412,7 @@ function renderCrumbs(){
     rb.onclick=()=>goTo('repo',pid,null,STATE.repoId);c.appendChild(rb);
   }
   if(STATE.level==='plan'){c.appendChild(el('<span class="sep">/</span>'));c.appendChild(el('<button class="crumb" style="color:#23211c">'+esc(STATE.planId)+'</button>'));}
+  if(STATE.level==='track'){c.appendChild(el('<span class="sep">/</span>'));c.appendChild(el('<button class="crumb" style="color:#23211c">'+esc(STATE.trackName)+'</button>'));}
 }
 
 // ---------- PIPELINE MAP (shared) ----------
@@ -716,14 +721,20 @@ function factSummary(t){
 function unifiedCard(t,repoName){
   const open=!!STATE.trackOpen[t.name];
   const wrap=el('<div class="kcard" data-unified-track="'+attr(t.name)+'" style="display:block;padding:0;cursor:default"></div>');
-  // Header (toggles expand). Shows track name + fact summary line.
-  const head=el('<button data-action="toggle-track" style="all:unset;box-sizing:border-box;cursor:pointer;display:block;width:100%;padding:11px 13px"></button>');
-  head.innerHTML='<span style="display:flex;align-items:center;gap:7px">'
-    +'<span style="font-size:9px;color:#9a917f;transform:rotate('+(open?'90deg':'0deg')+');transition:transform .2s">&#9654;</span>'
-    +'<span class="t" style="flex:1;min-width:0">'+esc(t.name)+'</span>'
-    +'<span class="mono" style="font-size:9px;letter-spacing:.06em;text-transform:uppercase;color:#7a6a3f;background:#efe7d2;padding:2px 6px;border-radius:4px">track</span></span>'
-    +'<span class="mono" data-track-facts style="display:block;font-size:11px;color:#8c8576;margin:6px 0 0 16px;overflow-wrap:anywhere">'+esc(factSummary(t))+'</span>';
-  head.onclick=()=>{STATE.trackOpen[t.name]=!STATE.trackOpen[t.name];render();};
+  // Header: the CHEVRON toggles the inline strand preview; the TRACK NAME opens
+  // the full track detail view (its own page). Two distinct affordances.
+  const head=el('<div style="display:block;box-sizing:border-box;padding:11px 13px"></div>');
+  const row=el('<div style="display:flex;align-items:center;gap:7px"></div>');
+  const chev=el('<button data-action="toggle-track" title="preview strands" style="all:unset;cursor:pointer;flex:none;font-size:9px;color:#9a917f;transform:rotate('+(open?'90deg':'0deg')+');transition:transform .2s">&#9654;</button>');
+  chev.onclick=(e)=>{e.stopPropagation();STATE.trackOpen[t.name]=!STATE.trackOpen[t.name];render();};
+  const name=el('<button data-action="open-track" class="t" style="all:unset;cursor:pointer;flex:1;min-width:0;overflow-wrap:anywhere">'+esc(t.name)+'</button>');
+  name.onclick=()=>goTo('track',STATE.productId,t.name,repoName);
+  row.appendChild(chev);row.appendChild(name);
+  row.appendChild(el('<span class="mono" style="flex:none;font-size:9px;letter-spacing:.06em;text-transform:uppercase;color:#7a6a3f;background:#efe7d2;padding:2px 6px;border-radius:4px">track</span>'));
+  head.appendChild(row);
+  const facts=el('<button data-action="open-track" data-track-facts class="mono" style="all:unset;cursor:pointer;display:block;font-size:11px;color:#8c8576;margin:6px 0 0 16px;overflow-wrap:anywhere">'+esc(factSummary(t))+' &nbsp;<span style="color:#a8916a">open →</span></button>');
+  facts.onclick=()=>goTo('track',STATE.productId,t.name,repoName);
+  head.appendChild(facts);
   wrap.appendChild(head);
   if(open) wrap.appendChild(strandMap(t,repoName));
   return wrap;
@@ -1046,6 +1057,114 @@ function render(){
   else if(STATE.level==='product') renderProduct(app);
   else if(STATE.level==='repo') renderRepo(app);
   else if(STATE.level==='plan') renderPlan(app);
+  else if(STATE.level==='track') renderTrackDetail(app);
+}
+
+// ---------- TRACK DETAIL (full page): strands along the pipeline ----------
+// Clicking a track's name on the board opens this. Strands are laid out in the
+// 5 pipeline stage lanes (spec'd..shipped) as compact chips; click a chip to
+// expand its full detail. A reserved region at the top is where the Phase-3 LLM
+// verdict (summary / next step / what to clean/close/dedupe) will render.
+function findTrack(name){return (tracks()||[]).find(t=>t.name===name)||null;}
+function stageMeta(key){return (typeof STAGES!=='undefined'?STAGES:[]).find(s=>s.key===key)||{key,name:key,color:'#b3a997'};}
+function strandChip(d,repoName){
+  const sd=stateDot(d.state);
+  const num=String(d.id).replace(/^.*#/,'#');
+  const opened=!!STATE.strandOpen[d.id];
+  const chip=el('<button data-strand-member="'+attr(d.id)+'" data-strand-role="'+attr(d.role)+'" data-strand-state="'+attr(d.state)+'" data-strand-source="'+attr(d.source||'—')+'" data-strand-stage="'+attr(d.stage)+'" data-open="'+opened+'" '
+    +'style="all:unset;box-sizing:border-box;cursor:pointer;display:block;width:100%;border:1px solid '+(opened?sd.d:'#e6e0d5')+';border-left:3px solid '+sd.d+';border-radius:7px;background:'+(opened?'#faf6ee':'#fff')+';padding:8px 9px;margin-bottom:7px"></button>');
+  chip.innerHTML='<span style="display:flex;align-items:center;gap:6px">'
+    +'<span class="mono" style="flex:none;font-size:11px;color:'+sd.c+'">'+esc(num)+'</span>'
+    +'<span class="mono" style="flex:none;font-size:8.5px;letter-spacing:.06em;text-transform:uppercase;color:#8c8576">'+esc(d.role)+'</span>'
+    +(d.source&&d.source!=='—'?'<span class="mono" data-strand-source-tag style="flex:none;font-size:8.5px;color:#7a6a3f;background:#f2ede2;padding:1px 5px;border-radius:3px;margin-left:auto">'+esc(d.source)+'</span>':'<span style="margin-left:auto"></span>')+'</span>'
+    +'<span class="mono" style="display:block;font-size:11px;color:#4a463d;margin-top:5px;line-height:1.35;overflow-wrap:anywhere">'+esc(String(d.title).slice(0,90))+'</span>'
+    +'<span class="mono" style="display:block;font-size:9px;color:'+sd.c+';margin-top:5px">'+esc(d.state)+'</span>';
+  chip.onclick=()=>{STATE.strandOpen[d.id]=!STATE.strandOpen[d.id];render();};
+  return chip;
+}
+function strandDetailPanel(d,repoName){
+  const sd=stateDot(d.state);
+  const num=String(d.id).replace(/^.*#/,'#');
+  const box=el('<div data-strand-detail="'+attr(d.id)+'" style="border:1px solid #e6e0d5;border-left:3px solid '+sd.d+';border-radius:9px;background:#fff;padding:14px 16px;margin-bottom:10px"></div>');
+  // Header: id + full title + close.
+  const head=el('<div style="display:flex;align-items:flex-start;gap:10px"></div>');
+  head.innerHTML='<span class="mono" style="flex:none;font-size:13px;color:'+sd.c+';font-weight:600">'+esc(num)+'</span>'
+    +'<span class="mono" style="flex:1;min-width:0;font-size:13px;color:#2a2722;line-height:1.4;overflow-wrap:anywhere">'+esc(d.title)+'</span>';
+  const close=el('<button title="collapse" style="all:unset;cursor:pointer;flex:none;font-size:14px;color:#b3ab9b;line-height:1">&times;</button>');
+  close.onclick=()=>{STATE.strandOpen[d.id]=false;render();};
+  head.appendChild(close);box.appendChild(head);
+  // Fact chips: role · state · source · stage · dates · branch.
+  const facts=el('<div class="mono" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;font-size:10px"></div>');
+  const tag=(label,color,bg)=>'<span style="color:'+(color||'#6e6757')+';background:'+(bg||'#f3f0e8')+';padding:2px 7px;border-radius:4px">'+esc(label)+'</span>';
+  let ft=tag(d.role,'#7a6a3f','#efe7d2')+tag(d.state,sd.c,'#f3f0e8')+tag('stage: '+d.stage,'#9a917f','#f3f0e8');
+  if(d.source&&d.source!=='—') ft+=tag('source: '+d.source,'#7a6a3f','#f2ede2');
+  (d.labels||[]).forEach(l=>{ft+=tag(l,'#5d8a6f','#e9f0e9');});
+  facts.innerHTML=ft;box.appendChild(facts);
+  // Dates + branch line.
+  const metaBits=[];
+  if(d.merged_at) metaBits.push('merged '+String(d.merged_at).slice(0,10));
+  else if(d.created_at) metaBits.push('opened '+String(d.created_at).slice(0,10));
+  if(d.branch) metaBits.push('branch: '+d.branch);
+  if(metaBits.length) box.appendChild(el('<div class="mono" style="font-size:10px;color:#a39c8c;margin-top:8px;overflow-wrap:anywhere">'+esc(metaBits.join('  ·  '))+'</div>'));
+  // The description — "what this strand is trying to do".
+  const body=(d.body||'').trim();
+  if(body){
+    box.appendChild(el('<div class="mono" style="font-size:9px;letter-spacing:.1em;color:#b3ab9b;margin:12px 0 4px">DESCRIPTION</div>'));
+    box.appendChild(el('<div data-strand-body style="font-size:12px;color:#5b5447;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere;max-height:260px;overflow:auto">'+esc(body)+'</div>'));
+  }else{
+    box.appendChild(el('<div class="mono" data-strand-body style="font-size:11px;color:#c2b89f;margin-top:10px;font-style:italic">No description on the '+(d.role==='issue'?'issue':(d.role==='plan'?'plan':'PR'))+'.</div>'));
+  }
+  // Link out.
+  if(d.url) box.appendChild(el('<a href="'+attr(d.url)+'" target="_blank" rel="noopener" class="mono" data-strand-link style="display:inline-block;margin-top:12px;font-size:11px;color:#8c6a2a;text-decoration:none;border:1px solid #ddd4c2;border-radius:6px;padding:4px 10px">open on GitHub →</a>'));
+  // RESERVED slot for the Phase-3 LLM take on THIS strand (per UNIFIED-CARD-MODEL
+  // layer 2). Rendered faint until the verdict pass exists.
+  box.appendChild(el('<div data-strand-llm-slot style="margin-top:12px;border-top:1px dashed #ece5d6;padding-top:9px;font-size:10.5px;color:#c2b89f;font-style:italic">LLM take on this strand — added by the strand-analysis pass (Phase 3).</div>'));
+  return box;
+}
+function renderTrackDetail(app){
+  const t=findTrack(STATE.trackName);
+  const p=products().find(x=>x.id===STATE.productId)||{};
+  const sec=el('<section data-view="track" data-track="'+attr(STATE.trackName||'')+'" style="padding-top:30px"></section>');
+  if(!t){sec.innerHTML='<p class="empty">Track not found.</p>';app.appendChild(sec);return;}
+  const repoName=STATE.repoId||(t.members_detail&&t.members_detail[0]&&(t.members_detail[0].id||'').split('#')[0])||'';
+  sec.innerHTML='<div class="eyebrow" style="color:#a39c8c;letter-spacing:.16em">'+esc((p.name||'')+(repoName?' · '+repoName:''))+' · track</div>'
+    +'<h1 class="mono" style="font-weight:500;font-size:clamp(22px,3.6vw,34px);margin:0;letter-spacing:-.01em;color:#2a2722;overflow-wrap:anywhere">'+esc(t.name)+'</h1>'
+    +'<div class="mono" data-track-facts style="font-size:12px;color:#8c8576;margin-top:9px">'+esc(factSummary(t))+'</div>';
+  // RESERVED verdict region (Phase-3 LLM: summary / next step / what to clean,
+  // close, dedupe, what's outdated/supplanted). Faint placeholder for now.
+  const verdict=el('<div data-region="track-verdict" style="margin-top:20px;border:1px dashed #d7cdb8;border-radius:10px;background:#faf6ee;padding:14px 16px"></div>');
+  verdict.innerHTML='<div class="mono" style="font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:#a8916a">Analysis</div>'
+    +'<div class="mono" style="font-size:12px;color:#b3a894;margin-top:6px;font-style:italic;line-height:1.5">The strand-analysis pass (Phase 3) will summarize what\'s happening here, recommend the next step, and flag what to close / clean up / dedupe (outdated, supplanted, duplicate work). Not run yet.</div>';
+  sec.appendChild(verdict);
+  // PIPELINE LANES: one column per stage; strands placed by their computed stage.
+  const stages=(typeof STAGES!=='undefined'?STAGES:[]);
+  const details=(t.members_detail||[]);
+  const byStage={};stages.forEach(s=>byStage[s.key]=[]);
+  details.forEach(d=>{(byStage[d.stage]||(byStage[d.stage]=[])).push(d);});
+  const narrow=window.innerWidth<820;
+  const lanesWrap=el('<div style="margin-top:24px"></div>');
+  lanesWrap.appendChild(el('<div class="mono" style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a917f;margin-bottom:12px">Pipeline · strands by stage</div>'));
+  const lanes=el('<div data-region="pipeline-lanes" style="display:grid;grid-template-columns:repeat('+(narrow?1:stages.length)+',1fr);gap:'+(narrow?'14px':'10px')+'"></div>');
+  stages.forEach(s=>{
+    const items=byStage[s.key]||[];
+    const lane=el('<div data-lane="'+attr(s.key)+'"></div>');
+    lane.appendChild(el('<div style="display:flex;align-items:center;gap:6px;margin-bottom:9px;padding-bottom:7px;border-bottom:2px solid '+s.color+'"><span style="width:7px;height:7px;border-radius:50%;background:'+s.color+'"></span><span class="mono" style="font-size:11px;color:#5b5447">'+esc(s.name)+'</span><span class="mono" style="font-size:10px;color:#b3ab9b;margin-left:auto">'+items.length+'</span></div>'));
+    if(!items.length) lane.appendChild(el('<div class="mono" style="font-size:10px;color:#cdc4b1;padding:2px 0">—</div>'));
+    items.forEach(d=>lane.appendChild(strandChip(d,repoName)));
+    lanes.appendChild(lane);
+  });
+  lanesWrap.appendChild(lanes);
+  sec.appendChild(lanesWrap);
+  // EXPANDED strand detail panels (full-width, below the lanes so they have room
+  // for the description + metadata). Shown for whichever chips are open.
+  const openDetails=details.filter(d=>STATE.strandOpen[d.id]);
+  if(openDetails.length){
+    const dwrap=el('<div data-region="strand-details" style="margin-top:26px"></div>');
+    dwrap.appendChild(el('<div class="mono" style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a917f;margin-bottom:12px">Strand detail</div>'));
+    openDetails.forEach(d=>dwrap.appendChild(strandDetailPanel(d,repoName)));
+    sec.appendChild(dwrap);
+  }
+  app.appendChild(sec);
 }
 
 // ---------- WORK TRACKS (Phase 5): review + fix LLM groupings ----------

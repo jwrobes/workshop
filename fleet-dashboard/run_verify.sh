@@ -14,3 +14,4 @@ export NODE_PATH="$(npm root -g)"
 node verify_ui.mjs
 node e2e_repo_board.mjs
 node e2e_unified_card.mjs
+node e2e_track_detail.mjs
