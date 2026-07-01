@@ -187,6 +187,9 @@ function plansFor(pid){return kanban().filter(c=>c.product===pid&&!c.archived);}
 // Work-tracks (Phase 5): consolidated groupings. Mirrors collector's _card_id.
 function tracks(){return (DATA&&DATA.tracks)||[];}
 function tracksMulti(){return tracks().filter(t=>(t.members||[]).length>=2);}
+// A track belongs to a product if any member card is in that product (used to
+// scope the Pass-3 rollup to a product page).
+function tracksInProduct(t,pid){return (t.members||[]).some(id=>{const c=cardById(id);return c&&c.product===pid;});}
 function trackByName(name){return tracks().find(t=>t.name===name)||null;}
 // Which board column a unified track card lands in. Driven by the STRANDS'
 // collective activity, not the furthest-along stage: a track is Completed only
@@ -644,6 +647,61 @@ function runlogPanel(){
   return box;
 }
 
+// The ROLLUP panel (Pass 3): the portfolio picture — a near-done/mid/early/stuck
+// bucket distribution + the per-track completion %s. `scope` filters to a
+// product's tracks (by name) when given; otherwise the whole fleet. Returns null
+// when no rollup is cached (offline-safe) or no tracks fall in scope.
+const _BUCKET_META={'near-done':{label:'near done',color:'#5d8a6f',bg:'#e9f0e9'},
+  'mid':{label:'in progress',color:'#a9762a',bg:'#fbf1dc'},
+  'early':{label:'early',color:'#8c8576',bg:'#f3f0e8'},
+  'stuck':{label:'needs a decision',color:'#c0632f',bg:'#f7e4da'}};
+function rollupPanel(scopeNames){
+  const r=(DATA&&DATA.rollup)||null;
+  if(!r||!(r.tracks||[]).length) return null;
+  let rows=r.tracks;
+  if(scopeNames){const set=new Set(scopeNames);rows=rows.filter(t=>set.has(t.name));}
+  if(!rows.length) return null;
+  // Recompute counts within scope.
+  const counts={'near-done':0,'mid':0,'early':0,'stuck':0};
+  rows.forEach(t=>{counts[t.bucket]=(counts[t.bucket]||0)+1;});
+  const box=el('<div data-region="rollup" data-track-count="'+rows.length+'" style="margin:20px 0 6px;border:1px solid #e6e0d5;border-radius:10px;background:#fffdf9;overflow:hidden"></div>');
+  const head=el('<div style="display:flex;align-items:center;gap:11px;padding:12px 16px;border-bottom:1px solid #ece5d6"></div>');
+  head.innerHTML='<span class="mono" style="font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:#a8916a">Portfolio · LLM rollup</span>'
+    +'<span class="mono" style="font-size:11px;color:#8a7f66">'+rows.length+' track'+(rows.length===1?'':'s')+' analyzed</span>';
+  box.appendChild(head);
+  // Distribution bar: one segment per non-empty bucket, sized by count.
+  const total=rows.length;
+  const dist=el('<div data-region="rollup-distribution" style="display:flex;height:10px;margin:14px 16px 8px;border-radius:5px;overflow:hidden;background:#efe7d2"></div>');
+  ['near-done','mid','early','stuck'].forEach(k=>{
+    if(!counts[k]) return;
+    const m=_BUCKET_META[k];
+    dist.appendChild(el('<div data-bucket="'+k+'" data-count="'+counts[k]+'" title="'+attr(m.label+': '+counts[k])+'" style="width:'+(100*counts[k]/total)+'%;background:'+m.color+'"></div>'));
+  });
+  box.appendChild(dist);
+  // Legend.
+  const legend=el('<div style="display:flex;flex-wrap:wrap;gap:12px;padding:0 16px 12px"></div>');
+  ['stuck','near-done','mid','early'].forEach(k=>{
+    if(!counts[k]) return;const m=_BUCKET_META[k];
+    legend.appendChild(el('<span class="mono" style="display:inline-flex;align-items:center;gap:6px;font-size:11px;color:#6e6757"><span style="width:8px;height:8px;border-radius:2px;background:'+m.color+'"></span>'+esc(m.label)+' · '+counts[k]+'</span>'));
+  });
+  box.appendChild(legend);
+  // Per-track rows (highest completion first; nulls last). Click -> track page.
+  const list=el('<div style="border-top:1px solid #f1ece1"></div>');
+  rows.forEach(t=>{
+    const m=_BUCKET_META[t.bucket]||_BUCKET_META.early;
+    const pct=(t.pct!=null?t.pct:null);
+    const row=el('<button data-rollup-track="'+attr(t.name)+'" data-bucket="'+attr(t.bucket)+'" style="all:unset;cursor:pointer;box-sizing:border-box;width:100%;display:flex;align-items:center;gap:11px;padding:9px 16px;border-top:1px solid #f6f2ea"></button>');
+    row.innerHTML='<span class="mono" style="flex:none;font-size:9px;letter-spacing:.05em;text-transform:uppercase;color:'+m.color+';background:'+m.bg+';border-radius:4px;padding:2px 7px;min-width:92px;text-align:center">'+esc(m.label)+'</span>'
+      +'<span class="mono" style="flex:1;font-size:12px;color:#3b372f;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(t.name)+'</span>'
+      +(t.headline?'<span class="mono" style="flex:none;font-size:10px;color:#a39c8c;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(t.headline)+'</span>':'')
+      +'<span class="mono" style="flex:none;font-size:12px;color:'+(pct!=null&&pct>=70?'#2f7a52':'#8c6a2a')+';min-width:44px;text-align:right">'+(pct!=null?pct+'%':'—')+'</span>';
+    row.onclick=()=>{const tk=(tracks()||[]).find(x=>x.name===t.name);const repo=tk&&tk.members_detail&&tk.members_detail[0]&&(tk.members_detail[0].id||'').split('#')[0];goTo('track',STATE.productId||(products()[0]||{}).id,t.name,repo);};
+    list.appendChild(row);
+  });
+  box.appendChild(list);
+  return box;
+}
+
 function renderFleet(app){
   const ps=products();
   const totalActive=ps.reduce((n,p)=>n+productActive(p.id),0);
@@ -657,6 +715,9 @@ function renderFleet(app){
     +'<h1 class="title">Where things stand</h1>'
     +'<p class="lede">'+totalActive+' plans in flight across '+ps.length+' products. '
     +(totalAttn===0?'Everything is healthy.':totalAttn+' item'+(totalAttn===1?'':'s')+' want a decision from you — everything else is healthy.')+'</p></div>';
+  // The rollup fills "Where things stand" with track-completion intelligence
+  // (Pass 3) when it's been run — the portfolio picture across tracks.
+  const roll=rollupPanel(null);if(roll)sec.appendChild(roll);
   const grid=el('<div class="grid"></div>');
   ps.forEach(p=>{
     const ac=productActive(p.id),at=productAttention(p.id),edge=at>0?'#d7a23f':'#7faa8c';
@@ -698,6 +759,11 @@ function renderProduct(app){
   const repoNames=(p.repos||[]).map(r=>r.name||(r.slug||'').split('/').pop()).join(' · ');
   sec.innerHTML='<div class="eyebrow" style="color:#a39c8c;letter-spacing:.16em">'+esc(repoNames)+'</div><h1 class="title" style="font-weight:500">'+esc(p.name)+'</h1>';
   sec.appendChild(attnPanel(plans,c=>goTo('plan',p.id,c.title,repoForCard(c))));
+
+  // Product-scoped rollup (Pass 3): where THIS product's tracks stand. Scope by
+  // the tracks whose members are this product's cards.
+  const prodTrackNames=tracksMulti().filter(t=>tracksInProduct(t,p.id)).map(t=>t.name);
+  const proll=rollupPanel(prodTrackNames);if(proll)sec.appendChild(proll);
 
   // REPOS grid
   const reposWrap=el('<div data-region="repos" style="margin-top:34px"></div>');

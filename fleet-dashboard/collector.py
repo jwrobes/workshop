@@ -1195,9 +1195,13 @@ def main():
                          "completion (LLM gut % + computed %), cleanup list, "
                          "relationships, per-strand status -> verdicts.json. "
                          "Runs after triage so it sees final membership.")
+    ap.add_argument("--rollup", action="store_true",
+                    help="PASS 3: product/fleet rollup over the Pass-2 verdicts "
+                         "(consumes verdicts.json, does not re-analyze).")
     ap.add_argument("--llm-all", action="store_true",
-                    help="run every LLM pass in order (triage -> analyze). Order "
-                         "matters: triage changes membership before analysis.")
+                    help="run every LLM pass in order (triage -> analyze -> "
+                         "rollup). Order matters: triage changes membership before "
+                         "analysis; rollup consumes analysis.")
     ap.add_argument("--triage-fixture", default=None,
                     help="TEST ONLY: a JSON file of canned triage proposals to "
                          "feed the triage pass INSTEAD of shelling out to claude "
@@ -1213,10 +1217,11 @@ def main():
     if args.analyze_fixture:
         args.analyze = True
     # --llm-all is the convenience that runs each built pass in order (order
-    # matters: triage changes membership before analyze).
+    # matters: triage changes membership before analyze; rollup consumes analyze).
     if args.llm_all:
         args.triage = True
         args.analyze = True
+        args.rollup = True
 
     try:
         cfg = load_config(args.config)
@@ -1517,8 +1522,18 @@ def main():
         print(f"analyze: {n_ok}/{len(multi)} track verdict(s) -> "
               f"{out_dir}/{consolidate.VERDICTS_FILE}")
 
+    # PASS 3 — ROLLUP (on-demand, --rollup / --llm-all). CONSUMES the Pass-2
+    # verdicts (never re-invokes the LLM per track): a product/fleet picture —
+    # per-track completion + a near-done/mid/early/stuck bucket distribution.
+    if getattr(args, "rollup", False):
+        verdicts = consolidate.load_verdicts(out_dir)
+        rollup = consolidate.build_rollup(multi, verdicts)
+        verdicts["rollup"] = rollup
+        consolidate.save_verdicts(out_dir, verdicts)
+        print(f"rollup: {rollup['counts']} across {len(rollup['tracks'])} track(s)")
+
     # Stamp cached verdicts onto tracks so the template reads t.verdict (offline-
-    # safe: no verdict -> the 'not run' placeholder).
+    # safe: no verdict -> the 'not run' placeholder). Also surface the rollup.
     _verdicts = consolidate.load_verdicts(out_dir)
     consolidate.stamp_verdicts(tracks, _verdicts)
 
@@ -1534,6 +1549,9 @@ def main():
         # The most recent LLM run's change-log ('Since last analysis' panel).
         # None until a --triage/--llm-all run has written llm-runlog.json.
         "llm_runlog": consolidate.load_runlog(out_dir),
+        # Pass-3 product/fleet rollup (per-track completion + bucket dist), or
+        # None if --rollup hasn't run. Per-track verdicts are stamped on tracks.
+        "rollup": _verdicts.get("rollup"),
     }
 
     (out_dir / "status.json").write_text(json.dumps(status, indent=2))

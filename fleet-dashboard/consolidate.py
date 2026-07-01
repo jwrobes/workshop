@@ -526,6 +526,79 @@ def stamp_verdicts(tracks, verdicts):
     return tracks
 
 
+# ---------------------------------------------------------------------------
+# PASS 3 — ROLLUP (product + fleet). CONSUMES the Pass-2 verdicts (never
+# re-invokes the LLM) and produces a portfolio picture: per-track completion +
+# a bucket distribution (near-done / mid / early / stuck). Pure aggregation.
+# ---------------------------------------------------------------------------
+
+# Completion-% -> bucket. 'stuck' is special: high completion BUT flagged needing
+# cleanup (a shipped-but-messy track isn't "near-done" in the actionable sense).
+_BUCKET_NEAR = "near-done"
+_BUCKET_MID = "mid"
+_BUCKET_EARLY = "early"
+_BUCKET_STUCK = "stuck"
+
+
+def _rollup_pct(verdict):
+    """The completion % to roll up for a track: prefer the auditable computed %,
+    fall back to the LLM gut %, else None (no verdict / not analyzed)."""
+    comp = (verdict or {}).get("completion") or {}
+    pct = comp.get("computed_pct")
+    if pct is None:
+        pct = comp.get("llm_pct")
+    return pct
+
+
+def _bucket_for(verdict):
+    """Bucket a track from its verdict. 'stuck' = the analysis says there's real
+    cleanup (a non-empty cleanup list) OR low completion confidence — the track
+    needs a decision, not just more building — regardless of raw %."""
+    pct = _rollup_pct(verdict)
+    comp = (verdict or {}).get("completion") or {}
+    needs_cleanup = bool((verdict or {}).get("cleanup"))
+    shaky = comp.get("confidence") == "low"
+    if pct is None:
+        # No % — but distinguish "never analyzed" (no verdict at all -> early)
+        # from "analyzed, flagged for cleanup / shaky read" (-> stuck, so the
+        # cleanup work isn't hidden as if the track were untouched).
+        if verdict and (needs_cleanup or shaky):
+            return _BUCKET_STUCK
+        return _BUCKET_EARLY
+    # A high-% track that still has cleanup / a shaky read is 'stuck' (merged but
+    # needs reconcile/close), not 'near-done'.
+    if pct >= 70 and (needs_cleanup or shaky):
+        return _BUCKET_STUCK
+    if pct >= 70:
+        return _BUCKET_NEAR
+    if pct >= 35:
+        return _BUCKET_MID
+    return _BUCKET_EARLY
+
+
+def build_rollup(tracks, verdicts):
+    """Aggregate the Pass-2 verdicts into a product/fleet picture. Returns
+    {"tracks":[{name, pct, bucket, headline}], "counts":{bucket: n}}. Tracks with
+    no verdict are included as 'early' (pct None) so the picture is complete.
+    Does NOT invoke any runner — pure consumption of verdicts.json."""
+    verdicts = verdicts or {}
+    buckets = {_BUCKET_NEAR: 0, _BUCKET_MID: 0, _BUCKET_EARLY: 0, _BUCKET_STUCK: 0}
+    out_tracks = []
+    for t in tracks:
+        v = verdicts.get(t.get("name"))
+        pct = _rollup_pct(v)
+        bucket = _bucket_for(v)
+        buckets[bucket] += 1
+        out_tracks.append({
+            "name": t.get("name"),
+            "pct": pct,
+            "bucket": bucket,
+            "headline": ((v or {}).get("headline") or "").strip(),
+        })
+    out_tracks.sort(key=lambda x: (x["pct"] is None, -(x["pct"] or 0)))
+    return {"tracks": out_tracks, "counts": buckets}
+
+
 def apply_overrides(tracks, overrides):
     """Apply user corrections (from track-overrides.json) OVER the LLM tracks.
     Overrides win. Supported corrections (all by stable card id):

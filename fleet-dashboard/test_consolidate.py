@@ -840,5 +840,72 @@ class VerdictStampTests(unittest.TestCase):
         self.assertNotIn("verdict", t)
 
 
+# ---------------------------------------------------------------------------
+# PASS 3 — ROLLUP. Pure aggregation over the Pass-2 verdicts: bucket each track
+# (near-done / mid / early / stuck) + per-track %. NEVER invokes a runner.
+# ---------------------------------------------------------------------------
+class RollupTests(unittest.TestCase):
+    def _tracks(self):
+        return [{"name": "a"}, {"name": "b"}, {"name": "c"}, {"name": "d"}]
+
+    def _verdicts(self):
+        return {
+            "a": {"headline": "near", "completion": {"computed_pct": 90,
+                  "confidence": "high"}, "cleanup": []},              # near-done
+            "b": {"headline": "mid", "completion": {"computed_pct": 50,
+                  "confidence": "high"}, "cleanup": []},               # mid
+            "c": {"headline": "shipped msg", "completion": {"computed_pct": 95,
+                  "confidence": "high"}, "cleanup": ["close #5"]},     # stuck (hi%+cleanup)
+            # d: no verdict -> early
+        }
+
+    def test_bucket_distribution(self):
+        r = consolidate.build_rollup(self._tracks(), self._verdicts())
+        self.assertEqual(r["counts"],
+                         {"near-done": 1, "mid": 1, "early": 1, "stuck": 1})
+
+    def test_high_pct_with_cleanup_is_stuck_not_near(self):
+        r = consolidate.build_rollup(self._tracks(), self._verdicts())
+        c = next(t for t in r["tracks"] if t["name"] == "c")
+        self.assertEqual(c["bucket"], "stuck")
+
+    def test_no_verdict_track_is_early(self):
+        r = consolidate.build_rollup(self._tracks(), self._verdicts())
+        d = next(t for t in r["tracks"] if t["name"] == "d")
+        self.assertEqual(d["bucket"], "early")
+        self.assertIsNone(d["pct"])
+
+    def test_low_completion_confidence_is_stuck(self):
+        # A diverged (low-confidence) completion read -> the track needs a
+        # decision, not more building -> stuck (even without an explicit cleanup).
+        tracks = [{"name": "x"}]
+        verdicts = {"x": {"completion": {"computed_pct": 85, "confidence": "low"},
+                          "cleanup": []}}
+        r = consolidate.build_rollup(tracks, verdicts)
+        self.assertEqual(r["tracks"][0]["bucket"], "stuck")
+
+    def test_analyzed_track_with_cleanup_but_no_pct_is_stuck_not_early(self):
+        # A track that WAS analyzed (has a verdict) and flagged for cleanup, but
+        # whose % couldn't be computed, must read 'stuck' (needs a decision), not
+        # 'early' (which is reserved for never-analyzed tracks).
+        tracks = [{"name": "z"}]
+        verdicts = {"z": {"completion": {}, "cleanup": ["reconcile #1 vs #2"]}}
+        r = consolidate.build_rollup(tracks, verdicts)
+        self.assertEqual(r["tracks"][0]["bucket"], "stuck")
+
+    def test_never_analyzed_track_is_still_early(self):
+        # No verdict at all (even with the fallback machinery) -> early.
+        r = consolidate.build_rollup([{"name": "q"}], {})
+        self.assertEqual(r["tracks"][0]["bucket"], "early")
+
+    def test_rollup_does_not_invoke_runner(self):
+        # Pass 3 CONSUMES Pass-2 output; it must not call any LLM. build_rollup
+        # takes no runner at all — this test documents that contract.
+        self.assertFalse(hasattr(consolidate.build_rollup, "runner"))
+        r = consolidate.build_rollup(self._tracks(), self._verdicts())
+        self.assertIn("tracks", r)
+        self.assertIn("counts", r)
+
+
 if __name__ == "__main__":
     unittest.main()

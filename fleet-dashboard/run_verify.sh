@@ -22,3 +22,4 @@ node e2e_pipeline_tracks.mjs
 node e2e_triage.mjs      # Pass 1 — triage (attach/archive/suggest)
 node e2e_llm_runlog.mjs  # Pass 1 — change-log panel
 node e2e_verdict.mjs     # Pass 2 — per-track verdict in the render slots
+node e2e_rollup.mjs      # Pass 3 — product/fleet rollup
