@@ -445,20 +445,73 @@ function mapChip(card,prod){
   chip.onclick=()=>goTo('plan',pid,card.title,repoForCard(card));
   return chip;
 }
+// Pipeline ITEMS: the map shows a TRACK as ONE unit at its track_stage (all
+// its strands count once), plus each untracked card at its own planStage. So a
+// 6-strand track is a single chip, consistent with the track-aware board.
+function pipelineItems(plans){
+  const items=[];const seenTrack={};
+  plans.forEach(c=>{
+    const tn=c.track;
+    if(tn){
+      const t=trackByName(tn);
+      if(t&&(t.members||[]).length>=2){
+        if(!seenTrack[tn]){seenTrack[tn]=1;
+          items.push({kind:'track',track:t,
+            stageKey:((t.facts||{}).pipeline_stage)||'spec'});}
+        return;  // strand represented by the track item, not its own chip
+      }
+    }
+    items.push({kind:'card',card:c,stageKey:planStage(c).key});
+  });
+  return items;
+}
+// Does a pipeline item need attention / is it stuck? For a track, aggregate
+// across its member cards (so the stage's status reflects the whole track).
+function itemStuck(it){
+  if(it.kind==='card') return !!planStage(it.card).stuck;
+  return (it.track.members||[]).some(id=>{const c=cardById(id);return c&&planStage(c).stuck;});
+}
+function itemAttention(it){
+  if(it.kind==='card') return !!cardAttention(it.card);
+  return (it.track.members||[]).some(id=>{const c=cardById(id);return c&&cardAttention(c);});
+}
 function pipelineGroups(plans){
+  const items=pipelineItems(plans);
   return STAGES.map(s=>{
-    const ps=plans.filter(p=>planStage(p).key===s.key);
-    const stuckN=ps.filter(p=>planStage(p).stuck).length;
-    const attnN=ps.filter(p=>cardAttention(p)).length;
+    const its=items.filter(it=>it.stageKey===s.key);
+    const stuckN=its.filter(itemStuck).length;
+    const attnN=its.filter(itemAttention).length;
     let statusLabel,statusColor,statusDot,statusAnim='',hasFlag=true;
     if(stuckN){statusLabel=stuckN+' stuck';statusColor='#b5701f';statusDot='#d99a2c';statusAnim='animation:pulseAmber 1.8s ease-in-out infinite;';}
     else if(attnN){statusLabel=attnN+' needs you';statusColor='#a9762a';statusDot='#cf962f';}
-    else if(ps.length){statusLabel='on track';statusColor='#6f8a78';statusDot='#9fc0a8';hasFlag=false;}
+    else if(its.length){statusLabel='on track';statusColor='#6f8a78';statusDot='#9fc0a8';hasFlag=false;}
     else{statusLabel='empty';statusColor='#bcb3a1';statusDot='#dcd3c2';hasFlag=false;}
     const isOpen=STATE.mapAll||!!STATE.mapExpanded[s.key];
-    return {key:s.key,name:s.name,color:s.color,count:ps.length,plans:ps,
+    return {key:s.key,name:s.name,color:s.color,count:its.length,items:its,
       statusLabel,statusColor,statusDot,statusAnim,hasFlag,isOpen};
   });
+}
+// Render a pipeline item — either a normal card chip or a TRACK chip.
+function mapItemChip(it,prod){
+  return it.kind==='track'?trackMapChip(it.track,prod):mapChip(it.card,prod);
+}
+// A track as a single pipeline chip: shows track identity + fact summary; opens
+// the track detail page (where the strands live), not a lone plan.
+function trackMapChip(t,prod){
+  const f=t.facts||{};
+  const chip=el('<button class="pmchip" data-pm-track="'+attr(t.name)+'" data-path="track" title="'+attr(t.name)+'"></button>');
+  chip.style.borderLeft='3px solid #b08d4e';
+  let meta='<div style="display:flex;align-items:center;gap:5px;margin-top:6px;flex-wrap:wrap">'
+    +'<span class="mono" style="font-size:8px;letter-spacing:.06em;text-transform:uppercase;color:#7a6a3f;background:#efe7d2;padding:1px 5px;border-radius:4px">track</span>'
+    +'<span class="mono" style="font-size:8.5px;color:#8c8576">'+(f.count||0)+' strands'+(f.merged?' · '+f.merged+' merged':'')+'</span>';
+  if(itemStuck({kind:'track',track:t})) meta+='<span class="mono" style="display:inline-flex;align-items:center;gap:3px;font-size:8.5px;color:#b5701f"><span style="width:5px;height:5px;border-radius:50%;background:#d99a2c;animation:pulseAmber 1.8s ease-in-out infinite"></span>stuck</span>';
+  else if(itemAttention({kind:'track',track:t})) meta+='<span style="width:6px;height:6px;border-radius:50%;background:#cf962f;box-shadow:0 0 0 2.5px rgba(207,150,47,.16)"></span>';
+  meta+='</div>';
+  chip.innerHTML='<div class="mono" style="font-size:10.5px;color:#33302a;line-height:1.25;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(t.name)+'</div>'+meta;
+  const pid=(prod&&prod.id)||STATE.productId;
+  const repoName=STATE.repoId||((t.members_detail&&t.members_detail[0]&&(t.members_detail[0].id||'').split('#')[0])||null);
+  chip.onclick=()=>goTo('track',pid,t.name,repoName);
+  return chip;
 }
 function renderMap(scopeLabel,plans,prod){
   const wrap=el('<section class="pmwrap" data-region="pipeline-map" data-scope="'+attr(scopeLabel)+'"></section>');
@@ -490,7 +543,7 @@ function renderMap(scopeLabel,plans,prod){
     const detail=el('<div class="pmdetail"></div>');
     groups.forEach(g=>{
       const col=el('<div class="pmcol" data-stage-cards="'+g.key+'"></div>');
-      if(g.isOpen) g.plans.forEach(c=>col.appendChild(mapChip(c,prod)));
+      if(g.isOpen) g.items.forEach(it=>col.appendChild(mapItemChip(it,prod)));
       detail.appendChild(col);
     });
     box.appendChild(detail);wrap.appendChild(box);
@@ -502,7 +555,7 @@ function renderMap(scopeLabel,plans,prod){
       stage.appendChild(el('<div style="position:absolute;left:-8px;top:14px;width:13px;height:13px;border-radius:50%;background:#fffdf9;border:3px solid '+g.color+'"></div>'));
       stage.appendChild(el('<div style="display:flex;align-items:baseline;gap:8px;margin-bottom:8px;flex-wrap:wrap"><span class="mono" style="font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:'+g.color+'">'+g.name+'</span><span class="mono" style="font-size:10px;color:#bcb3a1">'+g.count+'</span>'+(g.hasFlag?'<span class="mono" style="font-size:9px;color:'+g.statusColor+'">· '+g.statusLabel+'</span>':'')+'</div>'));
       const stk=el('<div class="colstack" style="gap:7px"></div>');
-      g.plans.forEach(c=>stk.appendChild(mapChip(c,prod)));
+      g.items.forEach(it=>stk.appendChild(mapItemChip(it,prod)));
       stage.appendChild(stk);box.appendChild(stage);
     });
     wrap.appendChild(box);

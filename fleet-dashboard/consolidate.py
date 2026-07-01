@@ -383,6 +383,29 @@ _STAGE_ORDER = {_STAGE_SPEC: 0, "routed": 1, "executing": 2, _STAGE_REVIEW: 3,
                 _STAGE_SHIPPED: 4}
 
 
+def track_stage(details):
+    """Where the WHOLE track sits on the pipeline map, as ONE unit (Jonathan's
+    rule):
+      - all strands at spec'd            -> spec'd (nothing has moved past it),
+      - all strands shipped              -> shipped (nothing left),
+      - otherwise (the middle)           -> the furthest-along stage among the
+        UNSHIPPED strands — the leading edge of what's still moving. So a track
+        with impl-PRs shipped but a spec-PR in-review and issues spec'd reads
+        'in-review', not 'shipped'. (This is a DIFFERENT axis from the board
+        column, which is by activity — 'is there work left'.)"""
+    stages = [d.get("stage") or _STAGE_SPEC for d in details]
+    if not stages:
+        return _STAGE_SPEC
+    if all(s == _STAGE_SPEC for s in stages):
+        return _STAGE_SPEC
+    if all(s == _STAGE_SHIPPED for s in stages):
+        return _STAGE_SHIPPED
+    # Middle: furthest-along of the strands that aren't already shipped. (If the
+    # only unshipped strands are all spec'd, that's where the leading edge is.)
+    unshipped = [s for s in stages if s != _STAGE_SHIPPED] or stages
+    return max(unshipped, key=lambda s: _STAGE_ORDER.get(s, 0))
+
+
 def track_facts(details):
     """Derive the fact SUMMARY for a track from its member details (no verdict):
     counts by role/state, the furthest-along stage, and useful factual flags
@@ -419,6 +442,7 @@ def track_facts(details):
         "merged": merged,
         "impl_merged_spec_open": bool(open_spec and merged),
         "furthest_stage": furthest,
+        "pipeline_stage": track_stage(details),
         "placement": placement,
         "activity_counts": {a: sum(1 for d in details
                                    if strand_activity_of(d) == a)

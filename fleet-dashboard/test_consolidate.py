@@ -299,6 +299,37 @@ class TrackPlacementTests(unittest.TestCase):
                          {"active": 1, "backlog": 1, "done": 0})
 
 
+class TrackStageTests(unittest.TestCase):
+    def _stage(self, cards):
+        tracks = [{"name": "t", "members": [consolidate._card_id(c) for c in cards]}]
+        consolidate.stamp_track_facts(tracks, cards)
+        return tracks[0]["facts"]["pipeline_stage"]
+
+    def test_all_specd_is_spec(self):
+        self.assertEqual(self._stage([issue_card(1, "a"), issue_card(2, "b")]), "spec")
+
+    def test_all_shipped_is_shipped(self):
+        self.assertEqual(self._stage([
+            pr_card(1, "a", state="MERGED", shipped=True),
+            pr_card(2, "b", state="MERGED", shipped=True)]), "shipped")
+
+    def test_middle_ignores_shipped_takes_furthest_unshipped(self):
+        # Briefing: impl-PRs shipped, spec-PR #118 in-review, issues spec'd.
+        # Furthest UNSHIPPED strand is the in-review spec-PR -> review, NOT shipped.
+        self.assertEqual(self._stage([
+            pr_card(115, "a", state="MERGED", shipped=True),
+            pr_card(117, "b", state="MERGED", shipped=True),
+            pr_card(119, "c", state="MERGED", shipped=True),
+            pr_card(118, "Specs: Stage 2"),         # open spec-PR -> review
+            issue_card(111, "d"), issue_card(112, "e")]), "review")
+
+    def test_middle_only_specd_unshipped(self):
+        # Shipped impl + only open issues left -> the leading edge is spec'd.
+        self.assertEqual(self._stage([
+            pr_card(1, "a", state="MERGED", shipped=True),
+            issue_card(2, "b")]), "spec")
+
+
 class TrackFactsTests(unittest.TestCase):
     def _briefing_track(self):
         # The communications-hub track: 3 merged impl PRs, 1 open spec-PR, 2 issues.
