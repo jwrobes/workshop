@@ -211,6 +211,183 @@ def attach_tracks_to_cards(cards, tracks):
     return cards
 
 
+# ---------------------------------------------------------------------------
+# Deterministic strand facts (Phase 1). No LLM, no judgment — pure code derived
+# from labels/title/branch/state, so it is always shown and never wrong. The
+# unified card's layer 1 (see UNIFIED-CARD-MODEL.md). The LLM verdict (layer 2)
+# is Phase 3+4 and lives elsewhere.
+# ---------------------------------------------------------------------------
+
+# Pipeline stage keys — MUST match template.html STAGES so the strand map and
+# the pipeline map speak the same language.
+_STAGE_SPEC = "spec"
+_STAGE_REVIEW = "review"
+_STAGE_SHIPPED = "shipped"
+
+
+def _is_build_spec_card(card):
+    """A build-spec strand: build-spec label, or a spec-y title. Mirrors the
+    collector's _is_build_spec but reads off the card's github object."""
+    gh = card.get("github") or {}
+    labels = {(l or "").lower() for l in (gh.get("labels") or [])}
+    if "build-spec" in labels or "build_spec" in labels:
+        return True
+    title = gh.get("title") or card.get("title") or ""
+    if re.search(r"\bbuild[\s_-]?spec\b", title, re.I):
+        return True
+    # "Specs: Stage 2 ..." — a PR whose job is to land the spec, not the impl.
+    return bool(re.match(r"\s*specs?\b", title, re.I))
+
+
+def strand_role(card):
+    """What kind of artifact this member is (deterministic):
+    spec-PR | impl-PR | issue | plan | worktree."""
+    if card.get("kind") == "worktree":
+        return "worktree"
+    gh = card.get("github") or {}
+    kind = gh.get("kind")
+    if kind == "issue":
+        return "issue"
+    if kind == "pr":
+        return "spec-PR" if _is_build_spec_card(card) else "impl-PR"
+    # No github object -> a local plan card is the anchor.
+    return "plan"
+
+
+def strand_state(card):
+    """The member's state (deterministic): merged | open | closed | dirty | stale.
+    Worktrees carry local git state; PRs/issues carry forge state."""
+    if card.get("kind") == "worktree":
+        flags = card.get("flags") or []
+        if (card.get("dirty_files") or 0) > 0:
+            return "dirty"
+        if "stale" in flags:
+            return "stale"
+        return "clean"
+    if card.get("shipped"):
+        return "merged"
+    gh = card.get("github") or {}
+    st = (gh.get("state") or "").upper()
+    if st == "MERGED":
+        return "merged"
+    if st == "CLOSED":
+        return "closed"
+    if st == "OPEN":
+        return "open"
+    # A local plan card with no forge state: reflect its column.
+    status = (card.get("status") or "").lower()
+    if status in ("completed", "done", "shipped"):
+        return "merged"
+    return "open"
+
+
+def strand_source(card):
+    """Best-effort deterministic origin: bosque | web | dev | —.
+
+    What's actually detectable (documented honestly, per the plan):
+      * branch prefix, when present — `claude/...` (Claude-on-web),
+        `build-<slug>` / a `bosque/...` prefix (Bosque cloud agent),
+        a plain local branch (dev machine);
+      * a `feat(bosque):`-style title marker as a fallback when branch is absent.
+    When neither signal exists we return '—' rather than guessing — the card
+    data does not always carry the branch (issues never do; older cached runs
+    predate branch plumbing)."""
+    gh = card.get("github") or {}
+    branch = (gh.get("branch") or "").lower()
+    if branch:
+        if branch.startswith("claude/") or "claude.ai" in branch:
+            return "web"
+        if branch.startswith("bosque/") or branch.startswith("build-spec"):
+            return "bosque"
+        if branch.startswith("build-"):
+            return "dev"
+    title = (gh.get("title") or card.get("title") or "").lower()
+    if re.search(r"\bbosque\b", title):
+        return "bosque"
+    if card.get("kind") == "worktree":
+        return "dev"  # a worktree is a local checkout on the dev machine
+    return "—"
+
+
+def strand_stage(card):
+    """Pipeline stage of the member (deterministic), matching template STAGES.
+    merged/shipped -> shipped; open PR -> in-review; open issue/spec -> spec'd."""
+    if strand_state(card) in ("merged",):
+        return _STAGE_SHIPPED
+    gh = card.get("github") or {}
+    if gh.get("kind") == "pr" and (gh.get("state") or "").upper() == "OPEN":
+        return _STAGE_REVIEW
+    return _STAGE_SPEC
+
+
+def strand_detail(card):
+    """The full deterministic fact-row for one member."""
+    return {
+        "id": _card_id(card),
+        "title": (card.get("github") or {}).get("title") or card.get("title")
+        or card.get("slug") or _card_id(card),
+        "role": strand_role(card),
+        "state": strand_state(card),
+        "source": strand_source(card),
+        "stage": strand_stage(card),
+        "url": (card.get("github") or {}).get("url") or card.get("path") or "",
+    }
+
+
+# Stage ordering for "furthest-along" — decides which board column the unified
+# card lands in (a mostly-shipped track goes to Completed).
+_STAGE_ORDER = {_STAGE_SPEC: 0, "routed": 1, "executing": 2, _STAGE_REVIEW: 3,
+                _STAGE_SHIPPED: 4}
+
+
+def track_facts(details):
+    """Derive the fact SUMMARY for a track from its member details (no verdict):
+    counts by role/state, the furthest-along stage, and useful factual flags
+    like 'impl merged AND spec-PR still open'."""
+    roles, states, sources = {}, {}, set()
+    for d in details:
+        roles[d["role"]] = roles.get(d["role"], 0) + 1
+        states[d["state"]] = states.get(d["state"], 0) + 1
+        if d["source"] and d["source"] != "—":
+            sources.add(d["source"])
+    merged = states.get("merged", 0)
+    open_spec = any(d["role"] == "spec-PR" and d["state"] == "open"
+                    for d in details)
+    furthest = _STAGE_SPEC
+    for d in details:
+        if _STAGE_ORDER.get(d["stage"], 0) > _STAGE_ORDER.get(furthest, 0):
+            furthest = d["stage"]
+    return {
+        "count": len(details),
+        "roles": roles,
+        "states": states,
+        "sources": sorted(sources),
+        "merged": merged,
+        "impl_merged_spec_open": bool(open_spec and merged),
+        "furthest_stage": furthest,
+    }
+
+
+def stamp_track_facts(tracks, cards):
+    """Stamp each track with `members_detail` (per-member deterministic facts)
+    and a `facts` summary, so the template just renders. Members not resolvable
+    to a card are still listed by id (best-effort). Returns the tracks list."""
+    by_id = {_card_id(c): c for c in cards}
+    for t in tracks:
+        details = []
+        for m in (t.get("members") or []):
+            c = by_id.get(m)
+            if c is not None:
+                details.append(strand_detail(c))
+            else:
+                details.append({"id": m, "title": m, "role": "?",
+                                "state": "?", "source": "—", "stage": _STAGE_SPEC,
+                                "url": ""})
+        t["members_detail"] = details
+        t["facts"] = track_facts(details)
+    return tracks
+
+
 def load_tracks(out_dir):
     p = out_dir / TRACKS_FILE
     try:

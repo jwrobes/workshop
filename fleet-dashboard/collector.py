@@ -823,10 +823,13 @@ def merge_forge_items_into_cards(cards, forge_items, now, repo_to_product=None):
                 uniq.append(m)
 
         is_merged_item = bool(it.get("merged"))
+        # `branch` (the PR head ref) is carried onto the card so strand-fact
+        # source detection (bosque/web/dev) has a real signal — the title alone
+        # can't distinguish a Bosque PR from a web one. Issues have branch=None.
         gh = {"kind": it.get("kind"), "number": it.get("number"),
               "title": it.get("title"), "url": it.get("url"),
               "state": "MERGED" if is_merged_item else "OPEN",
-              "labels": it.get("labels") or [],
+              "labels": it.get("labels") or [], "branch": it.get("branch"),
               "isDraft": bool(it.get("isDraft")), "createdAt": it.get("createdAt"),
               "mergedAt": it.get("mergedAt")}
 
@@ -1386,6 +1389,10 @@ def main():
     overrides = consolidate.load_overrides(out_dir, repo_dir)
     tracks = consolidate.apply_overrides(tracks, overrides)
     consolidate.attach_tracks_to_cards(kanban, tracks)
+    # Phase 1: deterministic strand facts. Stamp each track with per-member
+    # role/state/source/stage + a fact summary so the unified card renders
+    # layer 1 (facts) with no LLM. See UNIFIED-CARD-MODEL.md.
+    consolidate.stamp_track_facts(tracks, kanban)
 
     status = {
         "generated_at": now.isoformat(timespec="seconds"),

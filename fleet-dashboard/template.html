@@ -165,7 +165,7 @@ function mdToHtml(src){
 function $(id){return document.getElementById(id);}
 function slug(s){return String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');}
 
-const STATE={level:'fleet',productId:null,repoId:null,planId:null,doneOpen:false,mapExpanded:{},mapAll:false};
+const STATE={level:'fleet',productId:null,repoId:null,planId:null,doneOpen:false,mapExpanded:{},mapAll:false,trackOpen:{}};
 
 function products(){return (DATA&&DATA.products)||[];}
 function kanban(){return (DATA&&DATA.kanban)||[];}
@@ -182,6 +182,16 @@ function plansFor(pid){return kanban().filter(c=>c.product===pid);}
 // Work-tracks (Phase 5): consolidated groupings. Mirrors collector's _card_id.
 function tracks(){return (DATA&&DATA.tracks)||[];}
 function tracksMulti(){return tracks().filter(t=>(t.members||[]).length>=2);}
+function trackByName(name){return tracks().find(t=>t.name===name)||null;}
+// Which board column a unified track card lands in: driven by the track's
+// furthest-along stage (a mostly-shipped track goes to Completed). Same mapping
+// the pipeline uses, collapsed to the 3 board columns.
+function trackColumn(t){
+  const st=((t.facts||{}).furthest_stage)||'spec';
+  if(st==='shipped') return 'completed';
+  if(st==='spec') return 'backlog';
+  return 'active';  // routed / executing / review -> in flight
+}
 function cardId(c){
   const n=(c.github||{}).number;
   if(n!=null) return (c.repo||'?')+'#'+n;
@@ -367,7 +377,7 @@ function buildPrompt(card,prod,mode){
 
 function goTo(level,productId,planId,repoId){
   STATE.level=level;STATE.productId=productId??null;STATE.planId=planId??null;STATE.repoId=repoId??null;
-  STATE.doneOpen=false;STATE.mapExpanded={};STATE.mapAll=false;
+  STATE.doneOpen=false;STATE.mapExpanded={};STATE.mapAll=false;STATE.trackOpen={};
   // When opening a plan, resolve its real product/repo up front so crumbs +
   // back-link are correct even when navigated from the fleet map (null product).
   if(level==='plan'){
@@ -622,10 +632,14 @@ function renderRepo(app){
   // board
   const narrow=window.innerWidth<760;
   const board=el('<div class="board" data-region="board" style="grid-template-columns:'+(narrow?'1fr':'1fr 1fr 1fr')+'"></div>');
-  const active=rplans.filter(c=>c.status==='active'),backlog=rplans.filter(c=>c.status==='backlog'),completed=rplans.filter(c=>c.status==='completed'||c.status==='done'||c.status==='shipped'||c.shipped);
-  board.appendChild(kanbanCol('active',active,repoName));
-  board.appendChild(kanbanCol('backlog',backlog,repoName));
-  board.appendChild(kanbanCol('completed',completed,repoName));
+  // Track-aware split: a card belonging to a multi-member track is NOT rendered
+  // as its own row — instead ONE unified card represents the whole track, placed
+  // in the column its furthest-along stage implies. Loose (untracked) cards fall
+  // into their status column as before. Guarantees each member appears once.
+  const g=boardGroups(rplans);
+  board.appendChild(kanbanCol('active',g.active,repoName));
+  board.appendChild(kanbanCol('backlog',g.backlog,repoName));
+  board.appendChild(kanbanCol('completed',g.completed,repoName));
   sec.appendChild(board);
 
   // worktrees (local-only)
@@ -652,11 +666,98 @@ function wtMeta(w){
   if(f.includes('stale')) return {label:'stale',color:'#9a917f',dot:'#c2b89f'};
   return {label:'clean',color:'#5d8a6f',dot:'#7faa8c'};
 }
-function kanbanCol(kind,plans,repoName){
+// Split this repo's plans into the 3 board columns, collapsing multi-member
+// tracks into a single unified card per track. Returns {active,backlog,completed}
+// where each is {loose:[card], tracks:[trackObj]}.
+function boardGroups(rplans){
+  const cols={active:{loose:[],tracks:[]},backlog:{loose:[],tracks:[]},
+              completed:{loose:[],tracks:[]}};
+  const seenTrack={};  // track name -> already placed (dedupe across members)
+  const statusCol=c=>(c.status==='backlog')?'backlog'
+    :((c.status==='completed'||c.status==='done'||c.status==='shipped'||c.shipped)?'completed':'active');
+  rplans.forEach(c=>{
+    const tn=c.track;
+    if(tn){
+      const t=trackByName(tn);
+      // A real (2+ member, fact-stamped) track collapses to a unified card.
+      if(t&&(t.members||[]).length>=2){
+        if(!seenTrack[tn]){seenTrack[tn]=1;cols[trackColumn(t)].tracks.push(t);}
+        return;  // this member is represented by the unified card, not a row
+      }
+    }
+    cols[statusCol(c)].loose.push(c);
+  });
+  return cols;
+}
+// One unified card for a whole track: collapsed headline + fact summary, and an
+// expandable strand map (grouped by role) showing each member's state + source
+// + pipeline stage. This is layer 1 (deterministic facts) of UNIFIED-CARD-MODEL.
+const ROLE_ORDER=['spec-PR','impl-PR','issue','worktree','plan','?'];
+const ROLE_LABEL={'spec-PR':'SPECS','impl-PR':'IMPL','issue':'ISSUES','worktree':'WORKTREE','plan':'PLAN','?':'OTHER'};
+function stateDot(state){
+  if(state==='merged') return {c:'#5d8a6f',d:'#7faa8c'};
+  if(state==='open') return {c:'#9a6f22',d:'#cf962f'};
+  if(state==='dirty') return {c:'#a8916a',d:'#cbab6a'};
+  if(state==='closed') return {c:'#a39c8c',d:'#cabfa9'};
+  return {c:'#6e6757',d:'#b9b0a0'};
+}
+function factSummary(t){
+  const f=t.facts||{};const parts=[];
+  parts.push((f.count||0)+' artifact'+((f.count===1)?'':'s'));
+  if(f.merged) parts.push(f.merged+' merged');
+  // The useful factual flag (not a verdict): impl merged yet spec-PR still open.
+  if(f.impl_merged_spec_open){
+    const spec=(t.members_detail||[]).find(d=>d.role==='spec-PR'&&d.state==='open');
+    parts.push('spec-PR'+(spec?' '+spec.id.replace(/^.*#/,'#'):'')+' open');
+  }
+  if((f.sources||[]).length>1) parts.push((f.sources||[]).join('/'));
+  return parts.join(' · ');
+}
+function unifiedCard(t,repoName){
+  const open=!!STATE.trackOpen[t.name];
+  const wrap=el('<div class="kcard" data-unified-track="'+attr(t.name)+'" style="display:block;padding:0;cursor:default"></div>');
+  // Header (toggles expand). Shows track name + fact summary line.
+  const head=el('<button data-action="toggle-track" style="all:unset;box-sizing:border-box;cursor:pointer;display:block;width:100%;padding:11px 13px"></button>');
+  head.innerHTML='<span style="display:flex;align-items:center;gap:7px">'
+    +'<span style="font-size:9px;color:#9a917f;transform:rotate('+(open?'90deg':'0deg')+');transition:transform .2s">&#9654;</span>'
+    +'<span class="t" style="flex:1;min-width:0">'+esc(t.name)+'</span>'
+    +'<span class="mono" style="font-size:9px;letter-spacing:.06em;text-transform:uppercase;color:#7a6a3f;background:#efe7d2;padding:2px 6px;border-radius:4px">track</span></span>'
+    +'<span class="mono" data-track-facts style="display:block;font-size:11px;color:#8c8576;margin:6px 0 0 16px;overflow-wrap:anywhere">'+esc(factSummary(t))+'</span>';
+  head.onclick=()=>{STATE.trackOpen[t.name]=!STATE.trackOpen[t.name];render();};
+  wrap.appendChild(head);
+  if(open) wrap.appendChild(strandMap(t,repoName));
+  return wrap;
+}
+function strandMap(t,repoName){
+  const box=el('<div data-region="strand-map" style="border-top:1px solid #ece5d6;padding:8px 13px 11px"></div>');
+  const details=(t.members_detail||[]).slice().sort((a,b)=>ROLE_ORDER.indexOf(a.role)-ROLE_ORDER.indexOf(b.role));
+  let curRole=null;
+  details.forEach(d=>{
+    if(d.role!==curRole){
+      curRole=d.role;
+      box.appendChild(el('<div class="mono" style="font-size:9px;letter-spacing:.12em;color:#a39c8c;margin:9px 0 3px">'+esc(ROLE_LABEL[d.role]||d.role)+'</div>'));
+    }
+    const sd=stateDot(d.state);
+    const num=String(d.id).replace(/^.*#/,'#');
+    const row=el('<div data-strand-member="'+attr(d.id)+'" data-strand-role="'+attr(d.role)+'" data-strand-state="'+attr(d.state)+'" data-strand-source="'+attr(d.source||'—')+'" data-strand-stage="'+attr(d.stage)+'" style="display:flex;align-items:center;gap:8px;padding:3px 0;overflow:hidden"></div>');
+    row.innerHTML='<span style="flex:none;width:6px;height:6px;border-radius:50%;background:'+sd.d+'"></span>'
+      +'<span class="mono" style="flex:none;font-size:11px;color:'+sd.c+'">'+esc(num)+'</span>'
+      +'<span class="mono" style="flex:1;min-width:0;font-size:11px;color:#5b5447;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(String(d.title).slice(0,60))+'</span>'
+      +'<span class="mono" style="flex:none;font-size:10px;color:'+sd.c+'">'+esc(d.state)+'</span>'
+      +(d.source&&d.source!=='—'?'<span class="mono" data-strand-source-tag style="flex:none;font-size:9px;color:#7a6a3f;background:#f2ede2;padding:1px 5px;border-radius:3px">'+esc(d.source)+'</span>':'')
+      +'<span class="mono" data-strand-stage-tag style="flex:none;font-size:9px;color:#9a917f">'+esc(d.stage)+'</span>';
+    box.appendChild(row);
+  });
+  return box;
+}
+function kanbanCol(kind,group,repoName){
+  // group is {loose:[card], tracks:[trackObj]} (see boardGroups).
+  const plans=group.loose, trks=group.tracks;
   const col=el('<div data-column="'+kind+'"></div>');
   if(kind==='active'){
-    col.appendChild(el('<div class="col-h"><span style="width:8px;height:8px;border-radius:50%;background:#6f9d80"></span><span class="lbl" style="color:#5e7d6a">Active</span><span class="n">'+plans.length+'</span></div>'));
+    col.appendChild(el('<div class="col-h"><span style="width:8px;height:8px;border-radius:50%;background:#6f9d80"></span><span class="lbl" style="color:#5e7d6a">Active</span><span class="n">'+(plans.length+trks.length)+'</span></div>'));
     const cs=el('<div class="colstack"></div>');
+    trks.forEach(t=>cs.appendChild(unifiedCard(t,repoName)));
     plans.forEach(c=>{
       const w=worktreeForCard(c),pr=prMeta(w&&w.pr),a=cardAttention(c);
       const k=el('<button class="kcard" data-plan-id="'+attr(c.title)+'" data-status="active" data-attention="'+(!!a)+'"></button>');
@@ -667,8 +768,9 @@ function kanbanCol(kind,plans,repoName){
     });
     col.appendChild(cs);
   }else if(kind==='backlog'){
-    col.appendChild(el('<div class="col-h"><span style="width:8px;height:8px;border-radius:50%;border:1.5px solid #c2b89f;box-sizing:border-box"></span><span class="lbl" style="color:#9a917f">Backlog</span><span class="n">'+plans.length+'</span></div>'));
+    col.appendChild(el('<div class="col-h"><span style="width:8px;height:8px;border-radius:50%;border:1.5px solid #c2b89f;box-sizing:border-box"></span><span class="lbl" style="color:#9a917f">Backlog</span><span class="n">'+(plans.length+trks.length)+'</span></div>'));
     const cs=el('<div class="colstack"></div>');
+    trks.forEach(t=>cs.appendChild(unifiedCard(t,repoName)));
     plans.forEach(c=>{
       const k=el('<button class="bcard" data-plan-id="'+attr(c.title)+'" data-status="backlog"></button>');
       k.innerHTML='<span class="mono" style="font-size:12.5px;color:#5b5447;overflow-wrap:anywhere">'+esc(c.title)+'</span>';
@@ -677,11 +779,12 @@ function kanbanCol(kind,plans,repoName){
     col.appendChild(cs);
   }else{
     const head=el('<button style="all:unset;cursor:pointer;display:flex;align-items:center;gap:8px;margin-bottom:12px;width:100%"></button>');
-    head.innerHTML='<span style="font-size:10px;color:#9a917f;transform:rotate('+(STATE.doneOpen?'90deg':'0deg')+');transition:transform .2s">&#9654;</span><span class="lbl mono" style="color:#9a917f">Completed</span><span class="n">'+plans.length+'</span>';
+    head.innerHTML='<span style="font-size:10px;color:#9a917f;transform:rotate('+(STATE.doneOpen?'90deg':'0deg')+');transition:transform .2s">&#9654;</span><span class="lbl mono" style="color:#9a917f">Completed</span><span class="n">'+(plans.length+trks.length)+'</span>';
     head.onclick=()=>{STATE.doneOpen=!STATE.doneOpen;render();};
     col.appendChild(head);
     if(STATE.doneOpen){
       const cs=el('<div class="colstack" style="animation:fadeIn .2s ease"></div>');
+      trks.forEach(t=>cs.appendChild(unifiedCard(t,repoName)));
       plans.slice(0,12).forEach(c=>{
         const k=el('<button class="ccard" data-plan-id="'+attr(c.title)+'" data-status="completed"></button>');
         k.innerHTML='<span style="flex:none;width:14px;height:14px;border-radius:50%;background:#e3ebe2;color:#5d8a6f;display:inline-flex;align-items:center;justify-content:center;font-size:8px">&#10003;</span><span class="mono" style="flex:1;min-width:0;font-size:12px;color:#8a8273;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(c.title)+'</span>';
