@@ -58,6 +58,7 @@ The repo is the **source of truth** for tool code. Where a tool actually runs fr
 |---|---|---|
 | [`cli_ready_alerts/`](./cli_ready_alerts/) | Context-aware notification framework for Cursor and Claude Code agents. Fires per-workspace sounds on `done` / `approval` / `failed`. Supports talking mode (macOS `say`) and custom recorded sounds. Ships a `cra` control CLI + companion skill. macOS-only. | Heavy (installs to `~/.local/share/cli_ready_alerts/`, symlinks `cra` into `~/.local/bin/`) |
 | [`speak_to_code/`](./speak_to_code/) | Voice-to-code dictation pipeline. Records speech, transcribes on-device via Apple Silicon (mlx-whisper), cleans up with the `llm` CLI, and copies to clipboard. macOS + Apple Silicon only. | Heavy (symlinks `dictate` into `~/.local/bin/`) |
+| [`comprehension_signoff/`](./comprehension_signoff/) | Standalone Claude Code skill — post-ship comprehension gate for vibe-coded changes. Generates explainer artifacts then verifies understanding via SOLO-graded teach-back. Local-only (not in synced skills repo). | Light (symlink `comprehension_signoff/` into `~/.claude/skills/comprehension-signoff`) |
 
 ## Graduation
 
@@ -89,5 +90,9 @@ workshop/
 │   ├── setup.sh                   # Installs deps, symlinks dictate to ~/.local/bin/
 │   ├── dictate                    # Main script
 │   └── dictate-context.md.example # Vocabulary template for context.md
+├── comprehension_signoff/         # Standalone Claude Code skill — post-ship comprehension gate
+│   ├── README.md                  # Install + usage
+│   ├── SKILL.md                   # The skill (symlinked into ~/.claude/skills/)
+│   └── reference/                 # Research dossier + SOLO grading rubric
 └── _archive/                      # Retired tools, kept for reference
 ```

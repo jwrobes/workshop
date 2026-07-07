@@ -1,0 +1,110 @@
+# Closing the Comprehension Gap: Does a Validated "Cognitive Debt" Skill Exist for Vibe-Coded Software — and How to Build One
+
+## TL;DR
+- **No mature, well-adopted, ready-made Claude Skill exists for post-ship comprehension verification of vibe-coded software.** The closest direct match — a Claude Code plugin called "WHY" (jobrien874/why-plugin) that quizzes you on code Claude just generated to "combat cognitive debt" — had 0 GitHub stars at the time of research and deliberately does *not* gate progress. The only true *understanding-gate* implementation is an academic VS Code prototype ("VibeCheck," arXiv 2602.20206), not a Claude Skill.
+- **The problem you describe is real, named, and increasingly evidence-backed.** "Cognitive debt" (Margaret-Anne Storey, Feb 2026; MIT Media Lab, 2025), "comprehension debt" (Addy Osmani, Mar 2026), and "epistemic debt" (Sankaranarayanan, 2026) all describe the same thing, and a controlled experiment (N=78) found an "Explanation Gate" cut post-AI maintenance failure from ~77% to ~39%.
+- **You should build the skill yourself, grounding it in validated learning science.** The winning design is a post-ship "comprehension sign-off" SKILL.md that (1) produces layered artifacts (architecture diagram, plain-language walkthrough, annotated code, glossary, "what breaks if X changes" list), (2) verifies understanding via *active recall* and *teach-back* graded against the SOLO taxonomy (relational level ≥3), and (3) records a gated sign-off. This converts "metacognitive friction" — proven to work — into a repeatable workflow.
+
+## Key Findings
+
+**1. The space is occupied by *adjacent* tools, not a dedicated comprehension-sign-off skill.** Surveying the official Anthropic skills repo (github.com/anthropics/skills, ~148K stars), the major awesome-claude-skills lists, and obra/superpowers (~137K stars), none contain a skill about comprehension verification, understanding gates, or cognitive debt. What exists are neighbors: codebase **onboarding** skills, **walkthrough** diagram generators, pre-build "grilling" tools, and code review skills.
+
+**2. Two emerging direct-ish matches exist but are immature.** "WHY" (jobrien874/why-plugin) quizzes the user on just-generated code across WHAT/HOW/WHY tiers, cites the MIT cognitive-debt study, and offers an opt-in auto-trigger after 50+ lines — but explicitly states it is "Not a gatekeeper." The "/teach" skill (alexknowshtml/claude-skills, ~97 stars; original "Learn Quiz" prompt credited to Suzanne at Anthropic) is a Socratic teach-back loop *with* a completion gate ("Only surface 'session complete' when all items are [x]"), but operates at session level rather than specifically on shipped code.
+
+**3. The gated mechanism is validated in a controlled experiment.** Sankaranarayanan's "VibeCheck" VS Code extension with an "Explanation Gate" produced the strongest evidence that gating works (details below).
+
+**4. Robust learning-science principles already tell you how to verify genuine understanding:** the illusion of explanatory depth, the self-explanation effect, retrieval practice / the testing effect, the Feynman technique, the expertise reversal effect, and SOLO-based grading.
+
+**5. Anthropic's own skill-authoring best practices give you the structural template** (progressive disclosure, concise SKILL.md under ~500 lines, "explain the why" over all-caps imperatives, checklists, validation loops, bundled reference files).
+
+## Details
+
+### A. The concept and its origins
+
+**Vibe coding** was coined by Andrej Karpathy on February 2, 2025, in a viral X post (over 4.5M views): "There's a new kind of coding I call 'vibe coding', where you fully give in to the vibes, embrace exponentials, and forget that the code even exists. It's possible because the LLMs [e.g. Cursor Composer w/ Sonnet] are getting too good." He framed it for "throwaway weekend projects." Simon Willison sharpened the definition: "If an LLM wrote every line of your code, but you've reviewed, tested, and understood it all, that's not vibe coding in my book — that's using an LLM as a typing assistant." The defining feature is *lack of comprehension of the code*. Collins Dictionary announced "vibe coding" as its 2025 Word of the Year on November 6, 2025 (managing director Alex Beecroft: "It signals a major shift in software development, where AI is making coding more accessible"); Karpathy himself called it "passe" by February 2026, proposing "agentic engineering" as the mature successor.
+
+**Cognitive debt (MIT Media Lab, 2025).** Kosmyna et al., "Your Brain on ChatGPT: Accumulation of Cognitive Debt when Using an AI Assistant for Essay Writing Task" (arXiv 2506.08872; 54 participants, 18 in the Session-4 crossover), used EEG to show brain connectivity scaled *down* with external tool use — Brain-only participants showed the strongest, most distributed networks; the ChatGPT group showed "up to 55 percent reduced connectivity compared with the brain-only group." LLM users reported the lowest ownership of their essays and "struggled to accurately quote their own work" — in Session 1, "83 per cent of the ChatGPT group could not [quote a single sentence], against around 11 per cent in each of the other two groups." Crucially, the **Brain-to-LLM** group (who wrote unaided first, then added AI) showed higher memory recall and stronger neural engagement than the **LLM-to-Brain** group, suggesting "strategic timing of AI tool introduction following initial self-driven effort may enhance engagement." Caveat: this is a non-peer-reviewed preprint with a small sample, and the authors themselves urge caution.
+
+**Cognitive debt applied to code (Margaret-Anne Storey, Feb 2026).** Storey, in her blog post and the arXiv paper "From Technical Debt to Cognitive and Intent Debt" (arXiv 2603.22106), built on Peter Naur's 1985 "Programming as Theory Building": a program is not its source code; it is a theory living in developers' minds. She proposes a **Triple Debt Model**: technical debt (in code), cognitive debt (erosion of shared understanding in people), and intent debt (missing externalized rationale). Her anchoring anecdote: a student team using AI to build fast hit a wall by week 7 — they could no longer make simple changes without breaking things because "the theory of the system had evaporated." Simon Willison endorsed it as "the best explanation of the term cognitive debt I've seen so far," noting he had "gotten lost in his own AI-assisted projects."
+
+**Comprehension debt (Addy Osmani, March 2026).** Osmani (Google) defines it as "the growing gap between how much code exists in your system and how much of it any human being genuinely understands," warning it "breeds false confidence. The codebase looks clean. The tests are green. The reckoning arrives quietly." His framing builds on his earlier "70% problem" (AI gets you ~70% of the way; the last 30% — edge cases, security, integration — is as hard as ever) and "house of cards code." His core prescriptions: be "ruthlessly explicit about what a change is supposed to do before it's written"; treat "verification not as an afterthought but as a structural constraint"; maintain a "system-level mental model"; and be "honest about the difference between 'the tests passed' and 'I understand what this does and why.'" His thesis: "passive delegation ('just make it work') impairs skill development far more than active, question-driven use of AI." He closes: "Making code cheap to generate doesn't make understanding cheap to skip. The comprehension work is the job."
+
+**The supporting statistics (with caveats).** Osmani cites an Anthropic study (Shen & Tamkin, "How AI Impacts Skill Formation," arXiv 2601.20245; RCT with 52 engineers) finding AI-assisted participants "scored 17% lower on a follow-up comprehension quiz (50% vs. 67%)," with the largest declines in debugging. He also cites research that "developers using AI for code generation delegation score below 40% on comprehension tests, while developers using AI for conceptual inquiry … score above 65%." Note: some derivative articles quote the Anthropic figures as "42% vs 57%"; treat the precise numbers as contested. Industry data on the broader quality problem: GitClear's "AI Copilot Code Quality: 2025 Data Suggests 4x Growth in Code Clones" (211M lines, Jan 2020–Dec 2024) found copy/paste lines rose 8.3%→12.3%, refactored ("moved") lines fell 24.1%→9.5%, and short-term churn (code revised within two weeks) grew 3.1%→5.7%; 2024 was "the first year when the number of copy/pasted lines exceeded the number of moved lines," and code blocks with 5+ duplicated lines increased ~8x during 2024. Separately, the METR RCT (Becker, Rush, Barnes & Rein, arXiv 2507.09089, July 2025; 16 developers, 246 tasks) found that "allowing AI actually increases completion time by 19%" (CI +2% to +39%), even though developers forecast a 24% speedup beforehand and still estimated a 20% speedup afterward — a result that "contradicts predictions from experts in economics (39% shorter) and ML (38% shorter)."
+
+### B. The strongest validation that *gating* works
+
+Sankaranarayanan's "Mitigating 'Epistemic Debt' in Generative AI-Scaffolded Novice Programming using Metacognitive Scripts" (arXiv 2602.20206; to appear at ACM Learning@Scale 2026) ran a between-subjects experiment (N=78, three groups of 26) building a React app:
+- **Group A (Manual, no AI), Group B (Unrestricted AI / Cursor + Claude 3.5 Sonnet), Group C (Scaffolded AI** with the "VibeCheck" VS Code extension's **Explanation Gate)**.
+- The Explanation Gate intercepted any AI insertion of ≥2 lines/≥50 chars and **blocked merge** with a modal: "Before applying this code, explain its causal logic. How does it handle state updates?" A separate "Judge" LLM (GPT-4o, to avoid self-preference bias) graded the explanation against the **SOLO taxonomy**, requiring **≥ Level 3 (Relational)** — explaining how components interact, cause-and-effect, the *why* not just the *what*. Below threshold, the modal stayed locked and offered Socratic feedback.
+- **Phase 1 (build):** Both AI groups crushed the manual control on functional utility (B: 92.4%, C: 89.1%, A: 65.2%); B vs C did not differ (p=.64).
+- **Phase 2 (30-min AI-blackout maintenance task** — fix an injected race-condition bug in their *own* code): Manual succeeded 69.2%; **Unrestricted AI succeeded only 23.1% (≈77% failure); Scaffolded AI succeeded 61.5% (≈39% failure).** The 38-point success gap between B and C is the central finding.
+- The paper formalizes "epistemic debt" as functional utility minus corrective competence: Group B = 69.3 points; Group C = 27.6 points. The gate added a median ~14 minutes of friction, which the authors call a "false dichotomy" against speed because it was "largely subsidized by the generation speed of the LLM."
+- Qualitative: 72% of Group C initially found the gate "annoying," but 64% of those who fixed the bug said the gate was "the only reason they knew where to look." The authors conclude "future learning systems must enforce metacognitive friction" and that successful vibe coders "treat the AI as a consultant rather than a contractor."
+
+A companion measurement framework, "The Vibe-Check Protocol" (arXiv 2601.02410), proposes metrics including the "Explainability Gap" between code complexity and demonstrated comprehension.
+
+### C. Validated learning-science principles to ground the skill
+
+- **Illusion of explanatory depth (Rozenblit & Keil, 2002).** People believe they understand things far better than they do; the illusion collapses the moment they must *produce a step-by-step explanation*. This is precisely the failure mode of vibe coding, and the antidote — forced explanation — is the design's backbone. The effect appears specifically for *explanatory* (causal) knowledge, not facts/procedures.
+- **Self-explanation effect (Chi et al., 1989).** Learners who actively explain material to themselves learn substantially more; "self-explanation serves a particularly useful role in helping learners overcome the illusion of explanatory depth." Most people are passive self-explainers unless prompted — so the skill must *demand* explanation.
+- **Retrieval practice / testing effect (Roediger & Karpicke, 2006).** Actively retrieving information from memory beats passive re-reading for long-term retention; Karpicke & Blunt (2011, *Science*) showed retrieval beat even elaborate concept-mapping. Implication: quiz the user (recall), don't just re-show them the explanation (recognition).
+- **Recognition vs. recall.** Re-reading AI code and feeling "yes, that looks right" is recognition — a weak, illusion-prone signal. Genuine verification requires recall and reconstruction.
+- **Feynman technique & rubber-duck explanation.** Explaining code in plain language "to a 12-year-old" or a rubber duck exposes gaps; "if you can't explain it in simple terms, you don't understand it." Directly operationalizable as a teach-back artifact.
+- **Expertise reversal effect (Kalyuga, Sweller).** Instructional supports that help novices can *hinder* experts; guidance should fade as expertise grows. Implication: the skill should *calibrate* its depth/friction to the user's demonstrated level, not apply the same heavy scaffolding to a senior engineer who already understands.
+- **Metacognition & confidence calibration.** Have the user rate confidence *before* explaining, then compare to graded performance — this surfaces overconfidence (and echoes Osmani's 1–5 comprehension scoring idea).
+
+### D. Code-comprehension-specific practices to embed
+
+- **Trace execution by hand** through a representative path (e.g., "what happens when a user submits the form").
+- **Reconstruct from spec**: have the user predict what the code should do before reading it, or re-derive the approach.
+- **Predict-the-output exercises**: give inputs, ask the user to predict outputs/state changes before running.
+- **"What breaks if X changes?"**: identify blast radius and hidden coupling — directly targets the "week 7 wall."
+- **Write-your-own-comments/docs**: proving understanding by documenting *why*, not *what* (also pays down Storey's "intent debt").
+- **Reimplementation to repair debt** (Storey's suggestion): because generation is now cheap, re-derive a feature against new tests to rebuild the mental model.
+- The **three-file protocol** circulating in the comprehension-debt discourse: after each AI session, read the largest diffs fully; score comprehension 1–5; reject merges below 3.
+
+### E. Anthropic skill-authoring best practices to follow
+
+From Anthropic's official guidance ("Equipping agents for the real world with Agent Skills" and the Skill Authoring Best Practices docs):
+- **Progressive disclosure**: SKILL.md frontmatter (name + description, ~100 tokens) loads first; the body loads when triggered; bundled reference files load only as needed. Keep SKILL.md under ~500 lines.
+- **The `description` field is the single most important element** — it determines whether the skill triggers. State both *what it does* and *when to use it*.
+- **"Explain the why," not all-caps imperatives.** Anthropic's skill-creator flags ALWAYS/NEVER/MUST as a yellow flag; state the rule then the reasoning so Claude generalizes to edge cases.
+- **Use checklists and validation loops** (run validator → fix → repeat) — ideal for a comprehension gate ("only proceed when all requirements met").
+- **Bundle deterministic helpers as scripts** (e.g., a quiz generator or a sign-off recorder), invoked via bash so only output consumes context.
+- Distribute via the Agent Skills open standard (works across Claude Code, Claude.ai, the API, and other agents).
+
+## Recommendations
+
+**Stage 1 — Adopt/borrow now (this week).**
+- Install and trial **"/teach"** (alexknowshtml) for its completion-gate pattern and **"WHY"** (jobrien874) for its WHAT/HOW/WHY quiz framing on just-generated code, but treat both as unproven (low adoption) references rather than production dependencies. Audit any third-party skill before running it (skills execute arbitrary code).
+- For producing the *artifacts*, reuse **alexanderop/walkthrough** (interactive Mermaid diagrams) and a codebase-onboarding skill as components.
+
+**Stage 2 — Build the comprehension-sign-off skill (the core recommendation).** Author a SKILL.md named e.g. `comprehension-signoff` that runs *after* a vibe-coding session. Structure it as a gated, four-phase workflow with progressive disclosure:
+
+1. **Scope & artifact generation.** Claude identifies the "important parts" (entry points, state management, security-sensitive paths, novel logic) and produces layered artifacts in an output folder: (a) an **architecture/flow diagram** (Mermaid), (b) a **plain-language walkthrough** of each key flow, (c) **annotated code** explaining the *why*, (d) a **glossary** of project-specific terms, and (e) a **"what could go wrong / what breaks if X changes" list**.
+2. **Confidence pre-rating.** Ask the user to self-rate understanding 1–5 per key component *before* testing — to expose the illusion of explanatory depth.
+3. **Active verification (the gate).** For each key component, run a mix of: **teach-back** ("explain in your own words how state updates here"), **predict-the-output** exercises, and **"what breaks if X changes"** questions. Grade teach-back against a **SOLO ≥ Level 3 (Relational)** rubric (bundle the rubric as a reference file). Below threshold, give Socratic hints and loop — do not reveal the answer outright. Use a *separate* grading pass to reduce self-preference bias.
+4. **Gated sign-off & record.** Only when all key components pass does the skill emit a **sign-off record** (a committed `COMPREHENSION.md` or `.signoff` file with timestamp, commit SHA, components covered, scores, and any flagged residual gaps). This doubles as "intent debt" documentation.
+
+Design choices grounded in evidence:
+- **Make the gate real but proportionate.** The N=78 study shows gating cuts maintenance failure roughly in half; the ~14-min friction is acceptable given generation speed. Apply the **expertise reversal effect**: let confident, demonstrably-competent users fade the scaffolding (lighter quizzing), and concentrate friction on novel/risky code.
+- **Prefer recall over recognition** (testing effect) and **demand self-explanation** (most users won't volunteer it).
+- **Follow Anthropic authoring rules**: tight `description`, body < 500 lines, rubric/templates/examples in separate reference files, "explain the why," checklist-driven loop, optional bundled scripts for quiz generation and sign-off recording.
+
+**Stage 3 — Validate your skill.** Borrow the study's design: after a comprehension session, give the user a small "AI-blackout" modification task on their own code. Track pass rates and comprehension-quiz scores over time. **Thresholds that should change your approach:** if blackout pass rates don't materially beat an ungated baseline, the gate is theater — tighten the rubric or the artifact quality; if users routinely bypass or resent the gate, apply more aggressive expertise-based fading; if comprehension scores stay high with lighter friction for a given user, fade further.
+
+## Caveats
+- **Recency and adoption risk.** The directly-matching tools (WHY, /teach) are days-to-weeks old with negligible adoption (WHY had 0 stars). They are signals of an emerging niche, not battle-tested solutions.
+- **Evidence base is young and partly non-peer-reviewed.** The MIT "Your Brain on ChatGPT" study is a preprint with N=54 and a small crossover (18); its authors urge caution and a published critique disputes some metrics. The strongest gating evidence (N=78) is about *novice* React learners — generalization to senior engineers on production systems is plausible but unproven. Some headline statistics (e.g., the Anthropic 50%/67% vs. 42%/57% figures, the "<40% vs >65%" comprehension claim) vary across sources; cite them as indicative, not definitive.
+- **Attribution care.** Several codified remedies often attributed to Addy Osmani (a literal "three-file protocol," "1–5 scoring," "use AI for inquiry not delegation") appear primarily in *derivative* articles built on his essay rather than verbatim in his own post; his actual language centers on inquiry-vs-delegation and "the comprehension work is the job."
+- **Naming collisions.** "VibeCheck"/"Vibe Checker" refers to at least four distinct, unrelated works; the relevant ones are arXiv 2602.20206 (Explanation Gate) and arXiv 2601.02410 (measurement protocol).
+- **Security.** Any installed third-party skill can execute arbitrary code; audit SKILL.md and bundled scripts before use, and prefer skills you author yourself.
+
+### Key links
+- Anthropic skills repo: github.com/anthropics/skills · Skill authoring best practices: docs.claude.com/en/docs/agents-and-tools/agent-skills/best-practices · Anthropic engineering post: anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills
+- WHY plugin: github.com/jobrien874/why-plugin · /teach: github.com/alexknowshtml/claude-skills · walkthrough: github.com/alexanderop/walkthrough · /onboard: github.com/tommcfarlin/claude-code-onboard
+- Storey, cognitive/intent debt: margaretstorey.com/blog/2026/02/09/cognitive-debt/ · arXiv 2603.22106 · Willison: simonwillison.net/2026/Feb/15/cognitive-debt/
+- Osmani, comprehension debt: addyosmani.com/blog/comprehension-debt/ · oreilly.com/radar/comprehension-debt-the-hidden-cost-of-ai-generated-code/
+- MIT "Your Brain on ChatGPT": arXiv 2506.08872 · media.mit.edu/publications/your-brain-on-chatgpt/
+- Epistemic debt / Explanation Gate: arXiv 2602.20206 · Vibe-Check Protocol: arXiv 2601.02410 · METR RCT: arXiv 2507.09089 · GitClear 2025 code-quality report (gitclear.com)
+- Illusion of explanatory depth: Rozenblit & Keil 2002 (PMC3062901) · Testing effect/retrieval practice: Roediger & Karpicke 2006; Karpicke & Blunt 2011 (Science)
