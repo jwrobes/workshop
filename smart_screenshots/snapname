@@ -1,0 +1,586 @@
+#!/usr/bin/env python3
+"""snapname — name new macOS screenshots with an LLM and file them where you're working.
+
+Usage:
+  snapname process [--dir D] [--dry-run]   handle every unprocessed screenshot in D (the launchd
+                                           agent runs this whenever the folder changes)
+  snapname name FILE                       print the slug the model would give FILE; no changes
+  snapname where                           show where a screenshot taken now would go, and why
+  snapname pin DIR | unpin                 force the destination folder / go back to auto-detect
+  snapname log [-n N]                      tail the activity log
+  snapname install-agent | uninstall-agent load / unload the launchd WatchPaths agent
+  snapname config [KEY]                    print the effective config (or one value)
+  snapname backfill [--dir D] [--limit N] [--dry-run]
+                                           rename older default-named screenshots in place
+                                           (no routing, no pasting)
+
+Flow for each new "Screenshot <date> at <time>.png" in the watched folder:
+  1. Downscale a copy with sips and ask a vision model (via a pluggable command, see
+     SNAPNAME_VISION_CMD) for a short descriptive slug. On any failure the original name is kept.
+  2. Rename it in place to {date}_{slug}.png.
+  3. Resolve the working folder: a pin if set, else the cwd of the active pane in the most
+     recently used tmux client, mapped to its workbench (or *_workspace) folder. Hard-link the
+     file into <that folder>/screenshots/, so both copies survive the workbench being archived.
+  4. If that pane is running claude, paste the image path into its input box (no Enter).
+
+Config lives in ~/.config/snapname/config.json ($SNAPNAME_CONFIG overrides the path); state and
+logs in ~/.local/state/snapname/.
+
+Environment overrides: SNAPNAME_VISION_CMD (command template for the vision call) and
+SNAPNAME_MODEL (model name passed to it).
+"""
+
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG_PATH = Path(os.environ.get("SNAPNAME_CONFIG", HOME / ".config" / "snapname" / "config.json"))
+STATE_DIR = HOME / ".local" / "state" / "snapname"
+LOG_PATH = STATE_DIR / "snapname.log"
+PIN_PATH = STATE_DIR / "pin"
+LOCK_PATH = STATE_DIR / "lock"
+AGENT_LABEL = "com.jwrobes.snapname"
+AGENT_PLIST = HOME / "Library" / "LaunchAgents" / f"{AGENT_LABEL}.plist"
+
+# Vision command template. It is split with shlex, then each word has {image}, {image_dir},
+# {model}, {system} and {prompt} filled in, so quoting in the template is the only quoting needed.
+# It must print a short slug on stdout. Alternatives:
+#   llm -m {model} -a {image} -s {system} {prompt}                        (the `llm` CLI)
+DEFAULT_VISION_CMD = (
+    "claude -p --model {model} --allowedTools Read --add-dir {image_dir} "
+    "--append-system-prompt {system} "
+    '"Read the image file {image}. {prompt}"')
+
+DEFAULTS = {
+    "watch_dir": str(HOME / "Screenshots"),
+    "workspace_root": str(HOME / "workspace"),
+    "model": "claude-haiku-4-5",
+    "vision_cmd": DEFAULT_VISION_CMD,
+    # {date} = capture date from the macOS name (YYYY-MM-DD), {slug} = model output.
+    "name_format": "{date}_{slug}",
+    # "link" (hard-link into the working folder), "move" (leave nothing in watch_dir), "off".
+    "route": "link",
+    # "paste" puts the path in the Claude input box of the active pane; "off" disables it.
+    "inject": "paste",
+    "notify": True,
+    "max_slug_words": 6,
+    # Only screenshots created this recently are handled automatically. Anything older is a
+    # backlog file: left alone by the agent, renamed only by an explicit `snapname backfill`.
+    "max_age_seconds": 120,
+}
+
+# macOS default names: "Screenshot 2026-10-20 at 4.40.33 PM.png" (and "... PM (2).png").
+SCREENSHOT_RE = re.compile(
+    r"^Screenshot (?P<date>\d{4}-\d{2}-\d{2}) at (?P<time>[\d.]+(?:\s?[AP]M)?)(?: \(\d+\))?\.png$")
+
+SYSTEM_PROMPT = """You name screenshot files. Reply with ONLY a filename slug: {words} words max, \
+lowercase, hyphen-separated, ASCII letters/digits only, no extension, no punctuation.
+Describe what the screenshot shows and what it is about (app/tool, screen, the notable thing on it), \
+e.g. "dashboard-error-spike-checkout-service" or "ci-pipeline-failed-unit-tests".
+Never put people's names, emails, personal details, IDs, or secrets in the slug."""
+
+
+# ---------------------------------------------------------------- small utilities
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        cfg.update(json.loads(CONFIG_PATH.read_text()))
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as exc:
+        log(f"config unreadable, using defaults: {exc}")
+    # Environment wins over the config file.
+    for env, key in (("SNAPNAME_VISION_CMD", "vision_cmd"), ("SNAPNAME_MODEL", "model")):
+        if os.environ.get(env):
+            cfg[key] = os.environ[env]
+    return cfg
+
+
+def log(msg):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(LOG_PATH, "a") as fh:
+        fh.write(f"{stamp} {msg}\n")
+
+
+def run(cmd, input_text=None, timeout=30, cwd=None):
+    """Run a command; return stdout, or None if it failed or isn't installed."""
+    try:
+        res = subprocess.run(cmd, input=input_text, capture_output=True, text=True,
+                             timeout=timeout, cwd=cwd)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"command failed: {cmd[0]}: {exc}")
+        return None
+    if res.returncode != 0:
+        log(f"command failed: {' '.join(cmd[:3])}...: rc={res.returncode} {res.stderr.strip()[:300]}")
+        return None
+    return res.stdout
+
+
+def applescript_string(text):
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def notify(cfg, title, text):
+    if not cfg.get("notify"):
+        return
+    script = (f"display notification {applescript_string(text)} "
+              f"with title {applescript_string(title)}")
+    run(["osascript", "-e", script], timeout=5)
+
+
+# ---------------------------------------------------------------- naming
+
+def slugify(text, max_words):
+    """Turn model output into a safe slug; empty string if nothing usable is left."""
+    line = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+    line = line.strip("`\"' ").lower()
+    line = re.sub(r"\.(png|jpe?g)$", "", line)
+    words = [w for w in re.split(r"[^a-z0-9]+", line) if w]
+    return "-".join(words[:max_words])
+
+
+def build_vision_argv(template, **values):
+    """Split the command template into words, then fill each word's placeholders."""
+    return [word.format(**values) for word in shlex.split(template)]
+
+
+def call_vision_model(image, cfg, prompt):
+    """THE vision backend call: send image + prompt to the configured command, return its stdout
+    (or None on failure). To swap backends, change `vision_cmd` / SNAPNAME_VISION_CMD, or replace
+    this one function."""
+    try:
+        argv = build_vision_argv(
+            cfg["vision_cmd"], image=str(image), image_dir=str(Path(image).parent),
+            model=cfg["model"], max_tokens="40",
+            system=SYSTEM_PROMPT.format(words=cfg["max_slug_words"]), prompt=prompt)
+    except (ValueError, KeyError, IndexError) as exc:
+        log(f"bad vision_cmd template: {exc!r}")
+        return None
+    return run(argv, timeout=90, cwd=str(Path(image).parent))
+
+
+def ask_model_for_slug(path, cfg, hint=None):
+    """Return a slug for the image at path, or None on any failure."""
+    with tempfile.TemporaryDirectory(prefix="snapname-") as tmp:
+        small = Path(tmp) / "shot.jpg"
+        # 1024px JPEG keeps the request small and fast; naming doesn't need full resolution.
+        if run(["sips", "-Z", "1024", "-s", "format", "jpeg", str(path), "--out", str(small)],
+               timeout=20) is None or not small.exists():
+            return None
+        prompt = "Name this screenshot."
+        if hint:
+            prompt += f" The user is currently working on: {hint}."
+        out = call_vision_model(small, cfg, prompt)
+    slug = slugify(out, cfg["max_slug_words"]) if out else ""
+    return slug or None
+
+
+def unique_path(directory, stem, suffix):
+    candidate = directory / f"{stem}{suffix}"
+    n = 2
+    while candidate.exists():
+        candidate = directory / f"{stem}-{n}{suffix}"
+        n += 1
+    return candidate
+
+
+# ---------------------------------------------------------------- where am I working
+
+def tmux_active_pane():
+    """The active pane of the most recently used tmux client: {id, command, cwd}, or None."""
+    out = run(["tmux", "list-clients", "-F",
+               "#{client_activity}\t#{pane_id}\t#{pane_current_command}\t#{pane_current_path}"],
+              timeout=5)
+    rows = []
+    for line in (out or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) == 4 and parts[0].isdigit():
+            rows.append(parts)
+    if not rows:
+        return None
+    _, pane_id, command, cwd = max(rows, key=lambda r: int(r[0]))
+    return {"id": pane_id, "command": command, "cwd": cwd}
+
+
+def working_folder(cwd, workspace_root):
+    """Map a cwd to the folder screenshots should land in, plus a human label.
+
+    ~/workspace/X_workspace/workbench/<init>/...  -> that workbench initiative folder
+    ~/workspace/X_workspace/<anything else>/...   -> ~/workspace/X_workspace
+    anything else                                  -> None (screenshot stays in watch_dir only)
+
+    Worktrees are deliberately never a destination: images dropped there would end up in commits.
+    """
+    try:
+        rel = Path(cwd).resolve().relative_to(Path(workspace_root).resolve())
+    except (ValueError, OSError):
+        return None, None
+    parts = rel.parts
+    if not parts or not parts[0].endswith("_workspace"):
+        return None, None
+    ws = Path(workspace_root) / parts[0]
+    if len(parts) >= 3 and parts[1] == "workbench" and parts[2] != "completed":
+        return ws / "workbench" / parts[2], f"{parts[0]} / {parts[2]}"
+    if len(parts) >= 2:
+        initiative = workbench_for_worktree(ws, ws / parts[1])
+        if initiative is not None:
+            return initiative, f"{parts[0]} / {initiative.name}"
+    return ws, parts[0]
+
+
+def workbench_for_worktree(ws, worktree):
+    """The workbench initiative whose .claude/settings.json grants access to worktree, if any."""
+    target = worktree.resolve()
+    for settings in sorted((ws / "workbench").glob("*/.claude/settings.json")):
+        initiative = settings.parent.parent
+        try:
+            dirs = json.loads(settings.read_text()).get("permissions", {}).get(
+                "additionalDirectories", [])
+        except (OSError, ValueError):
+            continue
+        for d in dirs:
+            if (initiative / Path(d).expanduser()).resolve() == target:
+                return initiative
+    return None
+
+
+def resolve_target(cfg):
+    """Return (folder or None, label, pane or None, reason)."""
+    pane = tmux_active_pane()
+    if PIN_PATH.exists():
+        pinned = Path(PIN_PATH.read_text().strip()).expanduser()
+        if pinned.is_dir():
+            return pinned, pinned.name, pane, "pinned"
+        log(f"pin points at a missing folder, ignoring: {pinned}")
+    if pane is None:
+        return None, None, None, "no tmux client"
+    folder, label = working_folder(pane["cwd"], cfg["workspace_root"])
+    if folder is None:
+        return None, None, pane, f"active pane cwd {pane['cwd']} is not inside a *_workspace"
+    return folder, label, pane, f"active tmux pane {pane['id']} ({pane['command']})"
+
+
+def place(src, folder, mode):
+    """Put src into folder/screenshots/. Returns the new path, or None."""
+    dest_dir = folder / "screenshots"
+    fresh = not dest_dir.exists()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    if fresh:
+        # Keep screenshots out of whatever repo the workbench lives in.
+        (dest_dir / ".gitignore").write_text("*\n")
+    dest = unique_path(dest_dir, src.stem, src.suffix)
+    try:
+        if mode == "move":
+            shutil.move(str(src), dest)
+        else:
+            try:
+                os.link(src, dest)
+            except OSError:
+                shutil.copy2(src, dest)
+    except OSError as exc:
+        log(f"could not place {src.name} in {dest_dir}: {exc}")
+        return None
+    return dest
+
+
+PROMPT_LINE_RE = re.compile(r"^[ \u00a0]*❯[ \u00a0]*(.*?)[ \u00a0]*$")
+MENU_ITEM_RE = re.compile(r"^\d+\.\s")
+
+
+def safe_to_paste(screen):
+    """True when the last ❯ line on screen is Claude's input box, not a menu or permission dialog
+    ("❯ 1. Yes"). Text already being typed is fine: the path is appended to it."""
+    for line in reversed([l for l in screen.splitlines() if l.strip()]):
+        m = PROMPT_LINE_RE.match(line)
+        if m:
+            return not MENU_ITEM_RE.match(m.group(1))
+    return False
+
+
+def paste_into_claude(pane, text):
+    """Paste text into a claude pane's input without submitting. Returns True if it went in."""
+    if pane is None or pane["command"] != "claude":
+        return False
+    in_mode = (run(["tmux", "display-message", "-p", "-t", pane["id"], "#{pane_in_mode}"],
+                   timeout=5) or "").strip()
+    if in_mode == "1":
+        run(["tmux", "copy-mode", "-q", "-t", pane["id"]], timeout=5)
+    if not safe_to_paste(run(["tmux", "capture-pane", "-p", "-t", pane["id"]], timeout=5) or ""):
+        log(f"pane {pane['id']} is showing a menu or dialog; not pasting")
+        return False
+    buf = f"snapname-{os.getpid()}"
+    if run(["tmux", "load-buffer", "-b", buf, "-"], input_text=text, timeout=5) is None:
+        return False
+    # -p: bracketed paste, so Claude treats it as pasted text; -d: drop the buffer afterwards.
+    ok = run(["tmux", "paste-buffer", "-p", "-d", "-b", buf, "-t", pane["id"]], timeout=5)
+    return ok is not None
+
+
+# ---------------------------------------------------------------- processing
+
+def wait_until_stable(path, checks=3, interval=0.4, timeout=10):
+    """macOS can still be writing the file when the folder event fires."""
+    deadline = time.time() + timeout
+    last, same = -1, 0
+    while time.time() < deadline:
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            return False
+        same = same + 1 if size == last and size > 0 else 0
+        if same >= checks:
+            return True
+        last = size
+        time.sleep(interval)
+    return False
+
+
+def created_at(path):
+    st = path.stat()
+    return getattr(st, "st_birthtime", st.st_mtime)
+
+
+def pending(watch_dir, max_age=None, now=None):
+    """Default-named screenshots in watch_dir, oldest first; with max_age, only ones created in
+    the last max_age seconds."""
+    try:
+        entries = [p for p in Path(watch_dir).iterdir()
+                   if p.is_file() and SCREENSHOT_RE.match(p.name)]
+    except FileNotFoundError:
+        return []
+    entries.sort(key=created_at)
+    if max_age is None:
+        return entries
+    now = time.time() if now is None else now
+    return [p for p in entries if now - created_at(p) <= max_age]
+
+
+def process_one(path, cfg, dry_run=False, backfill=False):
+    """Name one screenshot. Fresh ones are also routed and pasted; backfill only renames."""
+    match = SCREENSHOT_RE.match(path.name)
+    if not match or not wait_until_stable(path):
+        return None
+    if backfill:
+        folder, label, pane, reason = None, None, None, "backfill"
+    elif cfg["route"] != "off":
+        folder, label, pane, reason = resolve_target(cfg)
+    else:
+        folder, label, pane, reason = None, None, tmux_active_pane(), "routing off"
+    slug = ask_model_for_slug(path, cfg, hint=label)
+    if not slug:
+        log(f"naming failed, keeping {path.name}")
+        if not backfill:
+            notify(cfg, "Screenshot", f"Couldn't name it; kept {path.name}")
+        return None
+    stem = cfg["name_format"].format(date=match["date"], slug=slug)
+    renamed = unique_path(path.parent, stem, ".png")
+    if dry_run:
+        print(f"{path.name} -> {renamed.name}; target: {folder or '(watch dir only)'} [{reason}]")
+        return renamed
+    path.rename(renamed)
+    final = renamed
+    if folder is not None:
+        placed = place(renamed, folder, cfg["route"])
+        if placed is not None:
+            final = placed
+    pasted = False
+    if cfg["inject"] == "paste" and not backfill:
+        pasted = paste_into_claude(pane, f"{final} ")
+    log(f"{path.name} -> {final} [{reason}]" + (" pasted" if pasted else ""))
+    if backfill:
+        return final
+    where = f" → {label}" if folder is not None and final != renamed else ""
+    notify(cfg, "Screenshot named", f"{final.name}{where}" + (" (pasted into Claude)" if pasted else ""))
+    return final
+
+
+def cmd_process(args, cfg):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOCK_PATH, "w") as lock:
+        try:
+            # One run at a time: launchd can fire again while a slow model call is in flight.
+            # The running instance rescans before exiting, so a skipped run loses nothing.
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        watch = args.dir or cfg["watch_dir"]
+        seen = set()
+        while True:
+            todo = [p for p in pending(watch, max_age=cfg["max_age_seconds"]) if p not in seen]
+            if not todo:
+                return 0
+            for path in todo:
+                seen.add(path)
+                process_one(path, cfg, dry_run=args.dry_run)
+
+
+def cmd_backfill(args, cfg):
+    cutoff = time.time() - cfg["max_age_seconds"]
+    todo = [p for p in pending(args.dir or cfg["watch_dir"]) if created_at(p) < cutoff]
+    if args.limit:
+        todo = todo[-args.limit:]
+    print(f"{len(todo)} older screenshot(s) to rename")
+    for path in todo:
+        final = process_one(path, cfg, dry_run=args.dry_run, backfill=True)
+        if final is not None and not args.dry_run:
+            print(f"{path.name} -> {final.name}")
+    return 0
+
+
+def cmd_name(args, cfg):
+    slug = ask_model_for_slug(Path(args.file), cfg)
+    if not slug:
+        print("naming failed; see `snapname log`", file=sys.stderr)
+        return 1
+    print(slug)
+    return 0
+
+
+def cmd_where(args, cfg):
+    folder, label, pane, reason = resolve_target(cfg)
+    print(f"destination: {folder / 'screenshots' if folder else cfg['watch_dir'] + ' (only)'}")
+    print(f"reason:      {reason}")
+    if pane:
+        will = cfg["inject"] == "paste" and pane["command"] == "claude"
+        print(f"paste:       {'yes, into ' + pane['id'] if will else 'no'}")
+    return 0
+
+
+def cmd_pin(args, cfg):
+    target = Path(args.dir).expanduser().resolve()
+    if not target.is_dir():
+        print(f"not a directory: {target}", file=sys.stderr)
+        return 1
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    PIN_PATH.write_text(str(target) + "\n")
+    print(f"pinned: {target}/screenshots")
+    return 0
+
+
+def cmd_unpin(args, cfg):
+    PIN_PATH.unlink(missing_ok=True)
+    print("unpinned; destination follows the active tmux pane again")
+    return 0
+
+
+def cmd_log(args, cfg):
+    try:
+        lines = LOG_PATH.read_text().splitlines()
+    except FileNotFoundError:
+        lines = []
+    print("\n".join(lines[-args.n:]))
+    return 0
+
+
+def agent_plist(cfg):
+    python = sys.executable
+    script = str(Path(__file__).resolve())
+    path_env = f"{HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin"
+    # zsh -ic picks up API keys exported in ~/.zshrc, which launchd doesn't load.
+    args = ["/bin/zsh", "-ic", 'exec "$0" "$@"', python, script, "process"]
+    arg_xml = "\n".join(f"\t\t<string>{a}</string>" for a in args)
+    log_file = STATE_DIR / "agent.log"
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>Label</key>
+\t<string>{AGENT_LABEL}</string>
+\t<key>EnvironmentVariables</key>
+\t<dict>
+\t\t<key>HOME</key>
+\t\t<string>{HOME}</string>
+\t\t<key>PATH</key>
+\t\t<string>{path_env}</string>
+\t</dict>
+\t<key>ProgramArguments</key>
+\t<array>
+{arg_xml}
+\t</array>
+\t<key>WatchPaths</key>
+\t<array>
+\t\t<string>{cfg['watch_dir']}</string>
+\t</array>
+\t<key>ThrottleInterval</key>
+\t<integer>2</integer>
+\t<key>StandardOutPath</key>
+\t<string>{log_file}</string>
+\t<key>StandardErrorPath</key>
+\t<string>{log_file}</string>
+</dict>
+</plist>
+"""
+
+
+def cmd_install_agent(args, cfg):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    Path(cfg["watch_dir"]).mkdir(parents=True, exist_ok=True)
+    domain = f"gui/{os.getuid()}"
+    run(["launchctl", "bootout", f"{domain}/{AGENT_LABEL}"], timeout=10)
+    AGENT_PLIST.write_text(agent_plist(cfg))
+    if run(["launchctl", "bootstrap", domain, str(AGENT_PLIST)], timeout=10) is None:
+        print(f"launchctl bootstrap failed; see {LOG_PATH}", file=sys.stderr)
+        return 1
+    print(f"agent loaded: {AGENT_PLIST} (watching {cfg['watch_dir']})")
+    return 0
+
+
+def cmd_uninstall_agent(args, cfg):
+    run(["launchctl", "bootout", f"gui/{os.getuid()}/{AGENT_LABEL}"], timeout=10)
+    AGENT_PLIST.unlink(missing_ok=True)
+    print("agent removed")
+    return 0
+
+
+def cmd_config(args, cfg):
+    print(cfg[args.key] if args.key else json.dumps(cfg, indent=2))
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="snapname", description=__doc__.split("\n")[0])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("process")
+    p.add_argument("--dir")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=cmd_process)
+    p = sub.add_parser("backfill")
+    p.add_argument("--dir")
+    p.add_argument("--limit", type=int, help="only the N most recent")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=cmd_backfill)
+    p = sub.add_parser("name")
+    p.add_argument("file")
+    p.set_defaults(fn=cmd_name)
+    sub.add_parser("where").set_defaults(fn=cmd_where)
+    p = sub.add_parser("pin")
+    p.add_argument("dir")
+    p.set_defaults(fn=cmd_pin)
+    sub.add_parser("unpin").set_defaults(fn=cmd_unpin)
+    p = sub.add_parser("log")
+    p.add_argument("-n", type=int, default=20)
+    p.set_defaults(fn=cmd_log)
+    sub.add_parser("install-agent").set_defaults(fn=cmd_install_agent)
+    sub.add_parser("uninstall-agent").set_defaults(fn=cmd_uninstall_agent)
+    p = sub.add_parser("config")
+    p.add_argument("key", nargs="?", choices=sorted(DEFAULTS))
+    p.set_defaults(fn=cmd_config)
+    args = parser.parse_args(argv)
+    return args.fn(args, load_config())
+
+
+if __name__ == "__main__":
+    sys.exit(main())

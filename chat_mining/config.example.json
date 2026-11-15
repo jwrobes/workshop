@@ -1,0 +1,34 @@
+{
+  "focus_areas": [
+    {
+      "name": "Project A",
+      "description": "Main product work: features, bug fixes, and architecture for Project A",
+      "workspace_keywords": ["project-a", "project_a"]
+    },
+    {
+      "name": "Docs",
+      "description": "Documentation, READMEs, process notes, onboarding material",
+      "workspace_keywords": ["docs", "documentation"]
+    },
+    {
+      "name": "Tooling",
+      "description": "Developer tooling, scripts, prompts, Claude/Cursor skills, automation",
+      "workspace_keywords": ["tooling", "scripts", "workshop"]
+    },
+    {
+      "name": "Experiments",
+      "description": "Prototypes, spikes, and throwaway explorations",
+      "workspace_keywords": ["prototype", "spike", "experiment"]
+    }
+  ],
+  "known_items": [
+    { "name": "Project A Launch", "focus_area": "Project A" },
+    { "name": "Docs Cleanup", "focus_area": "Docs" },
+    { "name": "Weekly Reading Group", "focus_area": "__text:reading group" }
+  ],
+  "llm": {
+    "default_model": "claude-haiku-4-5",
+    "batch_size": 25,
+    "cache_path": "~/.cache/chat_mining_classify.json"
+  }
+}
