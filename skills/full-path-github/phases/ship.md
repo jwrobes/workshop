@@ -11,11 +11,54 @@ history as a comment on the issue.
 - Execution log accumulated from all previous phases
 - Access to `~/workspace/skills/gh-pr-create/SKILL.md`
 
+## Step 0: Resolve the Target Repo and Base
+
+Two facts come from the checkout and its remote, not from assumption.
+
+**Target repo.** The PR goes where the code lives. Derive it from the
+worktree's remote, which may differ from the issue's repo (e.g. an issue in a
+tracker repo against code in another repo):
+
+```bash
+git -C {worktree_path} remote get-url origin
+# git@github.com:owner/repo.git  or  https://github.com/owner/repo.git  ->  owner/repo
+```
+
+Strip a trailing `.git`. Call it `{target_repo}` and pass `--repo {target_repo}`
+to every `gh pr` command below. If there is no `origin`, or it is not a GitHub
+URL, stop and report; do NOT fall back to the issue's repo. The issue's repo
+stays `{owner/repo}`, used for issue comments and labels. When the two differ,
+the PR body closes the issue with the full reference (`Closes owner/repo#NNN`),
+and commit subjects use that same form.
+
+**Base branch.** The remote decides what the PR diffs against. A local default
+branch that drifted ahead of the remote inflates the commit count with commits
+the PR will not contain.
+
+```bash
+cd {worktree_path}
+git fetch origin
+git symbolic-ref --short refs/remotes/origin/HEAD     # e.g. origin/main
+```
+
+Strip the leading `origin/` to get `{default_branch}` (if the ref is unset,
+use `gh repo view {target_repo} --json defaultBranchRef --jq .defaultBranchRef.name`).
+Treat `origin/{default_branch}` as the base for every comparison, rebase, and
+`--base` below; never hardcode `main`. Flag drift, do not fix it:
+
+```bash
+git rev-list --left-right --count {default_branch}...origin/{default_branch}
+```
+
+Anything other than `0	0` means the local branch diverged from the remote.
+Say so in the final report; never reset or merge to "fix" it here.
+
 ## Step 1: Prepare Commits
 
 ```bash
 cd {worktree_path}
-git log --oneline main..HEAD
+git log --oneline origin/{default_branch}..HEAD
+git rev-list --count origin/{default_branch}..HEAD    # the PR's commit count
 ```
 
 Verify commits follow project conventions:
@@ -27,36 +70,74 @@ Verify commits follow project conventions:
 If commits need cleanup, reorganize with interactive rebase or amend.
 Check `CONTRIBUTING.md` for project conventions.
 
-## Step 2: Rebase onto main, then Push
+## Step 2: Rebase onto the Default Branch
 
-Before pushing, make sure the branch is current with `main` — `main` may have
-moved during the run (e.g. a sibling leaf merged), which would make this PR
+Before pushing, make sure the branch is current with `origin/{default_branch}`
+— it may have moved during the run (e.g. a sibling leaf merged), which would make this PR
 conflict or carry duplicate commits.
 
 ```bash
 cd {worktree_path}
-git fetch origin main
+git fetch origin {default_branch}
 
 # Is this branch behind / stacked on something already merged?
-git log --oneline origin/main..HEAD     # should be ONLY this issue's commits
+git log --oneline origin/{default_branch}..HEAD     # should be ONLY this issue's commits
 ```
 
-If the branch was correctly cut from `main` (per `plan.md` Step 1), the log
+If the branch was correctly cut from the default branch (per `plan.md` Step 1), the log
 shows just this issue's commits and a rebase is a fast no-op. If it shows a
 **sibling leaf's commits too**, the branch was stacked — rebase to drop them:
 
 ```bash
-git rebase origin/main
+git rebase origin/{default_branch}
 # Already-merged sibling commits drop out automatically (same patch-id).
 # If a genuine conflict surfaces, resolve it, `git rebase --continue`,
 # then RE-RUN the validation suite (Layer 1 tests) before pushing —
 # a rebase can silently break a merge.
 ```
 
-Re-confirm green, then push:
+Re-confirm green:
 
 ```bash
 {test_command}            # must still pass after the rebase
+```
+
+## Step 2.5: Local Review Gate (advisory)
+
+Before pushing, get a fresh-eyes review of the committed branch, the same
+review a human or CI reviewer would give, while fixes are still cheap. This
+is **advisory**: record the result, never block shipping on it.
+
+Skip, noting the reason in the log, if `claude` is not on PATH, the diff
+against `origin/{default_branch}` is empty, or HEAD is behind it (rebase
+first). A skip is a result to report, not something to work around.
+
+Run a separate `claude -p` process in the worktree so the reviewer shares no
+context with this run. It reads the committed diff, not the working tree:
+
+```bash
+cd {worktree_path}
+claude -p "Use the code-review skill (~/workspace/skills/code-review/SKILL.md) \
+to review the committed diff: git diff origin/{default_branch}...HEAD. \
+Read-only: do not edit files. Report a verdict (approve | comment | \
+request_changes) and findings sorted most to least severe, each with severity \
+(critical | major | minor | info), file:line, and what to change. Any critical \
+or major finding means request_changes; only minor/info means comment; none \
+means approve. Your final message is the review." \
+  --allowedTools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*)" \
+  > /tmp/local-review.md
+```
+
+Findings are an opinion, not fact. Check each claim against the code before
+acting, especially claims about which callers or code paths are affected, and
+say plainly when a finding is mistaken. Fix confirmed critical/major findings
+with a new commit and re-run the tests, or list them under "Review Notes" in
+the PR body. Record the verdict and counts by severity in the execution log
+and the PR description.
+
+## Step 2.7: Push
+
+```bash
 git push -u origin HEAD --force-with-lease   # --force-with-lease only if rebased
 ```
 
@@ -87,13 +168,14 @@ Build the description from the execution log + validation results:
 - {config files added or modified}
 - Feature flag: `{flag_name}` (if any)
 
-Closes #{issue_number}
+Closes #{issue_number}      <!-- Closes owner/repo#N when the issue is in another repo -->
 
 ## Validation Results
 
 - **Tests:** {pass_count} passing ({new_count} new)
 - **ACs:** {covered}/{total} verified
 - **Review score:** {band} ({pct}%)
+- **Local review:** {verdict} ({critical}/{major}/{minor} findings) or skipped: {reason}
 - **E2E:** {pass/fail/n/a}
 
 ## Test Plan
@@ -165,8 +247,8 @@ cat > /tmp/pr-body.md <<'EOF'
 EOF
 
 gh pr create \
-  --repo {owner/repo} \
-  --base main \
+  --repo {target_repo} \
+  --base {default_branch} \
   --head {branch_name} \
   --draft \
   --title "{summary of change} (closes #{issue_number})" \
@@ -180,7 +262,7 @@ Record the PR URL.
 If all validation layers passed cleanly, mark the PR ready:
 
 ```bash
-gh pr ready {pr_number} --repo {owner/repo}
+gh pr ready {pr_number} --repo {target_repo}
 ```
 
 If any layer was deferred (e.g., should-fix items left for human, or
@@ -188,6 +270,10 @@ E2E was n/a with no hook), keep the PR as draft and note that in the
 issue comment in Step 6.
 
 ## Step 6: Post Execution Summary to Issue
+
+If the comment write is denied or fails, apply the **Outward-Write Fallback**
+in `guardrails.md`: save the body to `{git_dir}/orchestrator/issue-summary.md`, print
+the runnable `gh issue comment` command, and continue. Do not block.
 
 ```bash
 gh issue comment {NNN} --repo {owner/repo} --body "$(cat <<EOF
@@ -296,14 +382,16 @@ Full-path orchestrator complete.
 
   Issue:     {repo}#{number} — {title}
   PR:        {pr_url} ({draft|ready})
-  Branch:    {branch_name}
+  Branch:    {branch_name} ({commit_count} commits vs origin/{default_branch})
   Worktree:  {worktree_path}
 
   Tasks:     {completed}/{total}
   Tests:     {pass_count} passing ({new_count} new)
   ACs:       {covered}/{total} verified
   Review:    {band} ({pct}%)
+  Local review: {verdict} / skipped
   E2E:       {pass/fail/n/a}
+  Drift:     {none | local {default_branch} diverged from remote}
 
   Decisions: {high_count} high-confidence, {medium_count} medium (flagged)
   Blocks:    {block_count} encountered, {resolved_count} resolved
@@ -313,6 +401,8 @@ Review the PR when ready.
 
 ## Output
 
+- Target repo and base branch derived from the remote
+- Local review verdict recorded (advisory)
 - Branch pushed to origin
 - PR created (draft) with execution log in description
 - PR marked ready for review (if validation fully clean)

@@ -126,7 +126,7 @@ the diff against `code-review`:
 
 > Read `~/workspace/skills/code-review/SKILL.md` for the framework.
 >
-> Review the diff: `git diff main...HEAD` in the worktree at
+> Review the diff: `git diff origin/{default_branch}...HEAD` in the worktree at
 > {worktree_path}.
 >
 > Score each applicable phase (1–7) on the 0–3 scale:
@@ -144,7 +144,8 @@ the diff against `code-review`:
 > - Specific findings (file + line + what to change)
 > - Classification: must-fix, should-fix, consider
 >
-> Return the scored rubric and overall band.
+> Return the scored rubric and overall band. Your final message is the
+> review: send it only once the band is decided, not as an interim note.
 
 ### Pass criteria
 

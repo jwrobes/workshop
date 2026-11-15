@@ -91,7 +91,15 @@ If any task is unclear or blocked, write a BLOCKED section in the task
 file explaining what's needed and stop.
 
 After all tasks complete, run the full test suite once more and report.
+Your final message is your report: send it only once every task is done or
+BLOCKED, and end it with `Status: DONE` or `Status: BLOCKED`.
 ```
+
+For parallel groups only, end the dispatch with `elapsed {N}s` (since the
+recorded run start) and: "Time matters here: do not spend time that can be
+avoided, and the earlier a correct result is obtained, the better." Never add
+this to review or validation dispatches; time pressure trades away
+verification.
 
 Sequential groups: wait for the previous group's subagent to finish.
 Parallel groups: launch all parallel subagents simultaneously.
@@ -109,7 +117,9 @@ When two plans exist from a low-confidence ENRICH split:
 For each subagent:
 
 1. Wait for completion.
-2. Read the subagent's output.
+2. Read the subagent's output. No `Status:` line, or open items with no
+   stated blocker, means it stopped early: continue it per **Subagent
+   returns** in `guardrails.md` (max 2 continuations, then BLOCKED).
 3. Check for `BLOCKED` markers in any task file.
 
 ### If a task reports BLOCKED
