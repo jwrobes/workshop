@@ -1,0 +1,1353 @@
+#!/usr/bin/env python3
+"""sharpen — pair a sharpen-prompt Claude session with a working session.
+
+Usage:
+  sharpen session [PAIR] [--agent auto|claude|cursor]
+                                      mark this tmux pane as PAIR's sharpen pane and launch an agent.
+                                      --agent defaults to auto (prefers claude, else cursor-agent).
+  sharpen join [PAIR] [--role R]      mark this pane as a member of PAIR (role: working|sharpen)
+  sharpen leave                       clear this pane's pair/role
+  sharpen pair [SELECTOR]             from a sharpen pane: switch to a pair name, or add a pane
+                                      (%ID, left/right/up/down, cwd substring) as a working member.
+                                      No selector: show the resolved target and candidates
+  sharpen pin SELECTOR | unpin        force / release the target working pane for this pane's pair
+  sharpen pairs                       list all pairs with their panes and current target
+  sharpen status                      this pane's pair, role, resolved target, last copy
+  sharpen copy [PAIR] [--from-pane %ID] [--quiet]
+                                      re-copy the pair's last extracted message to the clipboard
+                                      (--from-pane picks the pair from a pane; prefix+y uses it)
+  sharpen last [SELECTOR]             print a pane's last-message snapshot
+  sharpen deliver [--refine] [--pair P] [--from-pane %ID] [--voice]
+                                      read text on stdin, paste it into the pair's sharpen pane
+  sharpen resend [--force] [--pair P] [--from-pane %ID]
+                                      deliver the last saved dictation again after a failure
+  sharpen dictate [--refine] [--from-pane %ID] [dictate args...]
+                                      run speak_to_code's dictate with --to-sharpen
+  sharpen gc                          remove snapshots older than 24h
+  sharpen hook stop|prompt|after_response|session_start
+                                      hook entry points (read the event JSON on stdin).
+                                      stop/prompt are Claude Code (Stop / UserPromptSubmit);
+                                      after_response/session_start are Cursor CLI
+                                      (afterAgentResponse / sessionStart).
+
+Pair membership lives on tmux panes as user options @sharpen_pair / @sharpen_role, so a new
+Claude session started in the same pane stays paired. Outside tmux, SHARPEN_PAIR / SHARPEN_ROLE
+env vars set at launch do the same job. State lives in ~/.config/sharpen/.
+"""
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("SHARPEN_STATE_DIR", Path.home() / ".config" / "sharpen"))
+SESSIONS_DIR = STATE_DIR / "sessions"
+PAIRS_DIR = STATE_DIR / "pairs"
+LOG_FILE = STATE_DIR / ".hook.log"
+TOOL_DIR = Path(os.path.realpath(__file__)).parent
+SESSION_PROMPT = TOOL_DIR / "prompts" / "sharpen-session.md"
+CURSOR_SESSION_PROMPT = TOOL_DIR / "prompts" / "sharpen-session-cursor.md"
+DICTATE = TOOL_DIR.parent / "speak_to_code" / "dictate"
+
+SNAPSHOT_MAX_CHARS = 8000
+SNAPSHOT_TTL_SECONDS = 24 * 3600
+STALE_SECONDS = int(os.environ.get("SHARPEN_STALE_SECONDS", "600"))
+ROLES = ("working", "sharpen")
+
+
+# ── small utilities ──────────────────────────────────────────────────────────
+
+def log(msg):
+    try:
+        private_dir(STATE_DIR)
+        fd = os.open(LOG_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as f:
+            f.write(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}] {msg}\n")
+    except OSError:
+        pass
+
+
+def die(msg, code=1):
+    print(f"sharpen: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def now():
+    return time.time()
+
+
+def age_str(seconds):
+    seconds = int(max(0, seconds))
+    if seconds < 90:
+        return f"{seconds}s ago"
+    if seconds < 5400:
+        return f"{seconds // 60}m ago"
+    return f"{seconds // 3600}h ago"
+
+
+def slugify(text):
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug or "default"
+
+
+def slug_from_cwd(cwd):
+    """Default pair name: the workbench initiative folder if inside one, else the folder name."""
+    parts = Path(cwd).parts
+    if "workbench" in parts:
+        i = parts.index("workbench")
+        if i + 1 < len(parts):
+            return slugify(parts[i + 1])
+    return slugify(Path(cwd).name)
+
+
+def read_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def private_dir(path):
+    """Create path (and the state root) owner-only, tightening any looser existing mode."""
+    for d in (STATE_DIR, path):
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if (d.stat().st_mode & 0o777) != 0o700:
+            d.chmod(0o700)
+
+
+def write_private(path, text):
+    private_dir(path.parent)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def write_json(path, data):
+    write_private(path, json.dumps(data, indent=2))
+
+
+# ── tmux ─────────────────────────────────────────────────────────────────────
+
+PANE_FORMAT = "\t".join([
+    "#{pane_id}", "#{session_name}", "#{window_id}", "#{window_index}", "#{pane_index}",
+    "#{pane_left}", "#{pane_top}", "#{pane_current_path}", "#{pane_current_command}",
+    "#{@sharpen_pair}", "#{@sharpen_role}",
+])
+PANE_FIELDS = ["id", "session", "window_id", "window_index", "pane_index",
+               "left", "top", "cwd", "command", "pair", "role"]
+
+
+def tmux(*args, input_text=None):
+    try:
+        r = subprocess.run(["tmux", *args], input=input_text, capture_output=True, text=True,
+                           timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def in_tmux():
+    return bool(os.environ.get("TMUX")) and shutil.which("tmux") is not None
+
+
+def list_panes():
+    out = tmux("list-panes", "-a", "-F", PANE_FORMAT)
+    panes = []
+    for line in (out or "").splitlines():
+        vals = line.split("\t")
+        if len(vals) != len(PANE_FIELDS):
+            continue
+        p = dict(zip(PANE_FIELDS, vals))
+        p["left"], p["top"] = int(p["left"]), int(p["top"])
+        p["pair"] = p["pair"] or None
+        p["role"] = p["role"] or None
+        panes.append(p)
+    return panes
+
+
+def pane_by_id(panes, pane_id):
+    return next((p for p in panes if p["id"] == pane_id), None)
+
+
+def set_pane_membership(pane_id, pair, role):
+    if pair:
+        tmux("set-option", "-p", "-t", pane_id, "@sharpen_pair", pair)
+        tmux("set-option", "-p", "-t", pane_id, "@sharpen_role", role)
+        tmux("select-pane", "-t", pane_id, "-T", f"{role}:{pair}")
+    else:
+        tmux("set-option", "-p", "-u", "-t", pane_id, "@sharpen_pair")
+        tmux("set-option", "-p", "-u", "-t", pane_id, "@sharpen_role")
+
+
+def notify(msg, pane_id=None):
+    if in_tmux() or pane_id:
+        args = ["display-message", "-d", "4000"]
+        if pane_id:
+            args += ["-t", pane_id]
+        tmux(*args, msg)
+    if os.environ.get("SHARPEN_MACOS_NOTIFY", "1") == "1" and shutil.which("osascript"):
+        safe = msg.replace("\\", "\\\\").replace('"', '\\"')
+        subprocess.run(["osascript", "-e", f'display notification "{safe}" with title "sharpen"'],
+                       capture_output=True, timeout=5)
+
+
+DISPLACE_WINDOW_SECONDS = 15 * 60
+
+
+def sha(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def read_clipboard():
+    if not shutil.which("pbpaste"):
+        return None
+    try:
+        r = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def write_clipboard(text, pair=None):
+    """System clipboard plus a tmux buffer named for the pair, so pairs never share a buffer."""
+    ok = False
+    if shutil.which("pbcopy"):
+        ok = subprocess.run(["pbcopy"], input=text, text=True).returncode == 0
+    if in_tmux():
+        tmux("load-buffer", "-b", f"sharpen-{pair or 'last'}", "-", input_text=text)
+    return ok
+
+
+def pending_pair():
+    """The pair whose sharpened message is still on the clipboard (copied under 15 minutes ago and
+    not replaced by anything since), else None."""
+    prev = read_json(STATE_DIR / "clipboard.json") or {}
+    if not prev.get("pair") or now() - prev.get("at", 0) > DISPLACE_WINDOW_SECONDS:
+        return None
+    current = read_clipboard()
+    return prev["pair"] if current is not None and sha(current) == prev.get("sha") else None
+
+
+def copy_message(text, pair):
+    """Copy a sharpened message to the clipboard.
+
+    Returns the name of another pair whose message this replaced while it was still on the
+    clipboard (copied under 15 minutes ago and not overwritten by anything else since), else None.
+    Only a hash is remembered, never the text.
+    """
+    state_path = STATE_DIR / "clipboard.json"
+    prev = read_json(state_path) or {}
+    holder = pending_pair()
+    displaced = holder if holder and holder != pair and prev.get("sha") != sha(text) else None
+    write_clipboard(text, pair)
+    write_json(state_path, {"pair": pair, "at": now(), "sha": sha(text), "chars": len(text)})
+    return displaced
+
+
+def resolve_selector(selector, panes, origin_id):
+    """Resolve a pane selector: %ID, left/right/up/down (relative to origin), or cwd substring."""
+    if selector.startswith("%"):
+        return pane_by_id(panes, selector)
+    origin = pane_by_id(panes, origin_id) if origin_id else None
+    if selector in ("left", "right", "up", "down") and origin:
+        same_window = [p for p in panes if p["window_id"] == origin["window_id"] and p is not origin]
+        key = {"left": lambda p: p["left"] < origin["left"],
+               "right": lambda p: p["left"] > origin["left"],
+               "up": lambda p: p["top"] < origin["top"],
+               "down": lambda p: p["top"] > origin["top"]}[selector]
+        cands = [p for p in same_window if key(p)]
+        dist = lambda p: abs(p["left"] - origin["left"]) + abs(p["top"] - origin["top"])
+        return min(cands, key=dist) if cands else None
+    matches = [p for p in panes if selector in p["cwd"] and p["id"] != origin_id]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        die(f"'{selector}' matches {len(matches)} panes ({', '.join(m['id'] for m in matches)}); "
+            "use a pane id")
+    return None
+
+
+# ── snapshots ────────────────────────────────────────────────────────────────
+
+def text_from_content(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(p.get("text", "") for p in content
+                         if isinstance(p, dict) and p.get("type") == "text")
+    return ""
+
+
+def last_assistant_from_transcript(transcript_path):
+    last = ""
+    try:
+        with open(transcript_path) as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if entry.get("type") != "assistant":
+                    continue
+                text = text_from_content(entry.get("message", {}).get("content", ""))
+                if text.strip():
+                    last = text
+    except OSError:
+        pass
+    return last
+
+
+def write_snapshot(event, pane, pair, role):
+    text = event.get("last_assistant_message") or ""
+    if not text and event.get("transcript_path"):
+        text = last_assistant_from_transcript(event["transcript_path"])
+    return write_snapshot_text(
+        text,
+        session_id=event.get("session_id") or event.get("conversation_id", "unknown"),
+        cwd=event.get("cwd"),
+        pane=pane, pair=pair, role=role,
+    )
+
+
+def write_snapshot_text(text, session_id, cwd, pane, pair, role):
+    """Persist a last-assistant snapshot keyed by session_id. CLI-agnostic."""
+    if not text or not text.strip():
+        return None
+    snap = {
+        "session_id": session_id or "unknown",
+        "cwd": cwd or os.getcwd(),
+        "tmux_pane": pane,
+        "pair": pair,
+        "role": role,
+        "updated_at": now(),
+        "last_assistant_text": text[-SNAPSHOT_MAX_CHARS:],
+    }
+    write_json(SESSIONS_DIR / f"{slugify(snap['session_id'])}.json", snap)
+    return snap
+
+
+def load_snapshots():
+    snaps = []
+    for path in SESSIONS_DIR.glob("*.json"):
+        s = read_json(path)
+        if s and s.get("updated_at"):
+            snaps.append(s)
+    return snaps
+
+
+def latest_snapshot_for_pane(snaps, pane_id):
+    mine = [s for s in snaps if s.get("tmux_pane") == pane_id]
+    return max(mine, key=lambda s: s["updated_at"]) if mine else None
+
+
+# ── pairs & target resolution ────────────────────────────────────────────────
+
+def pair_state(pair):
+    return read_json(PAIRS_DIR / f"{pair}.json", {}) or {}
+
+
+def save_pair_state(pair, state):
+    write_json(PAIRS_DIR / f"{pair}.json", state)
+
+
+def members(panes, pair, role=None):
+    return [p for p in panes if p["pair"] == pair and (role is None or p["role"] == role)]
+
+
+def resolve_target(pair, panes, snaps, sharpen_pane_id=None):
+    """Return (pane_id or None, snapshot or None, how) for the pair's current working target.
+
+    how: pinned | latest | neighbor | env | none
+    """
+    pinned = pair_state(pair).get("pinned_target")
+    if pinned and pane_by_id(panes, pinned):
+        return pinned, latest_snapshot_for_pane(snaps, pinned), "pinned"
+
+    working_ids = {p["id"] for p in members(panes, pair, "working")}
+    cands = [s for s in snaps if s.get("tmux_pane") in working_ids]
+    if cands:
+        best = max(cands, key=lambda s: s["updated_at"])
+        return best["tmux_pane"], best, "latest"
+    if working_ids:
+        return sorted(working_ids)[0], None, "latest"
+
+    # Paired outside tmux via env vars.
+    env_cands = [s for s in snaps if not s.get("tmux_pane") and s.get("pair") == pair
+                 and s.get("role") == "working"]
+    if env_cands:
+        best = max(env_cands, key=lambda s: s["updated_at"])
+        return None, best, "env"
+
+    # No working members: fall back to the one other Claude pane in the sharpen pane's window.
+    me = pane_by_id(panes, sharpen_pane_id) if sharpen_pane_id else None
+    if me:
+        others = [p for p in panes if p["window_id"] == me["window_id"] and p["id"] != me["id"]
+                  and p["role"] != "sharpen"]
+        with_snaps = [(p, latest_snapshot_for_pane(snaps, p["id"])) for p in others]
+        with_snaps = [(p, s) for p, s in with_snaps if s]
+        if len(with_snaps) == 1:
+            p, s = with_snaps[0]
+            return p["id"], s, "neighbor"
+    return None, None, "none"
+
+
+def header_line(pair, pane_id, snap, how, previous_pane=None):
+    if not snap:
+        hint = "run `sharpen pair <pane>` or `sharpen join` in the working pane"
+        if pane_id:
+            return f"Pair {pair} → {pane_id} (no message yet)"
+        return f"Pair {pair} → none ({hint})"
+    where = Path(snap.get("cwd") or "?").name
+    age = now() - snap["updated_at"]
+    bits = [where, age_str(age)]
+    if how == "pinned":
+        bits.append("pinned")
+    if how == "neighbor":
+        bits.append("same-window neighbor, not joined")
+    if age > STALE_SECONDS:
+        bits.append("stale")
+    target = pane_id or "env-paired session"
+    line = f"Pair {pair} → {target} ({', '.join(bits)})"
+    if previous_pane and previous_pane != pane_id:
+        line += f" — switched from {previous_pane}"
+    return line
+
+
+# ── message block extraction ─────────────────────────────────────────────────
+
+START_RE = re.compile(r"▼\s*MESSAGE TO COPY\s*[—–-]+\s*(NOT READY|READY)")
+END_RE = re.compile(r"▲\s*END OF MESSAGE")
+FENCE_RE = re.compile(r"^(\s*)(`{3,}|~{3,})(.*)$")
+
+
+def extract_message(text):
+    """Return (verdict, message) from a sharpen reply, or (None, None) if no block is found.
+
+    Takes the last MESSAGE TO COPY block, then the first fenced code block inside it; the
+    closing fence must use the same character, be at least as long as the opening one, and be
+    followed by the END OF MESSAGE marker, so inner code fences never truncate the message.
+    """
+    lines = text.splitlines()
+    starts = [i for i, l in enumerate(lines) if START_RE.search(l)]
+    if not starts:
+        return None, None
+    start = starts[-1]
+    verdict = START_RE.search(lines[start]).group(1)
+    i = start + 1
+    while i < len(lines) and not FENCE_RE.match(lines[i]):
+        if END_RE.search(lines[i]):
+            return verdict, None
+        i += 1
+    if i >= len(lines):
+        return verdict, None
+    indent, fence, _ = FENCE_RE.match(lines[i]).groups()
+    for j in range(i + 1, len(lines)):
+        m = FENCE_RE.match(lines[j])
+        if not (m and m.group(2)[0] == fence[0] and len(m.group(2)) >= len(fence)
+                and not m.group(3).strip()):
+            continue
+        # A real closing fence is the one followed by the END marker; a bare fence inside a
+        # message wrapped in a too-short fence is part of the message, not its end.
+        nxt = next((l for l in lines[j + 1:] if l.strip()), "")
+        if not END_RE.search(nxt):
+            continue
+        body = [l[len(indent):] if indent and l.startswith(indent) else l
+                for l in lines[i + 1:j]]
+        return verdict, "\n".join(body).strip("\n")
+    return verdict, None
+
+
+# ── hooks ────────────────────────────────────────────────────────────────────
+
+def current_membership(panes=None):
+    """(pane_id, pair, role) for the process's pane; env vars apply outside tmux or as default."""
+    pane_id = os.environ.get("TMUX_PANE") if in_tmux() else None
+    pair = os.environ.get("SHARPEN_PAIR") or None
+    role = os.environ.get("SHARPEN_ROLE") or None
+    if pane_id:
+        if panes is None:
+            panes = list_panes()
+        p = pane_by_id(panes, pane_id)
+        if p and p["pair"]:
+            pair, role = p["pair"], p["role"]
+    if pair and role not in ROLES:
+        role = "working"
+    return pane_id, pair, role
+
+
+def _process_assistant_reply(text, pane_id, pair, role):
+    """Shared sharpen-side handling: extract MESSAGE TO COPY, persist, copy, notify.
+
+    Called by both Claude's `Stop` and Cursor's `afterAgentResponse` hooks after they have
+    already written the per-session snapshot.
+    """
+    if role != "sharpen" or not pair:
+        return
+    verdict, message = extract_message(text or "")
+    state = pair_state(pair)
+    if verdict is None:
+        return  # a clarifying reply, not a sharpen pass
+    if not message:
+        notify(f"[{pair}] couldn't extract the message block", pane_id)
+        return
+    write_private(PAIRS_DIR / f"{pair}.last-message.md", message + "\n")
+    state["last_copied"] = {"verdict": verdict, "chars": len(message), "at": now(),
+                            "copied": verdict == "READY"}
+    save_pair_state(pair, state)
+    if verdict == "READY":
+        displaced = copy_message(message, pair)
+        note = f"[{pair}] copied — READY, {len(message)} chars"
+        if displaced:
+            note += (f"; replaced [{displaced}]'s message "
+                     f"(prefix+y in a [{displaced}] pane brings it back)")
+        notify(note, pane_id)
+    else:
+        notify(f"[{pair}] NOT READY — not copied; answer the blocking question "
+               f"(or `sharpen copy` to take the best guess)", pane_id)
+
+
+def hook_stop(event):
+    """Claude Code Stop hook."""
+    pane_id, pair, role = current_membership()
+    if not pair:
+        return  # only paired sessions are persisted; the snapshot holds assistant output
+    write_snapshot(event, pane_id, pair, role)
+    text = event.get("last_assistant_message") or ""
+    if not text and event.get("transcript_path"):
+        text = last_assistant_from_transcript(event["transcript_path"])
+    _process_assistant_reply(text, pane_id, pair, role)
+
+
+def hook_after_response(event):
+    """Cursor CLI `afterAgentResponse` hook. The event includes the assistant text directly."""
+    pane_id, pair, role = current_membership()
+    if not pair:
+        return
+    text = event.get("text") or ""
+    write_snapshot_text(
+        text,
+        session_id=event.get("conversation_id") or event.get("session_id", "unknown"),
+        cwd=(event.get("workspace_roots") or [None])[0],
+        pane=pane_id, pair=pair, role=role,
+    )
+    _process_assistant_reply(text, pane_id, pair, role)
+
+
+def hook_session_start(event):
+    """Cursor CLI `sessionStart` hook. In a sharpen pane, inject persona + skill pointer.
+
+    Cursor cannot inject context per-turn (`beforeSubmitPrompt` is block-only), so this one
+    sessionStart injection is the whole pre-loaded context. The skill itself runs `sharpen last`
+    on every pass to pull fresh working-session replies after that.
+    """
+    pane_id, pair, role = current_membership()
+    if role != "sharpen" or not pair:
+        return None
+    body_path = CURSOR_SESSION_PROMPT
+    body = body_path.read_text() if body_path.exists() else ""
+    header = f"sharpen_header: paired as sharpen pane for '{pair}'"
+    parts = [header, body.strip()] if body else [header]
+    # Tack on the current working-session reply so the very first pass doesn't need the shell call.
+    snaps = load_snapshots()
+    panes = list_panes() if in_tmux() else []
+    target, snap, _how = resolve_target(pair, panes, snaps, pane_id)
+    if snap:
+        parts.append(
+            f'<working_session_last_message pair="{pair}" pane="{target or ""}" '
+            f'cwd="{snap.get("cwd", "")}" age="{age_str(now() - snap["updated_at"])}">\n'
+            f'{snap["last_assistant_text"]}\n</working_session_last_message>'
+        )
+    return {"continue": True, "additional_context": "\n\n".join(parts)}
+
+
+DRAFT_MARKER_RE = re.compile(r"^\s*(new|refine)\b\s*(\[voice\])?\s*:", re.I)
+
+
+def hook_prompt(event):
+    """UserPromptSubmit: in sharpen panes, attach the working session's last message."""
+    panes = list_panes() if in_tmux() else []
+    pane_id, pair, role = current_membership(panes)
+    if role != "sharpen" or not pair:
+        return None
+    snaps = load_snapshots()
+    target, snap, how = resolve_target(pair, panes, snaps, pane_id)
+    state = pair_state(pair)
+    # Keyed by the sharpen session so a restarted or /clear-ed conversation in the same pane
+    # gets the message again instead of being told an earlier copy is still current.
+    sid = event.get("session_id") or "unknown"
+    injected = state.setdefault("injected", {})
+    last = injected.get(sid) or {}
+    prompt = event.get("prompt", "")
+    marker = DRAFT_MARKER_RE.match(prompt)
+    is_new = bool(marker and marker.group(1).lower() == "new")
+    changed = bool(snap) and (last.get("pane") != target
+                              or last.get("updated_at") != snap["updated_at"])
+    header = header_line(pair, target, snap, how, previous_pane=last.get("pane"))
+
+    parts = [f"sharpen_header: {header}"]
+    if snap and (is_new or changed or not last):
+        parts.append(
+            f'<working_session_last_message pair="{pair}" pane="{target or ""}" '
+            f'cwd="{snap.get("cwd", "")}" age="{age_str(now() - snap["updated_at"])}">\n'
+            f'{snap["last_assistant_text"]}\n</working_session_last_message>')
+        injected[sid] = {"pane": target, "updated_at": snap["updated_at"], "at": now()}
+        for old in sorted(injected, key=lambda k: injected[k].get("at", 0))[:-20]:
+            del injected[old]
+        save_pair_state(pair, state)
+    elif snap:
+        parts.append("The working session has not replied since its last message was attached "
+                     "earlier in this conversation; that earlier copy is still current.")
+    else:
+        parts.append("No working-session message is available for this pair.")
+    return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                   "additionalContext": "\n\n".join(parts)}}
+
+
+def cmd_hook(args):
+    if not args:
+        die("hook needs 'stop', 'prompt', 'after_response', or 'session_start'")
+    try:
+        event = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        event = {}
+    try:
+        if args[0] == "stop":                    # Claude Code `Stop`
+            hook_stop(event)
+        elif args[0] == "prompt":                # Claude Code `UserPromptSubmit`
+            out = hook_prompt(event)
+            if out:
+                print(json.dumps(out))
+        elif args[0] == "after_response":        # Cursor CLI `afterAgentResponse`
+            hook_after_response(event)
+        elif args[0] == "session_start":         # Cursor CLI `sessionStart`
+            out = hook_session_start(event)
+            if out:
+                print(json.dumps(out))
+    except Exception as e:  # hooks must never break the session
+        log(f"hook {args[0]} failed: {e!r}")
+    sys.exit(0)
+
+
+# ── commands ─────────────────────────────────────────────────────────────────
+
+def require_pane():
+    if not in_tmux() or not os.environ.get("TMUX_PANE"):
+        die("this command needs to run inside a tmux pane")
+    return os.environ["TMUX_PANE"]
+
+
+def claim_sharpen(pair, pane_id, panes, force):
+    others = [p for p in members(panes, pair, "sharpen") if p["id"] != pane_id]
+    if others and not force:
+        die(f"pair '{pair}' already has a sharpen pane ({others[0]['id']}); use --force to take over")
+    for p in others:
+        set_pane_membership(p["id"], None, None)
+    state = pair_state(pair)
+    state["sharpen_pane"] = pane_id
+    save_pair_state(pair, state)
+
+
+def parse_flags(args, flags_with_values=(), bool_flags=()):
+    opts, rest = {}, []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in flags_with_values and i + 1 < len(args):
+            opts[a] = args[i + 1]
+            i += 2
+        elif a in bool_flags:
+            opts[a] = True
+            i += 1
+        else:
+            rest.append(a)
+            i += 1
+    return opts, rest
+
+
+def session_command(pair):
+    """The claude command line for a sharpen session.
+
+    Runs in bypassPermissions because the session's logging step appends to the skill's
+    prompt_log.md under ~/.claude, a protected path that prompts in every other mode even with
+    an allow rule. SHARPEN_PERMISSION_MODE=default opts back into the normal prompts.
+    """
+    cmd = ["claude", "--name", f"sharpen:{pair}"]
+    mode = os.environ.get("SHARPEN_PERMISSION_MODE", "bypassPermissions")
+    if mode != "default":
+        cmd += ["--permission-mode", mode]
+    if SESSION_PROMPT.exists():
+        cmd += ["--append-system-prompt", SESSION_PROMPT.read_text()]
+    return cmd
+
+
+def cursor_session_command(pair):
+    """The cursor-agent command line for a sharpen session.
+
+    cursor-agent has no `--append-system-prompt`; persona is injected by the `sessionStart` hook
+    (`sharpen hook session_start`), which reads `prompts/sharpen-session-cursor.md`. `-f` is the
+    force-allow equivalent of Claude's bypassPermissions, needed so the session's logging step
+    can append to the log without a prompt.
+    """
+    return ["cursor-agent", "-f"]
+
+
+def _pick_agent(explicit):
+    """Resolve --agent auto|claude|cursor to a concrete choice."""
+    if explicit in ("claude", "cursor"):
+        return explicit
+    if explicit not in (None, "auto"):
+        die(f"--agent must be auto|claude|cursor (got {explicit!r})")
+    if shutil.which("claude"):
+        return "claude"
+    if shutil.which("cursor-agent"):
+        return "cursor"
+    die("neither 'claude' nor 'cursor-agent' found on PATH")
+
+
+def cmd_session(args):
+    opts, rest = parse_flags(args, flags_with_values=("--agent",), bool_flags=("--force",))
+    pane_id = require_pane()
+    panes = list_panes()
+    pair = slugify(rest[0]) if rest else slug_from_cwd(os.getcwd())
+    claim_sharpen(pair, pane_id, panes, opts.get("--force"))
+    set_pane_membership(pane_id, pair, "sharpen")
+    print(f"Pane {pane_id} is the sharpen pane for '{pair}'.")
+    working = members(panes, pair, "working")
+    if working:
+        print("Working members: " + ", ".join(p["id"] for p in working))
+    else:
+        print(f"No working panes yet — in the working pane run: sharpen join {pair}")
+    agent = _pick_agent(opts.get("--agent"))
+    env = dict(os.environ, SHARPEN_PAIR=pair, SHARPEN_ROLE="sharpen")
+    if agent == "claude":
+        if not shutil.which("claude"):
+            die("claude not found on PATH (try --agent cursor)")
+        os.execvpe("claude", session_command(pair), env)
+    else:  # cursor
+        if not shutil.which("cursor-agent"):
+            die("cursor-agent not found on PATH (try --agent claude)")
+        os.execvpe("cursor-agent", cursor_session_command(pair), env)
+
+
+def cmd_join(args):
+    opts, rest = parse_flags(args, flags_with_values=("--role",), bool_flags=("--force",))
+    pane_id = require_pane()
+    panes = list_panes()
+    role = opts.get("--role", "working")
+    if role not in ROLES:
+        die(f"role must be one of {', '.join(ROLES)}")
+    if rest:
+        pair = slugify(rest[0])
+    else:
+        me = pane_by_id(panes, pane_id)
+        window_sharpen = [p for p in panes if me and p["window_id"] == me["window_id"]
+                          and p["role"] == "sharpen" and p["pair"]]
+        pair = window_sharpen[0]["pair"] if len(window_sharpen) == 1 else slug_from_cwd(os.getcwd())
+    if role == "sharpen":
+        claim_sharpen(pair, pane_id, panes, opts.get("--force"))
+    set_pane_membership(pane_id, pair, role)
+    print(f"Pane {pane_id} joined '{pair}' as {role}.")
+
+
+def cmd_leave(_args):
+    pane_id = require_pane()
+    p = pane_by_id(list_panes(), pane_id)
+    set_pane_membership(pane_id, None, None)
+    tmux("select-pane", "-t", pane_id, "-T", "")
+    print(f"Pane {pane_id} left '{p['pair'] if p and p['pair'] else '(none)'}'.")
+
+
+def describe_target(pair, panes, snaps, sharpen_pane_id):
+    target, snap, how = resolve_target(pair, panes, snaps, sharpen_pane_id)
+    print(header_line(pair, target, snap, how))
+
+
+def cmd_pair(args):
+    pane_id = require_pane()
+    panes = list_panes()
+    me = pane_by_id(panes, pane_id)
+    pair = me["pair"] if me else None
+    if not args:
+        if not pair:
+            die("this pane isn't in a pair; run `sharpen session` or `sharpen join`")
+        describe_target(pair, panes, load_snapshots(), pane_id)
+        others = [p for p in panes if p["id"] != pane_id and p["command"] not in ("zsh", "bash")]
+        if others:
+            print("\nCandidate panes:")
+            for p in others:
+                tag = f"[{p['pair']} · {p['role']}]" if p["pair"] else ""
+                print(f"  {p['id']:>5}  {p['session']}:{p['window_index']}.{p['pane_index']}  "
+                      f"{p['command']:<10} {tag:<26} {p['cwd']}")
+        return
+    selector = args[0]
+    target = resolve_selector(selector, panes, pane_id)
+    if target:
+        if not pair:
+            die("this pane isn't in a pair; run `sharpen session` first")
+        if target["role"] == "sharpen":
+            die(f"{target['id']} is a sharpen pane")
+        set_pane_membership(target["id"], pair, "working")
+        panes = list_panes()
+        print(f"Added {target['id']} ({Path(target['cwd']).name}) to '{pair}' as working.")
+    else:
+        if me and me["role"] != "sharpen":
+            die("switching pairs by name only works from a sharpen pane")
+        new_pair = slugify(selector)
+        claim_sharpen(new_pair, pane_id, panes, force="--force" in args)
+        set_pane_membership(pane_id, new_pair, "sharpen")
+        pair = new_pair
+        panes = list_panes()
+        print(f"This sharpen pane now serves '{pair}'.")
+    describe_target(pair, panes, load_snapshots(), pane_id)
+
+
+def cmd_pin(args, unpin=False):
+    pane_id = require_pane()
+    panes = list_panes()
+    me = pane_by_id(panes, pane_id)
+    if not me or not me["pair"]:
+        die("this pane isn't in a pair")
+    state = pair_state(me["pair"])
+    if unpin:
+        state.pop("pinned_target", None)
+        save_pair_state(me["pair"], state)
+        print(f"'{me['pair']}' unpinned — target is the most recent working member.")
+    else:
+        if not args:
+            die("pin needs a selector (%ID, left/right/up/down, cwd substring)")
+        target = resolve_selector(args[0], panes, pane_id)
+        if not target:
+            die(f"no pane matches '{args[0]}'")
+        if target["pair"] != me["pair"]:
+            set_pane_membership(target["id"], me["pair"], "working")
+            panes = list_panes()
+        state["pinned_target"] = target["id"]
+        save_pair_state(me["pair"], state)
+        print(f"'{me['pair']}' pinned to {target['id']}.")
+    describe_target(me["pair"], panes, load_snapshots(), pane_id)
+
+
+def cmd_pairs(_args):
+    panes = list_panes()
+    snaps = load_snapshots()
+    names = sorted({p["pair"] for p in panes if p["pair"]})
+    if not names:
+        print("No pairs. Start one with `sharpen session [PAIR]` in a tmux pane.")
+        return
+    for name in names:
+        sharpen = [p["id"] for p in members(panes, name, "sharpen")]
+        working = [p["id"] for p in members(panes, name, "working")]
+        target, snap, how = resolve_target(name, panes, snaps, sharpen[0] if sharpen else None)
+        print(f"{name}")
+        print(f"  sharpen: {', '.join(sharpen) or '—'}   working: {', '.join(working) or '—'}")
+        print(f"  {header_line(name, target, snap, how)}")
+        last = pair_state(name).get("last_copied")
+        if last:
+            print(f"  last pass: {last['verdict']}, {last['chars']} chars, {age_str(now() - last['at'])}")
+
+
+def cmd_status(_args):
+    panes = list_panes() if in_tmux() else []
+    pane_id, pair, role = current_membership(panes)
+    print(f"pane: {pane_id or '(not in tmux)'}   pair: {pair or '—'}   role: {role or '—'}")
+    if pair:
+        sharpen = members(panes, pair, "sharpen")
+        describe_target(pair, panes, load_snapshots(), sharpen[0]["id"] if sharpen else pane_id)
+        last = pair_state(pair).get("last_copied")
+        if last:
+            print(f"last pass: {last['verdict']}, {last['chars']} chars, "
+                  f"{'copied' if last['copied'] else 'not copied'}, {age_str(now() - last['at'])}")
+        d = read_json(PAIRS_DIR / f"{pair}.last-delivery.json")
+        if d:
+            outcome = "delivered" if d["ok"] else f"FAILED: {d['reason']}"
+            print(f"last delivery: {outcome} ({d['chars']} chars, {age_str(now() - d['at'])})")
+
+
+def cmd_copy(args):
+    opts, rest = parse_flags(args, flags_with_values=("--from-pane",), bool_flags=("--quiet",))
+    quiet = bool(opts.get("--quiet"))
+
+    def fail(msg):
+        if quiet:
+            tmux("display-message", "-d", "4000", f"sharpen: {msg}")
+            sys.exit(1)
+        die(msg)
+
+    if rest:
+        pair = slugify(rest[0])
+    elif opts.get("--from-pane"):
+        p = pane_by_id(list_panes(), opts["--from-pane"])
+        pair = p["pair"] if p else None
+        if not pair:
+            fail("that pane isn't in a pair")
+    else:
+        _, pair, _ = current_membership()
+        if not pair:
+            fail("not in a pair; pass the pair name")
+    path = PAIRS_DIR / f"{pair}.last-message.md"
+    if not path.exists():
+        fail(f"no extracted message for '{pair}' yet")
+    text = path.read_text().rstrip("\n")
+    copy_message(text, pair)
+    if quiet:
+        tmux("display-message", "-d", "3000", f"[{pair}] recopied — {len(text)} chars")
+    else:
+        print(f"Copied '{pair}' message ({len(text)} chars).")
+
+
+def cmd_last(args):
+    panes = list_panes() if in_tmux() else []
+    snaps = load_snapshots()
+    origin = os.environ.get("TMUX_PANE")
+    if args:
+        p = resolve_selector(args[0], panes, origin)
+        if not p:
+            die(f"no pane matches '{args[0]}'")
+        snap = latest_snapshot_for_pane(snaps, p["id"])
+    else:
+        _, pair, _ = current_membership(panes)
+        if not pair:
+            die("not in a pair; pass a selector")
+        sharpen = members(panes, pair, "sharpen")
+        _, snap, _ = resolve_target(pair, panes, snaps, sharpen[0]["id"] if sharpen else origin)
+    if not snap:
+        die("no snapshot yet")
+    print(f"# {snap.get('tmux_pane')} {snap.get('cwd')} ({age_str(now() - snap['updated_at'])})\n")
+    print(snap["last_assistant_text"])
+
+
+IDLE_WAIT_SECONDS = float(os.environ.get("SHARPEN_IDLE_WAIT", "5"))
+PASTE_WAIT_SECONDS = float(os.environ.get("SHARPEN_PASTE_WAIT", "5"))
+SUBMIT_WAIT_SECONDS = float(os.environ.get("SHARPEN_SUBMIT_WAIT", "4"))
+POLL_SECONDS = 0.15
+SNIPPET_CHARS = 30
+PROMPT_LINE_RE = re.compile(r"^[ \u00a0]*❯[ \u00a0]*(.*?)[ \u00a0]*$")
+QUEUED_HINT_RE = re.compile(r"^Press up to edit queued messages$", re.I)
+PASTE_PLACEHOLDER_RE = re.compile(r"\[Pasted text #\d+")
+
+
+class DeliveryError(Exception):
+    def __init__(self, message, kind=""):
+        super().__init__(message)
+        self.kind = kind
+
+
+def capture_pane(pane_id):
+    return tmux("capture-pane", "-p", "-t", pane_id) or ""
+
+
+def prompt_state(screen):
+    """Classify a Claude pane screen: ('empty'|'text'|'unknown', input text).
+
+    The input box is the last line that starts with the ❯ glyph. Menus and permission dialogs
+    also use it ("❯ 1. Yes"), so those count as text rather than an empty prompt. A pane in the
+    middle of a pass still accepts input (Claude queues it), so busy is not a separate state;
+    the "Press up to edit queued messages" hint shown while something is queued is not typed text.
+    """
+    lines = [l for l in screen.splitlines() if l.strip()]
+    for line in reversed(lines):
+        m = PROMPT_LINE_RE.match(line)
+        if m:
+            typed = m.group(1)
+            if not typed or QUEUED_HINT_RE.match(typed):
+                return "empty", ""
+            return "text", typed
+    return "unknown", ""
+
+
+def paste_visible(screen, payload):
+    """True when the input box holds our payload (or Claude's placeholder for a long paste)."""
+    state, typed = prompt_state(screen)
+    if state != "text":
+        return False
+    snippet = payload.strip().splitlines()[0][:SNIPPET_CHARS].rstrip()
+    return typed.startswith(snippet) or bool(PASTE_PLACEHOLDER_RE.search(typed))
+
+
+def wait_until(predicate, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        if predicate():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(POLL_SECONDS)
+
+
+def wait_until_ready(pane_id):
+    return wait_until(lambda: prompt_state(capture_pane(pane_id))[0] == "empty", IDLE_WAIT_SECONDS)
+
+
+def wait_for_paste(pane_id, payload):
+    return wait_until(lambda: paste_visible(capture_pane(pane_id), payload), PASTE_WAIT_SECONDS)
+
+
+def wait_for_submit(pane_id, payload):
+    return wait_until(lambda: not paste_visible(capture_pane(pane_id), payload), SUBMIT_WAIT_SECONDS)
+
+
+def leave_copy_mode(pane_id):
+    """A scrolled-back pane swallows Enter, so leave scrollback (or any other pane mode) first."""
+    in_mode = (tmux("display-message", "-p", "-t", pane_id, "#{pane_in_mode}") or "").strip()
+    if in_mode == "1":
+        tmux("copy-mode", "-q", "-t", pane_id)
+
+
+def find_sharpen_pane(panes, pair=None, from_pane=None):
+    """The sharpen pane to deliver to: the named pair's, else the pair of the pane the key was
+    pressed in, else (for an unpaired pane) the one sharpen pane in its window, else the only
+    sharpen pane on the server. Several candidates mean no answer rather than a guess."""
+    origin = pane_by_id(panes, from_pane) if from_pane else None
+    if not pair and origin:
+        pair = origin["pair"]
+    if pair:
+        cands = members(panes, pair, "sharpen")
+        return (cands[0], pair) if cands else (None, pair)
+    if origin:
+        local = [p for p in panes if p["role"] == "sharpen" and p["window_id"] == origin["window_id"]]
+        if len(local) == 1:
+            return local[0], local[0]["pair"]
+        if len(local) > 1:
+            return None, None
+    all_sharpen = [p for p in panes if p["role"] == "sharpen"]
+    if len(all_sharpen) == 1:
+        return all_sharpen[0], all_sharpen[0]["pair"]
+    return None, None
+
+
+def save_dictation(text, pair):
+    """Keep the transcript on disk before any attempt to send it, so a failure never loses it."""
+    if pair:
+        path = PAIRS_DIR / f"{pair}.last-dictation.md"
+    else:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        path = STATE_DIR / "dictations" / f"{stamp}-{os.getpid()}.md"
+    write_private(path, text + "\n")
+    write_pointer(path, "")
+    return path
+
+
+def write_pointer(path, kind):
+    """Tell the popup wrapper where the transcript is and why delivery failed ('no-pane' means no
+    unambiguous sharpen session, which is the one case where it offers a choice)."""
+    pointer = os.environ.get("SHARPEN_DICTATION_PTR")
+    if pointer:
+        try:
+            Path(pointer).write_text(json.dumps({"path": str(path), "kind": kind}))
+        except OSError:
+            pass
+
+
+def record_delivery(pair, pane_id, ok, reason, chars, refine):
+    log(f"deliver pair={pair or '-'} pane={pane_id or '-'} {'ok' if ok else 'FAILED'} "
+        f"chars={chars}" + (f" reason={reason}" if reason else ""))
+    if pair:
+        write_json(PAIRS_DIR / f"{pair}.last-delivery.json",
+                   {"at": now(), "ok": ok, "reason": reason, "chars": chars, "pane": pane_id,
+                    "refine": bool(refine)})
+
+
+def send_to_pane(pane, pair, text, refine, voice):
+    """Paste text into the sharpen pane, check it landed in the input box, press Enter, and check
+    the box emptied. A pane in the middle of a pass is fine: Claude queues the message."""
+    pid = pane["id"]
+    # Never type into a shell: a pasted draft would run as commands.
+    if pane["command"] != "claude" and not os.environ.get("SHARPEN_DELIVER_ANY"):
+        raise DeliveryError(f"sharpen pane {pid} is running '{pane['command']}', not claude; "
+                            f"start it with `sharpen session {pair}`")
+    leave_copy_mode(pid)
+    if not wait_until_ready(pid):
+        raise DeliveryError(f"sharpen pane {pid} isn't at an empty Claude prompt (a dialog is "
+                            "open or text is half-typed); nothing was sent")
+    marker = "refine" if refine else "new"
+    if voice:
+        marker += " [voice]"
+    payload = f"{marker}: {text}"
+    # Bracketed paste keeps multi-line text as one prompt instead of submitting at each newline.
+    # The buffer is named per pair and process so simultaneous deliveries can't share one.
+    buf = f"sharpen-deliver-{pair or 'x'}-{os.getpid()}"
+    if tmux("load-buffer", "-b", buf, "-", input_text=payload) is None \
+            or tmux("paste-buffer", "-p", "-d", "-b", buf, "-t", pid) is None:
+        tmux("delete-buffer", "-b", buf)
+        raise DeliveryError(f"couldn't paste into {pid}")
+    if not wait_for_paste(pid, payload):
+        raise DeliveryError(f"the draft never showed up in {pid}'s input box, so Enter was not "
+                            "sent; check that pane")
+    tmux("send-keys", "-t", pid, "Enter")
+    if not wait_for_submit(pid, payload):
+        raise DeliveryError(f"Enter was sent but the draft is still in {pid}'s input box; check "
+                            "that pane (it may be in a menu)")
+    return len(payload)
+
+
+def deliver(text, pair_name, from_pane, refine, voice):
+    pane = pair = None
+    if in_tmux():
+        pane, pair = find_sharpen_pane(list_panes(), pair_name, from_pane)
+    saved = save_dictation(text, pair) if voice else None
+    chars = len(text)
+    try:
+        if not in_tmux():
+            raise DeliveryError("deliver needs tmux")
+        if not pane:
+            raise DeliveryError("no sharpen pane found for "
+                                + (f"'{pair}'" if pair else "this pane (not in a pair)"),
+                                kind="no-pane")
+        chars = send_to_pane(pane, pair, text, refine, voice)
+    except DeliveryError as e:
+        record_delivery(pair, pane and pane["id"], False, str(e), chars, refine)
+        if saved and e.kind:
+            write_pointer(saved, e.kind)
+        note = ""
+        if saved:
+            note = f" Your dictation is saved at {saved}"
+            note += "; `sharpen resend` sends it again." if pair else "."
+        die(f"{e}.{note}", 3)
+    record_delivery(pair, pane["id"], True, "", chars, refine)
+    print(f"Delivered and submitted to [{pair} · sharpen] {pane['id']} ({chars} chars).")
+
+
+def cmd_deliver(args):
+    opts, _ = parse_flags(args, flags_with_values=("--pair", "--from-pane"),
+                          bool_flags=("--refine", "--voice"))
+    text = sys.stdin.read().strip()
+    if not text:
+        die("nothing to deliver (empty stdin)")
+    pair = slugify(opts["--pair"]) if opts.get("--pair") else None
+    deliver(text, pair, opts.get("--from-pane") or os.environ.get("TMUX_PANE"),
+            bool(opts.get("--refine")), bool(opts.get("--voice")))
+
+
+def cmd_resend(args):
+    opts, _ = parse_flags(args, flags_with_values=("--pair", "--from-pane"), bool_flags=("--force",))
+    from_pane = opts.get("--from-pane") or os.environ.get("TMUX_PANE")
+    pair = slugify(opts["--pair"]) if opts.get("--pair") else None
+    if not pair:
+        _, pair = find_sharpen_pane(list_panes() if in_tmux() else [], None, from_pane)
+    if not pair:
+        die("which pair? run it from a pane in a pair, or pass --pair NAME")
+    path = PAIRS_DIR / f"{pair}.last-dictation.md"
+    if not path.exists():
+        die(f"no saved dictation for '{pair}'")
+    last = read_json(PAIRS_DIR / f"{pair}.last-delivery.json") or {}
+    if last.get("ok") and not opts.get("--force"):
+        die(f"the last dictation for '{pair}' was already delivered; --force sends it again")
+    deliver(path.read_text().strip(), pair, from_pane, bool(last.get("refine")), True)
+
+
+def offer_clipboard(path, ask=input):
+    """After a failed voice delivery, ask whether to put the saved transcript on the clipboard.
+
+    Never silent: the clipboard may hold a sharpened message from a pair that hasn't been pasted
+    yet, so the prompt names it. Returns True if the transcript was copied."""
+    text = Path(path).read_text().strip()
+    holder = pending_pair()
+    warn = (f" This replaces [{holder}]'s sharpened message (prefix+y in a [{holder}] pane brings "
+            "it back).") if holder else ""
+    answer = ask(f"\nCopy the transcript to the clipboard so you can paste it yourself?{warn} [y/N] ")
+    if answer.strip().lower() not in ("y", "yes"):
+        return False
+    write_clipboard(text)
+    (STATE_DIR / "clipboard.json").unlink(missing_ok=True)
+    return True
+
+
+def choose_target(path, refine, ask=input, show=print):
+    """The transcript couldn't be matched to one sharpen session. List them and let the user pick,
+    or copy to the clipboard, or skip. Returns 'delivered', 'copied', or 'skipped'."""
+    text = Path(path).read_text().strip()
+    sharpen_panes = sorted((p for p in list_panes() if p["role"] == "sharpen" and p["pair"]),
+                           key=lambda p: (p["pair"], p["id"]))
+    if not sharpen_panes:
+        return "copied" if offer_clipboard(path, ask=ask) else "skipped"
+    show("\nWhich sharpen session should get it?")
+    for i, p in enumerate(sharpen_panes, 1):
+        show(f"  {i}) [{p['pair']}]  {p['session']}:{p['window_index']}.{p['pane_index']}  "
+             f"{Path(p['cwd']).name}")
+    holder = pending_pair()
+    warn = f" (replaces [{holder}]'s pending message)" if holder else ""
+    prompt = f"Number to send, c = copy to clipboard{warn}, Enter = skip: "
+    for _ in range(5):
+        answer = ask(prompt).strip().lower()
+        if not answer:
+            return "skipped"
+        if answer == "c":
+            write_clipboard(text)
+            (STATE_DIR / "clipboard.json").unlink(missing_ok=True)
+            return "copied"
+        if answer.isdigit() and 1 <= int(answer) <= len(sharpen_panes):
+            chosen = sharpen_panes[int(answer) - 1]
+            try:
+                deliver(text, chosen["pair"], None, refine, True)
+                return "delivered"
+            except SystemExit:
+                show("That one didn't take it either (reason above).")
+                continue
+        show("Type one of the numbers, c, or just Enter.")
+    return "skipped"
+
+
+def cmd_dictate(args):
+    if not DICTATE.exists():
+        die(f"dictate not found at {DICTATE}")
+    opts, rest = parse_flags(args, flags_with_values=("--from-pane",), bool_flags=("--refine",))
+    cmd = [str(DICTATE), "--to-sharpen"]
+    if opts.get("--refine"):
+        cmd.append("--refine")
+    if opts.get("--from-pane"):
+        cmd += ["--from-pane", opts["--from-pane"]]
+    cmd += rest
+    fd, pointer = tempfile.mkstemp(prefix="sharpen-dictation-")
+    os.close(fd)
+    # Ctrl-C (which stops the recording) reaches the whole popup's process group. If Python
+    # took it too, subprocess would kill dictate mid-transcription, so ignore it here only;
+    # the child keeps the default handler because it was spawned first.
+    child = subprocess.Popen(cmd, env=dict(os.environ, SHARPEN_DICTATION_PTR=pointer))
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    rc = child.wait()
+    info = read_json(pointer) or {}
+    Path(pointer).unlink(missing_ok=True)
+    saved, kind = info.get("path"), info.get("kind", "")
+    if rc == 3 and saved and sys.stdin.isatty():
+        try:
+            if kind == "no-pane":
+                outcome = choose_target(saved, bool(opts.get("--refine")))
+            else:
+                outcome = "copied" if offer_clipboard(saved) else "skipped"
+        except EOFError:
+            outcome = "skipped"
+        if outcome in ("delivered", "copied"):
+            print("Done." if outcome == "delivered" else "Copied. Paste it wherever you like.")
+            time.sleep(1.5)
+            sys.exit(0)
+        print(f"Not sent. The transcript is saved at {saved}")
+    if rc != 0 or os.environ.get("SHARPEN_POPUP_PAUSE"):
+        # Keep a popup open long enough to read an error before it closes.
+        try:
+            input("\n[press Enter to close]")
+        except EOFError:
+            pass
+    sys.exit(rc)
+
+
+def cmd_gc(_args):
+    removed = 0
+    for path in SESSIONS_DIR.glob("*.json"):
+        s = read_json(path)
+        if not s or now() - s.get("updated_at", 0) > SNAPSHOT_TTL_SECONDS:
+            path.unlink(missing_ok=True)
+            removed += 1
+    for path in (STATE_DIR / "dictations").glob("*.md"):
+        if now() - path.stat().st_mtime > SNAPSHOT_TTL_SECONDS:
+            path.unlink(missing_ok=True)
+            removed += 1
+    print(f"Removed {removed} snapshot(s) and saved transcript(s) older than 24h.")
+
+
+COMMANDS = {
+    "session": cmd_session, "join": cmd_join, "leave": cmd_leave, "pair": cmd_pair,
+    "pin": cmd_pin, "unpin": lambda a: cmd_pin(a, unpin=True), "pairs": cmd_pairs,
+    "status": cmd_status, "copy": cmd_copy, "last": cmd_last, "deliver": cmd_deliver,
+    "resend": cmd_resend,
+    "dictate": cmd_dictate, "gc": cmd_gc, "--gc": cmd_gc, "hook": cmd_hook,
+}
+
+
+CHEATSHEET = """\
+sharpen — draft here, paste there
+
+THE LOOP
+  1. Sharpen pane:  sharpen session            start the sharpen session (names the pair)
+                    sharpen session --agent cursor   use cursor-agent instead of claude
+  2. Working pane:  sharpen join               join that pair (restart the agent there afterwards)
+  3. Send a draft:  type it in the sharpen pane, or press  prefix+v  anywhere in the pair to dictate
+  4. Adjust:        type "shorter, drop step 3"   or press  prefix+V  and speak it
+  5. Paste:         when you see "copied — READY", Cmd-V in the working pane
+
+KEYS (tmux, after `tmux source-file .../sharpen.tmux`)
+  prefix+v   dictate a new draft          prefix+V   dictate a refinement of the current draft
+  prefix+y   put this pair's last sharpened message back on the clipboard
+  Ctrl-C ends the recording; wait a few seconds. Dictation is pasted into the sharpen session AND
+  submitted automatically (queued if it is mid-pass). Nothing for you to paste or send.
+
+WHAT TO TYPE IN THE SHARPEN SESSION
+  new: ...      fresh draft, re-attaches the working session's latest reply
+  refine: ...   adjust the last sharpened message (also the default after a pass)
+
+SWITCHING
+  working session filled up   restart claude in the SAME pane: nothing else to do
+  new working pane            sharpen join   (there), or  sharpen pair %17 | right | left  (from sharpen)
+  two working panes alive     sharpen pin %17   /   sharpen unpin
+  other initiative            sharpen pair other-name   (from the sharpen pane)
+  leave a pair                sharpen leave
+
+LOOK AROUND
+  sharpen pairs    every pair: panes, current target, last pass
+  sharpen status   this pane: pair, role, target, last copy
+  sharpen last     the working-session message the sharpen pane sees
+  sharpen copy     re-copy the last message (also takes NOT READY best guesses)
+  sharpen resend   send the last saved dictation again
+
+IF SOMETHING'S OFF
+  nothing copied      verdict was NOT READY (answer the question) or the reply had no message block
+  clipboard replaced  another pair replied first: the notice names it; prefix+y brings yours back
+  no context shown    header says "none": join a working pane, or sharpen pair <selector>
+  voice not arriving  popup stays open with the reason and your text is saved. Clear the sharpen
+                      pane's input box, then:  sharpen resend   (sharpen status shows the last try)
+  unclear target      the popup lists the sharpen sessions: type a number, c = copy, Enter = skip
+  log                 ~/.config/sharpen/.hook.log
+
+More: sharpen help commands   (every command)   |   sharpen <command> --help   (one command)
+"""
+
+
+def command_help(name):
+    """The usage block for one command, pulled from the module docstring."""
+    lines = __doc__.strip().splitlines()
+    out, capture = [], False
+    for line in lines:
+        starts_command = line.startswith("  sharpen ")
+        if starts_command:
+            capture = line.split()[1] == name or (name == "unpin" and line.split()[1] == "pin")
+        elif not line.startswith(" " * 20):
+            capture = False
+        if capture:
+            out.append(line)
+    return "\n".join(out)
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(CHEATSHEET)
+        return
+    if argv[0] == "help":
+        if len(argv) > 1 and argv[1] == "commands":
+            print(__doc__.strip())
+        elif len(argv) > 1 and command_help(argv[1]):
+            print(command_help(argv[1]))
+        else:
+            print(CHEATSHEET)
+        return
+    if len(argv) > 1 and argv[1] in ("-h", "--help") and argv[0] in COMMANDS:
+        text = command_help(argv[0])
+        print(text or f"sharpen {argv[0]} (internal; see `sharpen help commands`)")
+        return
+    fn = COMMANDS.get(argv[0])
+    if not fn:
+        die(f"unknown command '{argv[0]}' (see sharpen --help)", 2)
+    fn(argv[1:])
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

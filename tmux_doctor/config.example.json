@@ -1,0 +1,7 @@
+{
+  "workspace_root": "~/workspace",
+  "protected_names": [],
+  "protected_path_roots": [    "~/personal",
+  ],
+  "activity_grace_days": null
+}
