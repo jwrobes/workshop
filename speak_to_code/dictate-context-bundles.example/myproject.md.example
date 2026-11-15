@@ -1,0 +1,20 @@
+---
+name: myproject
+generated_from: hand-written
+generated_at: 2026-01-01T00:00:00Z
+generator_model:
+hand_edited: true
+---
+
+# MyProject Context
+
+## Vocabulary
+- myproject-api — the HTTP API service
+- myproject-worker — background job runner
+
+## Repos
+- myproject/services/api — API source
+- myproject/services/worker — queue consumer
+
+## Notes
+- Replace these entries, or run `dictate --generate-context myproject --from ~/workspace/myproject/docs`.

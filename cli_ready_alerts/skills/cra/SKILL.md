@@ -29,6 +29,7 @@ Companion skill for the `cli_ready_alerts` tool. Teaches the agent how to invoke
 
 ```
 cra on | off                  # global enable/disable (persists across sessions, writes config.json)
+cra sounds on|off            # toggle only the sound channel, leave other channels alone
 cra status                    # config, contexts, routing, overrides, paths
 cra mute <ctx>                # silence one context (writes muted: true)
 cra unmute <ctx>              # reverse mute

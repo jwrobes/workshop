@@ -152,6 +152,9 @@ cat <<CLAUDE
 [setup] Claude Code: merge this into ~/.claude/settings.json under "hooks".
 [setup] Stop/Notification don't include workspace_path — dispatch-claudecode.sh
 [setup] injects \$PWD. PermissionRequest includes "cwd" directly and is used as-is.
+[setup] The Notification matcher is required: without it, Claude Code's idle
+[setup] reminder (~60s after a turn ends) plays the approval sound. SubagentStop
+[setup] is deliberately not hooked, so subagents finishing stay silent.
 
 {
   "hooks": {
@@ -167,6 +170,7 @@ cat <<CLAUDE
     ],
     "Notification": [
       {
+        "matcher": "permission_prompt|elicitation_dialog",
         "hooks": [
           {
             "type": "command",
@@ -201,16 +205,6 @@ cat <<CLAUDE
           {
             "type": "command",
             "command": "$INSTALL_DIR/dispatch-claudecode.sh approval"
-          }
-        ]
-      }
-    ],
-    "SubagentStop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$INSTALL_DIR/dispatch-claudecode.sh done"
           }
         ]
       }

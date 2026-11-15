@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# dictate-generate-context — generate a context bundle from a docs folder or file
+#
+# Usage: dictate-generate-context <name> [--from <path>] [--force]
+# Also reachable via: dictate --generate-context <name> --from <path> [--force]
+
+set -euo pipefail
+
+CONTEXTS_DIR="$HOME/.config/dictate/contexts"
+MAX_FILES=50
+MAX_BYTES=$(( 200 * 1024 ))
+
+NAME=""
+FROM_PATH=""
+FORCE=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --from)  FROM_PATH="$2"; shift 2 ;;
+        --force) FORCE=true; shift ;;
+        -h|--help)
+            sed -n '2,4p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        -*)
+            echo "Unknown flag: $1" >&2; exit 1 ;;
+        *)
+            [[ -z "$NAME" ]] && NAME="$1" || { echo "Unexpected argument: $1" >&2; exit 1; }
+            shift ;;
+    esac
+done
+
+if [[ -z "$NAME" ]]; then
+    echo "Usage: dictate-generate-context <name> --from <path> [--force]" >&2
+    exit 1
+fi
+
+if [[ ! "$NAME" =~ ^[a-z0-9-]+$ ]]; then
+    echo "Error: name '$NAME' is invalid — must match [a-z0-9-]+" >&2
+    exit 1
+fi
+
+if [[ -z "$FROM_PATH" ]]; then
+    echo "Error: --from <path> is required" >&2
+    exit 1
+fi
+
+if [[ ! -e "$FROM_PATH" ]]; then
+    echo "Error: path '$FROM_PATH' does not exist" >&2
+    exit 1
+fi
+
+BUNDLE_FILE="$CONTEXTS_DIR/${NAME}.md"
+
+# Check for existing bundle
+if [[ -f "$BUNDLE_FILE" ]]; then
+    if ! $FORCE; then
+        echo "Error: bundle '$NAME' already exists at $BUNDLE_FILE" >&2
+        echo "Use --force to overwrite." >&2
+        exit 1
+    fi
+    # Check hand_edited
+    hand_edited=$(awk '/^---/ { count++; next } count==1 && /^hand_edited:/ { sub(/^hand_edited: */, ""); print; exit } count>=2 { exit }' "$BUNDLE_FILE")
+    if [[ "$hand_edited" == "true" ]]; then
+        echo "Warning: bundle '$NAME' has been hand-edited. Proceeding with --force will overwrite your changes." >&2
+        echo "Existing file: $BUNDLE_FILE" >&2
+        read -r -p "Continue? [y/N] " confirm
+        [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+    fi
+fi
+
+mkdir -p "$CONTEXTS_DIR"
+
+# Collect input content
+collect_content() {
+    local path="$1"
+    if [[ -f "$path" ]]; then
+        cat "$path"
+        return
+    fi
+
+    # Directory: walk and collect files
+    local total_bytes=0
+    local file_count=0
+    local content=""
+
+    # Preferred files first: README, vocabulary, glossary, design docs
+    local preferred_pattern='README|vocabulary|glossary|DESIGN|PLAN|OVERVIEW|ARCHITECTURE'
+    local source_exts='\.md$|\.txt$|\.py$|\.ts$|\.tsx$|\.js$|\.jsx$|\.go$|\.rb$|\.java$|\.rs$|\.sh$|\.yaml$|\.yml$'
+
+    local all_files=()
+    while IFS= read -r -d '' f; do
+        all_files+=("$f")
+    done < <(find "$path" -maxdepth 5 -type f \( \
+        -name "*.md" -o -name "*.txt" -o -name "*.py" -o -name "*.ts" -o -name "*.tsx" \
+        -o -name "*.js" -o -name "*.jsx" -o -name "*.go" -o -name "*.rb" -o -name "*.java" \
+        -o -name "*.rs" -o -name "*.sh" -o -name "*.yaml" -o -name "*.yml" \
+    \) -print0 2>/dev/null | sort -z)
+
+    # Sort: preferred names first, then rest
+    local preferred=() rest=()
+    for f in "${all_files[@]}"; do
+        base=$(basename "$f")
+        if echo "$base" | grep -qiE "$preferred_pattern"; then
+            preferred+=("$f")
+        else
+            rest+=("$f")
+        fi
+    done
+
+    for f in "${preferred[@]}" "${rest[@]}"; do
+        [[ "$file_count" -ge "$MAX_FILES" ]] && break
+        fsize=$(wc -c < "$f" 2>/dev/null || echo 0)
+        (( total_bytes + fsize > MAX_BYTES )) && break
+        content="${content}"$'\n\n'"=== $(basename "$f") ==="$'\n'"$(cat "$f")"
+        (( total_bytes += fsize )) || true
+        (( file_count++ )) || true
+    done
+
+    printf '%s' "$content"
+    echo "  (collected $file_count files, $total_bytes bytes)" >&2
+}
+
+echo "Collecting content from: $FROM_PATH"
+INPUT_CONTENT=$(collect_content "$FROM_PATH")
+
+if [[ -z "$INPUT_CONTENT" ]]; then
+    echo "Error: no readable content found at '$FROM_PATH'" >&2
+    exit 1
+fi
+
+DISTILLATION_SYSTEM="You are creating a voice-dictation context bundle. Read the provided documents and extract:
+1. Proper nouns, acronyms, and technical terms that voice transcription will likely mangle
+2. Team names, service names, tool names, and person names referenced
+3. Current focus areas or active work streams
+
+Return markdown matching this template — keep total output under 400 tokens:
+
+# <Name> Context
+
+## Vocabulary
+- <Term> — <brief definition or expansion>
+
+## Team & Services
+- <name> — <brief description>
+
+## Current Focus
+- <one-line summary of active work>
+
+Output only the markdown. No preamble, no commentary."
+
+DISTILLATION_USER="Documents:
+
+${INPUT_CONTENT}
+
+Generate the context bundle for name: ${NAME}"
+
+echo "Generating bundle..."
+GENERATED=""
+GENERATOR_MODEL=""
+
+if command -v claude >/dev/null 2>&1; then
+    GENERATOR_MODEL="claude"
+    GENERATED=$(printf '%s\n\n%s' "$DISTILLATION_SYSTEM" "$DISTILLATION_USER" | claude -p) || GENERATED=""
+elif command -v llm >/dev/null 2>&1; then
+    GENERATOR_MODEL="llm"
+    GENERATED=$(printf '%s' "$DISTILLATION_USER" | llm -s "$DISTILLATION_SYSTEM") || GENERATED=""
+fi
+
+if [[ -z "$GENERATED" ]]; then
+    echo "Error: no working LLM backend. Install and configure the claude or llm CLI." >&2
+    exit 1
+fi
+
+GENERATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+FROM_ABS=$(cd "$(dirname "$FROM_PATH")" && echo "$(pwd)/$(basename "$FROM_PATH")")
+
+TMP=$(mktemp "${BUNDLE_FILE}.XXXX")
+{
+    printf -- '---\n'
+    printf 'name: %s\n' "$NAME"
+    printf 'generated_from: %s\n' "$FROM_ABS"
+    printf 'generated_at: %s\n' "$GENERATED_AT"
+    printf 'generator_model: %s\n' "$GENERATOR_MODEL"
+    printf 'hand_edited: false\n'
+    printf -- '---\n\n'
+    printf '%s\n' "$GENERATED"
+} > "$TMP"
+mv "$TMP" "$BUNDLE_FILE"
+
+CHARS=$(wc -c < "$BUNDLE_FILE" | tr -d ' ')
+echo ""
+echo "Wrote $BUNDLE_FILE (${CHARS} chars)."
+echo "Edit:  \$EDITOR $BUNDLE_FILE"
+echo "Use:   dictate --context $NAME"
