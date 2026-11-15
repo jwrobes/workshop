@@ -69,6 +69,7 @@ The repo is the **source of truth** for tool code. Where a tool actually runs fr
 | [`workspace_init/`](./workspace_init/) | `wsnew <github-issue-url>`: derives an initiative name, runs `claude -p "/scaffold-workspace ..."` headlessly, then opens a 2-pane tmux session. Needs the `gh` CLI. | Portable bash + python3 |
 | [`workspace_doctor/`](./workspace_doctor/) | Scans git worktrees across `*_workspace/` dirs, checks PR and issue state with `gh`, classifies what is safe to clean up, and archives or removes it after approval. Dry-run by default. Ships the `cleanup-workspace` skill. | Portable python3; state in `~/.config/workspace-doctor/` |
 | [`chat_mining/`](./chat_mining/) | Catalogs, searches and classifies local Claude Code and Cursor chat history. LLM command is configurable (`claude -p` or `llm`). | Portable, stdlib python3 |
+| [`epic_conductor/`](./epic_conductor/) | Supervisor that runs several `full-path-github` workers in parallel, one detached tmux session per GitHub issue, coordinated through a shared log. Restarts dead workers, supports live human-driven workers, never merges. Needs `gh`, `tmux`, `claude`, and `workspace_init`. Ships the `conducting-epics` skill. | Portable bash; `setup.sh` symlinks the helpers into `~/.local/bin` |
 
 ## Standalone skills
 

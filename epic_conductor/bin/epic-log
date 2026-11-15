@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Append one event to an epic's shared update log. One short line per call, so
+# concurrent writers never interleave.
+# usage: epic-log <epic> <repo>/<n> <EVENT> [message...]
+set -euo pipefail
+[ $# -ge 3 ] || { echo "usage: epic-log <epic> <repo>/<n> <EVENT> [message...]" >&2; exit 2; }
+SRC="${BASH_SOURCE[0]}"; while [ -h "$SRC" ]; do D="$(cd -P "$(dirname "$SRC")" && pwd)"; SRC="$(readlink "$SRC")"; [[ $SRC != /* ]] && SRC="$D/$SRC"; done
+HERE="$(cd -P "$(dirname "$SRC")" && pwd)"
+source "$HERE/_common.sh"
+epic="$1"; issue="$2"; event="$3"; shift 3
+validate_epic "$epic"
+case "$event" in STARTED|PHASE|HEARTBEAT|BLOCKED|HANDOFF|DONE|KILLED) ;; *) echo "unknown event: $event" >&2; exit 2 ;; esac
+msg="$*"; msg="${msg//$'\n'/ }"; msg="${msg//$'\t'/ }"
+mkdir -p "$EPIC_HOME/$epic"
+printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$issue" "$event" "$msg" >> "$EPIC_HOME/$epic/UPDATES.log"

@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Read-only snapshot of one issue from GitHub: state, orchestrator-blocked label,
+# open blocked_by dependencies, the closing PR and its checks. Needs gh, makes no changes.
+# usage: epic-check <issue-url|owner/repo#n>
+set -euo pipefail
+SRC="${BASH_SOURCE[0]}"; while [ -h "$SRC" ]; do D="$(cd -P "$(dirname "$SRC")" && pwd)"; SRC="$(readlink "$SRC")"; [[ $SRC != /* ]] && SRC="$D/$SRC"; done
+HERE="$(cd -P "$(dirname "$SRC")" && pwd)"
+source "$HERE/_common.sh"
+[ $# -eq 1 ] || { echo "usage: epic-check <issue-url|owner/repo#n>" >&2; exit 2; }
+parse_issue "$1"
+
+row="$(gh issue view "$IID" -R "$REPO_SLUG" --json state,labels --jq '[.state, ([.labels[].name] | join(","))] | @tsv')"
+state="${row%%$'\t'*}"; labels="${row#*$'\t'}"
+blocked_label=no
+case ",$labels," in *,orchestrator-blocked,*) blocked_label=yes ;; esac
+
+if blockers="$(gh api "repos/$REPO_SLUG/issues/$IID/dependencies/blocked_by" \
+      --jq '.[] | select(.state == "open") | "#\(.number)"' 2>/dev/null)"; then
+  blockers="$(printf '%s' "$blockers" | paste -sd, -)"; [ -n "$blockers" ] || blockers=none
+else
+  blockers=unknown
+fi
+
+pr_row="$(gh pr list -R "$REPO_SLUG" --state all --search "closes #$IID in:title,body" \
+  --json url,state,isDraft --jq '.[0] // empty | [.url, .state, (.isDraft | tostring)] | @tsv' 2>/dev/null || true)"
+pr=none; pr_state=none; checks=none
+if [ -n "$pr_row" ]; then
+  IFS=$'\t' read -r pr pstate pdraft <<<"$pr_row"
+  case "$pstate" in
+    OPEN) [ "$pdraft" = true ] && pr_state=draft || pr_state=ready ;;
+    MERGED) pr_state=merged ;;
+    *) pr_state=closed ;;
+  esac
+  c="$(gh pr checks "$pr" --json bucket --jq '[.[].bucket] | unique | join(",")' 2>/dev/null || true)"
+  case ",$c," in
+    ,,) checks=none ;;
+    *,fail,*|*,cancel,*) checks=fail ;;
+    *,pending,*) checks=pending ;;
+    *) checks=pass ;;
+  esac
+fi
+
+printf 'issue: %s\nstate: %s\norchestrator-blocked: %s\nopen-blockers: %s\npr: %s\npr-state: %s\nchecks: %s\n' \
+  "$REPO_SLUG#$IID" "$state" "$blocked_label" "$blockers" "$pr" "$pr_state" "$checks"
