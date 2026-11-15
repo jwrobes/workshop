@@ -65,6 +65,10 @@ The repo is the **source of truth** for tool code. Where a tool actually runs fr
 | [`comprehension_signoff/`](./comprehension_signoff/) | Standalone Claude Code skill — post-ship comprehension gate for vibe-coded changes. Generates explainer artifacts then verifies understanding via SOLO-graded teach-back. Local-only (not in synced skills repo). | Light (symlink `comprehension_signoff/` into `~/.claude/skills/comprehension-signoff`) |
 | [`sharpen_prompt/`](./sharpen_prompt/) | Pairs a `sharpen-prompt` Claude session with a working session in tmux. Hooks hand the working session's last reply to the sharpen session and copy the sharpened message to the clipboard when it is READY. Ships the `sharpen-prompt` companion skill. macOS + tmux only. | Portable, stdlib python3; `setup.sh` symlinks `sharpen` and registers two Claude Code hooks |
 | [`tmux_doctor/`](./tmux_doctor/) | Classifies tmux sessions, writes a keep/kill report and manifest, and kills approved sessions with hard guards. Ships the `cleanup-tmux` companion skill. | Portable, stdlib python3; runtime in `~/.config/tmux-doctor/` |
+| [`smart_screenshots/`](./smart_screenshots/) | Names new macOS screenshots with a vision model, hard-links them into the workbench folder of your active tmux pane, and pastes the path into that pane's Claude input. Vision command is configurable (`claude -p` or `llm`). macOS only. | Portable, stdlib python3; launchd agent via `setup.sh` |
+| [`workspace_init/`](./workspace_init/) | `wsnew <github-issue-url>`: derives an initiative name, runs `claude -p "/scaffold-workspace ..."` headlessly, then opens a 2-pane tmux session. Needs the `gh` CLI. | Portable bash + python3 |
+| [`workspace_doctor/`](./workspace_doctor/) | Scans git worktrees across `*_workspace/` dirs, checks PR and issue state with `gh`, classifies what is safe to clean up, and archives or removes it after approval. Dry-run by default. Ships the `cleanup-workspace` skill. | Portable python3; state in `~/.config/workspace-doctor/` |
+| [`chat_mining/`](./chat_mining/) | Catalogs, searches and classifies local Claude Code and Cursor chat history. LLM command is configurable (`claude -p` or `llm`). | Portable, stdlib python3 |
 
 ## Standalone skills
 
@@ -82,6 +86,7 @@ The repo is the **source of truth** for tool code. Where a tool actually runs fr
 | [`grill-me/`](./skills/grill-me/) | Interview the user relentlessly about a plan or design until reaching shared understanding, resolving each branch of the decision tree. |
 | [`improve-codebase-architecture/`](./skills/improve-codebase-architecture/) | Explore a codebase for architectural friction, discover opportunities for improving testability, and propose module-deepening refactors. |
 | [`playwright-capture-flow/`](./skills/playwright-capture-flow/) | Playwright: Capture Flow. |
+| [`pr-review-walkthrough/`](./skills/pr-review-walkthrough/) | Build a single-file HTML review walkthrough for one GitHub pull request, so a reviewer understands the change before reading the diff. |
 | [`prd-to-issues/`](./skills/prd-to-issues/) | Break a PRD into independently-grabbable GitHub issues using tracer-bullet vertical slices. |
 | [`readable-output/`](./skills/readable-output/) | Rewrite a complex answer, conversation, change, or agent run into clear, easy-to-review output - simplified technical English (STE), then a diagram, interactive HTML page. |
 | [`refresh-context-pack/`](./skills/refresh-context-pack/) | Build or refresh a fast-load, project-scoped context pack — a compact snapshot of live tracker state (GitLab epics/issues, or an equivalent) plus standing traps and links. |
