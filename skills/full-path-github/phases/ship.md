@@ -251,6 +251,44 @@ queue can be kept honest:
 > merge. The dependency gate in `intake.md` is the backstop if a blocked issue
 > is picked up anyway.
 
+## Step 6.7: Verify the Deployed Artifact (continuously-deployed projects)
+
+**Applies when** the merge/push actually deploys something a user hits — a
+site, an app, a service. **Skip** where merging only lands code.
+
+Green CI means *the build succeeded*, not *the thing works*. A deploy can be
+"successful" and still serve a broken page: the build passes, the workflow goes
+green, the artifact uploads — and the live URL renders unusable. That gap is
+where a bad deploy can sit unnoticed until a human happens to look.
+
+If the project has a `.visual.json` with a `url`, re-run the check against the
+**live** deployment once it finishes:
+
+```bash
+gh run watch {run_id} --repo {owner/repo} --exit-status
+VISUAL_URL={url from .visual.json} npm run check:visual   # or the manifest's command
+```
+
+Otherwise do the minimum by hand — and do it the way a **browser** would, not
+by fetching URLs you composed yourself:
+
+```bash
+# Fetch the page, then resolve every asset link RELATIVE TO THE PAGE URL.
+curl -s "$URL" | grep -oE '(href|src)="[^"]+"'   # what the page actually asks for
+```
+
+> Fetching an asset at the URL you *believe* it lives at proves nothing. The
+> only URLs that matter are the ones the page emits. This distinction is what
+> separated "verified" from "actually working" in the #6 failure.
+
+| Result | Action |
+|--------|--------|
+| Live artifact renders correctly | Note the verified URL in the final report. |
+| Live artifact is broken | **Say so plainly and immediately.** File a bug issue with the root cause, and fix it through the normal issue→PR flow. Do not quietly hot-patch the mainline. |
+
+Record in the execution log: the live URL, what was asserted against it, and
+the result.
+
 ## Step 7: Final Report
 
 ```text

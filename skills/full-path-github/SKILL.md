@@ -163,6 +163,7 @@ Issue URL + Project
   │     Layer 1.5: Schema-refutation (refute-first; external-contract code)
   │     Layer 2:   ACs verified
   │     Layer 3:   code-review ≥ Solid
+  │     Layer 3.5: Visual render check (user-facing web UI)
   │     Layer 4:   E2E hooks pass (if applicable)
   │     → blocked if validation fails after retry
   │
@@ -254,6 +255,7 @@ Full-path orchestrator complete.
   Tests:     {pass_count} passing ({new_count} new)
   ACs:       {covered}/{total} verified
   Review:    {band} ({pct}%)
+  Visual:    {pass/fail/n/a}
   E2E:       {pass/fail/n/a}
 
   Decisions: {high_count} high, {medium_count} medium (flagged)
