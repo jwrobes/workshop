@@ -1,8 +1,8 @@
 # Validate Phase
 
-Three (or four) layers: tests pass, ACs verified, `code-review` scores
-the diff, and E2E hooks confirm the feature works end-to-end (when
-available).
+Layered gates: tests pass, ACs verified, `code-review` scores the diff, the
+rendered UI is checked in a real browser (when the diff is user-facing), and
+E2E hooks confirm the feature works end-to-end (when available).
 
 ## Pre-conditions
 
@@ -165,6 +165,109 @@ After addressing must-fix items, re-run the review **once**:
 - If must-fix items remain after retry → stop and report per guardrails.
 - If all must-fix resolved → proceed.
 
+## Layer 3.5: Visual Render Check (user-facing web UI)
+
+**Applies when** the diff changes anything a browser renders — a page, a
+template, a stylesheet, a layout, an asset path, or the build/deploy config
+that decides where those assets are served from. **Skip (`n/a`)** for
+back-end-only or CLI work.
+
+This layer exists because of a real failure: a site shipped to production
+**completely unstyled** — default serif, blue underlined links — while every
+other layer was green. Tests passed, ACs "verified", review scored well, and
+the deploy succeeded. The cause was an asset-path mismatch: the page linked
+`/assets/css/site.css` while the host served it from `/website/assets/...`.
+
+The verification that missed it looked rigorous:
+
+```bash
+curl .../website/assets/css/site.css   # 200 OK ✅
+```
+
+That is the URL the **file** lives at — not the URL the **page asks for**.
+A 200 on a hand-composed asset URL proves nothing about whether the page can
+load it.
+
+> **The rule this layer encodes:** *fetching an asset yourself is not
+> evidence the page renders. Only a browser loading the page is.*
+
+### Step 3.5a: Discover the project's visual hook
+
+Same manifest convention as Layer 4 — a **`.visual.json` at the repo root**:
+
+```bash
+cat {repo_root}/.visual.json 2>/dev/null
+```
+
+```json
+{
+  "command": "npm run check:visual",
+  "build": "npm run build",
+  "url": "https://example.github.io/site/",
+  "describe": "Headless-Chromium render check"
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `command` | **Required.** Runs the render check; gate on its exit code (0 = pass). |
+| `build` | Optional. Build step to run first. |
+| `url` | Optional. The live URL, for a post-deploy re-check in SHIP. |
+| `describe` | Optional. One line for the execution log. |
+
+- **`.visual.json` present** → run `build` (if given), then `command`, and gate
+  on the exit code.
+- **Absent, but the diff touches rendered output** → do **not** skip. Build the
+  check as part of this run (it is small — see the assertions below) and add the
+  manifest, exactly as Layer 4 says to build a missing E2E hook. A project that
+  renders HTML and cannot answer "does it look right?" has a gap worth closing
+  once.
+
+### Step 3.5b: What the check must assert
+
+Assert that **styling actually applied** — not pixel-perfection. Screenshot
+baselines churn on every copy edit and get disabled; these do not:
+
+| Assertion | Catches |
+|---|---|
+| No request returns >= 400 (**browser's own network log**) | the asset-path bug; missing images |
+| Body's computed font is the brand font, not `Times`/`serif` | CSS never applied |
+| A known design token resolves (e.g. `--color-brand`) | token stylesheet missing |
+| A grid/flex container computes >= 2 columns | layout rules not in effect |
+| A headline's computed font-size exceeds the browser default | stylesheet not applied |
+| No horizontal overflow at ~390px | mobile breakage |
+| No uncaught JS errors | broken bundle |
+
+Computed styles are the key: they are what the user actually sees, and unlike
+"the file returned 200" they cannot be true while the page looks broken.
+
+> **Serve the way production serves.** If the site is published under a path
+> prefix, the check's local server must serve **only** under that prefix and
+> 404 everything else. A lenient dev server that resolves both `/assets/...`
+> and `/prefix/assets/...` will pass a build that breaks in production — this
+> was true of the first version of this very check, which passed on the broken
+> build until the server was tightened.
+
+### Step 3.5c: Prove the check can fail
+
+A regression check that has never failed is unverified. Before trusting it:
+
+1. Reintroduce the fault (e.g. build with the wrong path prefix).
+2. Run the check — it **must exit non-zero**.
+3. Restore the fix — it **must exit zero**.
+
+Record both exit codes in the execution log. If the check passes on a build you
+know is broken, **the check is wrong, not the build.** Fix it before shipping.
+
+### Pass criteria
+
+- [ ] `.visual.json` present (or built this run)
+- [ ] Check exits 0 on the current build
+- [ ] Check demonstrably exits non-zero on the reintroduced fault
+- [ ] Gated in CI, not only runnable by hand
+
+If it fails: fix and re-run, 2 attempts, then stop and report per guardrails.
+
 ## Layer 4: E2E Validation (optional, soft-blocking)
 
 If the feature has an E2E hook (identified in PLAN), the orchestrator
@@ -300,6 +403,7 @@ gh issue comment {NNN} --repo {owner/repo} --body "$(cat <<EOF
 - Tests: ${PASS_COUNT} passing (${NEW_COUNT} new)
 - ACs: ${COVERED}/${TOTAL} verified
 - Review: ${BAND} (${SCORE}%)
+- Visual: ${VISUAL_RESULT}
 - E2E: ${E2E_RESULT}
 
 ${REVIEW_NOTES}
@@ -326,6 +430,8 @@ EOF
 | 6. Frontend | {score}/3 or n/a | {summary} |
 | 7. Commits | {score}/3 | {summary} |
 | **Overall** | **{pct}%** | **{band}** |
+
+**Layer 3.5 — Visual render:** {pass/fail/n/a} — {assertions_passed}/{assertions_total} assertions; fault-injection proof: broken build exit {code}, fixed build exit {code}
 
 **Layer 4 — E2E ({iterations} iteration(s)):** {pass/fail/n/a}
 

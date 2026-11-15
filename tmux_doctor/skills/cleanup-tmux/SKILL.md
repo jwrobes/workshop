@@ -24,8 +24,12 @@ Sibling of `cleanup-workspace`. Consumes `workspace-doctor`'s `scan.json` for th
 
 ### Step 1 — Scan
 
+The scripts live two levels above this skill (`<workshop clone>/tmux_doctor/`). Resolve that from the
+installed symlink so it works wherever the clone lives:
+
 ```bash
-python ~/personal/workshop/tmux_doctor/tmux-scan.py
+TMUX_DOCTOR="$(cd "$(dirname "$(readlink -f ~/.claude/skills/cleanup-tmux/SKILL.md)")/../.." && pwd)"
+python3 "$TMUX_DOCTOR/tmux-scan.py"
 ```
 
 This writes `~/.config/tmux-doctor/scan.json` and prints the grouped report. If a fresh `scan.json` already exists you can read it directly.
@@ -79,7 +83,7 @@ Never put an `attached` or `protected-name` session in the manifest. (The execut
 ### Step 6 — Dry-run
 
 ```bash
-python ~/personal/workshop/tmux_doctor/tmux-cleanup.py
+python3 "$TMUX_DOCTOR/tmux-cleanup.py"
 ```
 
 Show the output. Confirm: "Reply yes to execute, no to cancel."
@@ -87,7 +91,7 @@ Show the output. Confirm: "Reply yes to execute, no to cancel."
 ### Step 7 — Execute
 
 ```bash
-python ~/personal/workshop/tmux_doctor/tmux-cleanup.py --execute
+python3 "$TMUX_DOCTOR/tmux-cleanup.py" --execute
 ```
 
 Report the result and the log path (`~/.config/tmux-doctor/cleanup-log.md` + `.html`). Surface any skipped sessions (attached/protected/already-gone) with their reasons.
