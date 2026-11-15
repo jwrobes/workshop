@@ -115,6 +115,53 @@ render();
 </script>
 ```
 
+### Answers and comments back to Claude (two-way pages)
+Add this when the output has **open questions for the user**, or the user wants to
+review and react. The page becomes the reply form. A local HTML file cannot
+reach the Claude session or write anywhere except Downloads, so give two
+return paths and no network calls.
+
+1. **Answer tab.** Put each open question in a JSON block in the page
+   (`<script type="application/json" id="answer-spec">`) with `slug`, `source`,
+   `generated_at`, and `questions[]` (`id`, `type`: choice | text | number |
+   textarea, `q`, `help`, `options`, `suggested`). Render the form from it.
+   Choice questions get a free-text notes field. Mark the suggested option, and
+   never pre-select it: the user must choose.
+2. **Comment mode.** A floating "💬 Comment" toggle. When it's on, tapping any
+   paragraph, list item, table row, card, heading, or SVG box/arrow on any tab
+   opens a bottom panel. The panel quotes the target (tab + text; for SVG, the
+   label text inside the box or next to the arrow) and takes a comment. Number
+   the comment on the element. List all comments on the Answer tab, each with
+   Remove.
+3. **Draft persistence.** Save answers and comments to `localStorage` on every
+   change (wrap in try/catch). The page must work without storage.
+4. **Return paths** (both are required):
+   - **Copy for Claude:** a plain-text block starting
+     `READABLE-OUTPUT ANSWERS: <slug>`, with numbered `[id]` answers, then
+     `COMMENTS:` with `[tab] on: "<target>"` and the comment. Use
+     `navigator.clipboard`. If that fails, show the text in a selected textarea.
+   - **Save answers file:** download `<slug>.answers.json` (same data as JSON:
+     `slug, source, generated_at, answered_at, answers[], comments[]`).
+5. Put the "Answer the open questions →" link in the TL;DR, and add a
+   "Review & send (n)" button next to the comment toggle. It only opens the
+   Answer tab; label it so it doesn't look like it sends anything.
+6. Set `generated_at` from `date -u +%Y-%m-%dT%H:%M:%SZ` when you write the page.
+   Never guess it. Use a new `slug` for each round (`<slug>-r2`, `-r3`), so old
+   drafts and comments in localStorage don't carry over.
+
+**Picking up answers (Claude's side).** When the user says "pick up my answers",
+or pastes a `READABLE-OUTPUT ANSWERS` block:
+1. Find the newest `~/Downloads/<slug>.answers*.json` (the browser may add
+   ` (1)`). Check that `slug` matches and `answered_at` is later than `generated_at`.
+2. Read back a short summary of the answers and comments before acting on them.
+   Treat a blank answer as "not answered", never as consent.
+3. Act on them. Then move the file next to the page as
+   `answers/<slug>-<answered_at>.json`, so the decisions are kept with the work
+   (in git, if the page lives in a repo).
+4. If an answer changes the plan, update the page and the source docs. Then
+   remove the answered questions from the spec, so the next round asks only
+   what is still open.
+
 ### MR review walkthroughs
 A page that helps someone review a merge request has its own skill:
 `mr-review-walkthrough` (rules, skeleton, lessons). Use it instead of this one.
@@ -149,3 +196,5 @@ Return, in this order:
 - If the content has a numeric tradeoff, does the page let the reader vary it?
 - Does the HTML page read correctly with no interaction, and on a phone?
 - Is each uncertain claim labeled once?
+- If the user must decide something, does the page have an Answer tab, comment
+  mode, and both return paths (copy and save file)?
