@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Kill one worker's tmux session and record why. Does not touch its worktree, branch or issue.
+# Look at the pane first (tmux capture-pane -p -t <session> -S -80); see the conducting-epics skill.
+# usage: epic-kill <epic> <issue> <reason...>
+set -euo pipefail
+SRC="${BASH_SOURCE[0]}"; while [ -h "$SRC" ]; do D="$(cd -P "$(dirname "$SRC")" && pwd)"; SRC="$(readlink "$SRC")"; [[ $SRC != /* ]] && SRC="$D/$SRC"; done
+HERE="$(cd -P "$(dirname "$SRC")" && pwd)"
+source "$HERE/_common.sh"
+[ $# -ge 3 ] || { echo "usage: epic-kill <epic> <issue-url|owner/repo#n> <reason...>" >&2; exit 2; }
+epic="$1"; ref="$2"; shift 2
+validate_epic "$epic"
+parse_issue "$ref"
+sess="$(session_name "$epic" "$PROJECT_NAME" "$IID")"
+if [ -n "$(live_target "$epic" "$PROJECT_NAME" "$IID")" ]; then
+  echo "refusing: $PROJECT_NAME/$IID is a LIVE worker driven by a human. Ask the user to end it." >&2; exit 3
+fi
+tmux kill-session -t "$sess"
+"$HERE/epic-log" "$epic" "$PROJECT_NAME/$IID" KILLED "$*"
+echo "killed $sess"

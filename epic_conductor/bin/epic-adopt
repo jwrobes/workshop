@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Join an existing tmux window/pane (one you opened yourself) to the supervisor as a LIVE worker.
+# Renders the live worker prompt, registers the tmux target so epic-status tracks it and
+# epic-kill refuses to touch it, and prints the command to run inside it.
+# usage: epic-adopt <epic> <issue-url|owner/repo#n> <tmux-target> [--brief FILE]
+#   tmux-target  e.g. mysession:2  (see: tmux list-windows -a)
+set -euo pipefail
+SRC="${BASH_SOURCE[0]}"; while [ -h "$SRC" ]; do D="$(cd -P "$(dirname "$SRC")" && pwd)"; SRC="$(readlink "$SRC")"; [[ $SRC != /* ]] && SRC="$D/$SRC"; done
+HERE="$(cd -P "$(dirname "$SRC")" && pwd)"
+source "$HERE/_common.sh"
+[ $# -ge 3 ] || { echo "usage: epic-adopt <epic> <issue-url> <tmux-target> [--brief FILE]" >&2; exit 2; }
+epic="$1"; ref="$2"; target="$3"; shift 3
+brief=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --brief) [ $# -ge 2 ] || { echo "--brief needs a file" >&2; exit 2; }; brief="$2"; shift 2 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+[ -z "$brief" ] || [ -f "$brief" ] || { echo "brief not found: $brief" >&2; exit 2; }
+validate_epic "$epic"
+tmux display-message -p -t "$target" '#{pane_id}' >/dev/null 2>&1 || { echo "no such tmux target: $target" >&2; exit 1; }
+parse_issue "$ref"
+url="$ISSUE_URL"
+issue="$PROJECT_NAME/$IID"
+if [ -n "$(live_target "$epic" "$PROJECT_NAME" "$IID")" ]; then
+  echo "already adopted: $issue (remove $(live_file "$epic" "$PROJECT_NAME" "$IID") to re-adopt)" >&2; exit 1
+fi
+if tmux has-session -t "$(session_name "$epic" "$PROJECT_NAME" "$IID")" 2>/dev/null; then
+  echo "a spawned worker already runs for $issue" >&2; exit 1
+fi
+
+attempt="$(attempt_number "$epic" "$issue")"
+mkdir -p "$EPIC_HOME/$epic/prompts" "$EPIC_HOME/$epic/live"
+prompt="$EPIC_HOME/$epic/prompts/${PROJECT_NAME}-${IID}-attempt${attempt}-live.md"
+sed -e "s|{{ISSUE_URL}}|$url|g" -e "s|{{EPIC}}|$epic|g" -e "s|{{ISSUE_KEY}}|$issue|g" \
+    -e "s|{{ATTEMPT}}|$attempt|g" -e "s|{{EPIC_LOG}}|$HERE/epic-log|g" \
+    "$HERE/../prompts/worker-live.md" > "$prompt"
+[ -z "$brief" ] || { printf '\n---\n\n'; cat "$brief"; } >> "$prompt"
+
+printf '%s' "$target" > "$(live_file "$epic" "$PROJECT_NAME" "$IID")"
+"$HERE/epic-log" "$epic" "$issue" STARTED "attempt $attempt, LIVE, adopted $target, prompt $(basename "$prompt")"
+echo "adopted $target as LIVE worker for $issue"
+echo "run in that window, from the issue's workbench directory:"
+echo "  claude \"\$(cat '$prompt')\""

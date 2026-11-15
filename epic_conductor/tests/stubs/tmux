@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Fake tmux. State: $FAKE_TMUX_DIR/{sessions,panes} (one name per line); calls logged to $FAKE_TMUX_DIR/calls.
+d="${FAKE_TMUX_DIR:?}"; touch "$d/sessions" "$d/panes" "$d/calls"
+echo "$*" >> "$d/calls"
+arg_after() { local k="$1"; shift; while [ $# -gt 0 ]; do [ "$1" = "$k" ] && { echo "$2"; return; }; shift; done; }
+case "$1" in
+  has-session)     grep -qxF "$(arg_after -t "$@")" "$d/sessions" ;;
+  display-message) grep -qxF "$(arg_after -t "$@")" "$d/panes" && echo %1 ;;
+  new-session)     arg_after -s "$@" >> "$d/sessions" ;;
+  kill-session)    t="$(arg_after -t "$@")"; grep -qxF "$t" "$d/sessions" || exit 1; grep -vxF "$t" "$d/sessions" > "$d/s.tmp" || true; mv "$d/s.tmp" "$d/sessions" ;;
+  capture-pane)    echo "fake pane output" ;;
+esac

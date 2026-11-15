@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# One row per issue: last event, its age, whether the tmux session is alive, attempt count.
+# usage: epic-status <epic>
+set -euo pipefail
+SRC="${BASH_SOURCE[0]}"; while [ -h "$SRC" ]; do D="$(cd -P "$(dirname "$SRC")" && pwd)"; SRC="$(readlink "$SRC")"; [[ $SRC != /* ]] && SRC="$D/$SRC"; done
+HERE="$(cd -P "$(dirname "$SRC")" && pwd)"
+source "$HERE/_common.sh"
+epic="${1:?usage: epic-status <epic>}"
+validate_epic "$epic"
+log="$EPIC_HOME/$epic/UPDATES.log"
+[ -f "$log" ] || { echo "no log for epic '$epic'"; exit 0; }
+now="$(date +%s)"
+printf '%-28s %-10s %-8s %-9s %-4s %s\n' ISSUE EVENT AGE_MIN ALIVE ATT MESSAGE
+awk -F'\t' '{last[$2]=$0} END{for (i in last) print last[i]}' "$log" | sort -t$'\t' -k2,2 |
+while IFS=$'\t' read -r ts issue event msg; do
+  proj="${issue%/*}"; iid="${issue#*/}"
+  alive=no
+  target="$(live_target "$epic" "$proj" "$iid")"
+  if [ -n "$target" ]; then
+    tmux display-message -p -t "$target" '#{pane_id}' >/dev/null 2>&1 && alive=live || alive=live-gone
+  else
+    tmux has-session -t "$(session_name "$epic" "$proj" "$iid")" 2>/dev/null && alive=yes
+  fi
+  age=$(( (now - $(to_epoch "$ts")) / 60 ))
+  printf '%-28s %-10s %-8s %-9s %-4s %s\n' "$issue" "$event" "$age" "$alive" "$(started_count "$epic" "$issue")" "$msg"
+done

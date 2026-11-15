@@ -176,6 +176,11 @@ cat > /tmp/issue-body.md <<'EOF'
 ### Open Questions
 {Any medium-confidence flags or deferred decisions}
 
+## Reporter Screenshots & Recordings
+
+{Verbatim attachments from INTAKE's "Reporter attachments" list. Omit this
+section only if INTAKE recorded "none".}
+
 ## Orchestrator Decisions
 
 | Decision | Choice | Confidence | Evidence |
@@ -184,6 +189,17 @@ cat > /tmp/issue-body.md <<'EOF'
 EOF
 
 gh issue edit {NNN} --repo {owner/repo} --body-file /tmp/issue-body.md
+```
+
+**Reporter media must survive the rewrite.** Overwriting drops stale *prose*,
+not repro media. Re-embed every attachment INTAKE recorded, verbatim and with
+its URL unchanged, so the screenshot or recording still renders. If a
+screenshot is load-bearing for the design (a UI bug, a layout), open it and
+inspect it directly rather than inferring from the text. After the edit, check
+the live body still contains each URL:
+
+```bash
+gh issue view {NNN} --repo {owner/repo} --json body --jq .body | grep -F '{url}'
 ```
 
 ## Step 6: Record Enrich Summary

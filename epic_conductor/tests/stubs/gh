@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Fake gh. Fixtures (already-jq'd output) in $FAKE_GH_DIR: issue_view, blockers, pr_list, checks.
+# Create "blockers.fail" to make the dependency API error. Calls logged to $FAKE_GH_DIR/calls.
+d="${FAKE_GH_DIR:?}"; echo "$*" >> "$d/calls"
+case "$1 $2" in
+  "issue view") cat "$d/issue_view" ;;
+  "api "*)      [ -e "$d/blockers.fail" ] && exit 1; cat "$d/blockers" 2>/dev/null || true ;;
+  "pr list")    cat "$d/pr_list" 2>/dev/null || true ;;
+  "pr checks")  cat "$d/checks" 2>/dev/null || true; exit 8 ;;
+  *) echo "gh stub: unhandled: $*" >&2; exit 99 ;;
+esac
