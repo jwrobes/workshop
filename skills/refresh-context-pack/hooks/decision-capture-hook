@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# decision-capture-hook — Claude Code Stop event hook
+#
+# Registered as an additional Stop hook in ~/.claude/settings.json, alongside
+# dispatch-claudecode.sh and dictate-session-hook. Does not modify or depend on either.
+#
+# Opt-in per project: only runs if <cwd>/plans/DECISIONS_LOG.md already exists. Its
+# presence IS the opt-in signal — no separate marker file, no global config.
+#
+# Unlike dictate-session-hook (which OVERWRITES a rolling short-term summary for voice
+# dictation context), this hook APPENDS durable decisions/scope-changes/resolved-judgment
+# calls to that log — feeding the refresh-context-pack skill's "merge forward judgment
+# sections" step. Most turns contain no decision; the extraction prompt is built to output
+# exactly NONE in that case, and this hook writes nothing when it sees NONE, so the log
+# stays dense rather than filling with empty entries.
+#
+# Rules (mirrors dictate-session-hook's proven shape):
+#   - Never blocks: forks background process and exits immediately
+#   - Throttle: skips if this hook last ran within THROTTLE_SECONDS for this cwd
+#   - Always exits 0; errors go to <cwd>/plans/.decisions_log_state/.hook.log
+
+set -euo pipefail
+
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DISTILL_PROMPT_FILE="$HOOK_DIR/decision-extract-prompt.md"
+THROTTLE_SECONDS=120
+MAX_INPUT_CHARS=8000
+MAX_OUTPUT_CHARS=1500
+
+PAYLOAD=$(cat)
+
+CWD=$(printf '%s' "$PAYLOAD" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get('cwd', ''))
+except Exception:
+    print('')
+" 2>/dev/null || true)
+[[ -z "$CWD" ]] && CWD="$PWD"
+
+LOG_FILE="$CWD/plans/DECISIONS_LOG.md"
+
+# Opt-in check: only run at all if the log file already exists for this project.
+# This must stay before mkdir/anything else — every non-opted-in cwd hits this and exits.
+if [[ ! -f "$LOG_FILE" ]]; then
+    exit 0
+fi
+
+STATE_DIR="$CWD/plans/.decisions_log_state"
+THROTTLE_FILE="$STATE_DIR/.last-run"
+ERR_LOG="$STATE_DIR/.hook.log"
+
+log() { printf '[decision-capture-hook] %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$ERR_LOG" 2>/dev/null || true; }
+
+mkdir -p "$STATE_DIR"
+
+# Throttle: skip if we ran within THROTTLE_SECONDS, regardless of whether a decision
+# was found last time — this bounds LLM-call frequency independent of log-append timing.
+if [[ -f "$THROTTLE_FILE" ]]; then
+    FILE_AGE=$(( $(date +%s) - $(stat -f %m "$THROTTLE_FILE" 2>/dev/null || echo 0) ))
+    if [[ "$FILE_AGE" -lt "$THROTTLE_SECONDS" ]]; then
+        exit 0
+    fi
+fi
+touch "$THROTTLE_FILE"
+
+# Extract transcript content via transcript_path from payload (same parsing as
+# dictate-session-hook). Deliberately takes the LAST N chars, not the first — recent
+# turns are what matter for catching a decision just made, not early context.
+TRANSCRIPT=$(printf '%s' "$PAYLOAD" | python3 -c "
+import sys, json
+
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+
+transcript_path = d.get('transcript_path', '')
+if not transcript_path:
+    sys.exit(0)
+
+lines = []
+try:
+    with open(transcript_path) as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+            except Exception:
+                continue
+            if entry.get('type') not in ('user', 'assistant'):
+                continue
+            msg = entry.get('message', {})
+            role = msg.get('role', entry.get('type', ''))
+            content = msg.get('content', '')
+            if isinstance(content, list):
+                parts = [p.get('text', '') for p in content if isinstance(p, dict) and p.get('type') == 'text']
+                content = ' '.join(parts)
+            if role in ('user', 'assistant') and content.strip():
+                lines.append(f'{role}: {content.strip()}')
+except Exception:
+    pass
+
+text = '\n'.join(lines)
+print(text[-$MAX_INPUT_CHARS:])
+" 2>/dev/null || true)
+
+if [[ -z "$TRANSCRIPT" ]]; then
+    log "no transcript content in payload for cwd=$CWD; skipping"
+    exit 0
+fi
+
+if [[ ! -f "$DISTILL_PROMPT_FILE" ]]; then
+    log "extraction prompt not found at $DISTILL_PROMPT_FILE; skipping"
+    exit 0
+fi
+DISTILL_PROMPT=$(cat "$DISTILL_PROMPT_FILE")
+
+# Fork background extraction — never blocks the session.
+(
+    FULL_PROMPT="${DISTILL_PROMPT/\[transcript window\]/$TRANSCRIPT}"
+
+    EXTRACTED=""
+
+    if [[ -z "$EXTRACTED" ]] && command -v claude >/dev/null 2>&1; then
+        EXTRACTED=$(printf '%s' "$FULL_PROMPT" | claude -p 2>>"$ERR_LOG") || EXTRACTED=""
+    fi
+
+    if [[ -z "$EXTRACTED" ]]; then
+        log "all extractors failed for cwd=$CWD"
+        exit 0
+    fi
+
+    TRIMMED="$(printf '%s' "$EXTRACTED" | tr -d '[:space:]')"
+    if [[ "$TRIMMED" == "NONE" ]]; then
+        log "no decisions found for cwd=$CWD"
+        exit 0
+    fi
+
+    if [[ "${#EXTRACTED}" -gt "$MAX_OUTPUT_CHARS" ]]; then
+        EXTRACTED="${EXTRACTED:0:$MAX_OUTPUT_CHARS}"
+        log "truncated extraction to $MAX_OUTPUT_CHARS chars for cwd=$CWD"
+    fi
+
+    TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    # Append, never overwrite — this is the entire point of this hook vs dictate's.
+    {
+        printf '\n## %s\n\n' "$TIMESTAMP"
+        printf '%s\n' "$EXTRACTED"
+    } >> "$LOG_FILE"
+
+    log "appended decision(s) to $LOG_FILE for cwd=$CWD"
+) &
+
+exit 0
