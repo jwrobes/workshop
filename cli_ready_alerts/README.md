@@ -56,6 +56,7 @@ The `cra` CLI is the one-stop control surface:
 cra status             # show config, contexts, routing, overrides
 cra off                # disable alerts globally (persists across sessions)
 cra on                 # re-enable
+cra sounds on|off     # toggle only the sound channel
 cra mute <context>     # silence one context, keep others firing
 cra unmute <context>   # re-enable
 cra test done default  # fire the sound that WOULD play for event+context

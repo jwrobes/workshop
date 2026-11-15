@@ -13,7 +13,7 @@
 # All events include "cwd" except Stop/Notification — we fall back to $PWD for those.
 #
 # Event → sound mapping:
-#   done:     Stop, SubagentStop
+#   done:     Stop
 #   approval: Notification, PermissionRequest, Elicitation
 #   failed:   StopFailure
 #

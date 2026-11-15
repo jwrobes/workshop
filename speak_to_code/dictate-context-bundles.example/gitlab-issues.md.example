@@ -1,0 +1,24 @@
+---
+name: gitlab-issues
+generated_from: hand-written
+generated_at: 2026-06-02T00:00:00Z
+generator_model:
+hand_edited: true
+---
+
+# GitLab Issues Context
+
+## Voice
+- Write issue titles as imperative: "Fix X", "Add Y", "Remove Z"
+- Bug reports: describe observed behavior, expected behavior, reproduction steps
+- Feature requests: describe the user problem first, then the proposed solution
+
+## Vocabulary
+- MR — merge request (not PR)
+- ~backend, ~frontend, ~infra — common label slugs
+- /draft — GitLab quick action to mark an MR as draft
+- /assign @username — GitLab quick action to assign
+
+## Templates
+- Bug: Title / Steps to reproduce / Expected / Actual / Environment
+- Feature: Problem / Proposed solution / Acceptance criteria

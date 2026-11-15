@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# dictate-session-hook — Claude Code Stop event hook
+#
+# Registered as a Stop hook in ~/.claude/settings.json.
+# Reads JSON event payload from stdin, extracts transcript, distills to
+# ~/.config/dictate/sessions/<cwd-hash>.md via the claude CLI (fallback: llm CLI).
+#
+# Rules:
+#   - Never blocks: forks background process and exits immediately
+#   - Throttle: skips if session file was written within 120s
+#   - Always exits 0; errors go to ~/.config/dictate/sessions/.hook.log
+
+set -euo pipefail
+
+SESSIONS_DIR="$HOME/.config/dictate/sessions"
+LOG_FILE="$SESSIONS_DIR/.hook.log"
+DISTILL_PROMPT_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/prompts/session-distill.md"
+THROTTLE_SECONDS=120
+MAX_INPUT_CHARS=8000
+MAX_OUTPUT_CHARS=1500
+
+log() { printf '[dictate-session-hook] %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG_FILE" 2>/dev/null || true; }
+
+# Read stdin payload
+PAYLOAD=$(cat)
+
+# Extract cwd from payload; fallback to $PWD
+CWD=$(printf '%s' "$PAYLOAD" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get('cwd', ''))
+except Exception:
+    print('')
+" 2>/dev/null || true)
+[[ -z "$CWD" ]] && CWD="$PWD"
+
+# Compute session file path
+CWD_HASH=$(printf '%s' "$CWD" | shasum -a 256 | cut -c1-16)
+SESSION_FILE="$SESSIONS_DIR/${CWD_HASH}.md"
+
+mkdir -p "$SESSIONS_DIR"
+
+# Throttle check: skip if file exists and mtime < THROTTLE_SECONDS ago
+if [[ -f "$SESSION_FILE" ]]; then
+    FILE_AGE=$(( $(date +%s) - $(stat -f %m "$SESSION_FILE" 2>/dev/null || echo 0) ))
+    if [[ "$FILE_AGE" -lt "$THROTTLE_SECONDS" ]]; then
+        exit 0
+    fi
+fi
+
+# Extract transcript content via transcript_path from payload (Claude Code Stop event format)
+TRANSCRIPT=$(printf '%s' "$PAYLOAD" | python3 -c "
+import sys, json
+
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+
+transcript_path = d.get('transcript_path', '')
+if not transcript_path:
+    sys.exit(0)
+
+lines = []
+try:
+    with open(transcript_path) as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+            except Exception:
+                continue
+            if entry.get('type') not in ('user', 'assistant'):
+                continue
+            msg = entry.get('message', {})
+            role = msg.get('role', entry.get('type', ''))
+            content = msg.get('content', '')
+            if isinstance(content, list):
+                parts = [p.get('text', '') for p in content if isinstance(p, dict) and p.get('type') == 'text']
+                content = ' '.join(parts)
+            if role in ('user', 'assistant') and content.strip():
+                lines.append(f'{role}: {content.strip()}')
+except Exception:
+    pass
+
+text = '\n'.join(lines)
+print(text[:$MAX_INPUT_CHARS])
+" 2>/dev/null || true)
+
+# If no transcript content, bail gracefully
+if [[ -z "$TRANSCRIPT" ]]; then
+    log "no transcript content in payload for cwd=$CWD; skipping"
+    exit 0
+fi
+
+# Count turns for frontmatter
+TURN_COUNT=$(printf '%s' "$TRANSCRIPT" | grep -c '^user:' 2>/dev/null || echo 0)
+
+# Load distillation prompt
+if [[ ! -f "$DISTILL_PROMPT_FILE" ]]; then
+    log "distillation prompt not found at $DISTILL_PROMPT_FILE; skipping"
+    exit 0
+fi
+DISTILL_PROMPT=$(cat "$DISTILL_PROMPT_FILE")
+
+# Fork background distillation — never blocks the session
+(
+    # Replace placeholder in prompt with actual transcript
+    FULL_PROMPT="${DISTILL_PROMPT/\[last N turns, user + assistant text only, tool calls stripped\]/$TRANSCRIPT}"
+
+    DISTILLER=""
+    DISTILLED=""
+
+    if command -v claude >/dev/null 2>&1; then
+        DISTILLER="claude"
+        DISTILLED=$(printf '%s' "$FULL_PROMPT" | claude -p 2>>"$LOG_FILE") || DISTILLED=""
+    fi
+
+    if [[ -z "$DISTILLED" ]] && command -v llm >/dev/null 2>&1; then
+        DISTILLER="llm"
+        DISTILLED=$(printf '%s' "$FULL_PROMPT" | llm 2>>"$LOG_FILE") || DISTILLED=""
+    fi
+
+    if [[ -z "$DISTILLED" ]]; then
+        log "all distillers failed for cwd=$CWD"
+        exit 0
+    fi
+
+    # Post-hoc truncation: if body > MAX_OUTPUT_CHARS, truncate at last paragraph break
+    if [[ "${#DISTILLED}" -gt "$MAX_OUTPUT_CHARS" ]]; then
+        DISTILLED=$(printf '%s' "$DISTILLED" | awk -v max="$MAX_OUTPUT_CHARS" '
+            { lines[NR] = $0; total += length($0) + 1 }
+            END {
+                chars = 0
+                last_para = 0
+                for (i = 1; i <= NR; i++) {
+                    chars += length(lines[i]) + 1
+                    if (lines[i] == "") last_para = i
+                    if (chars > max) break
+                }
+                limit = (last_para > 0) ? last_para - 1 : i - 1
+                for (j = 1; j <= limit; j++) print lines[j]
+            }
+        ')
+        log "truncated distillation to last paragraph break for cwd=$CWD"
+    fi
+
+    UPDATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    # Write atomically via temp file
+    TMP_FILE=$(mktemp "${SESSION_FILE}.XXXX")
+    {
+        printf -- '---\n'
+        printf 'cwd: %s\n' "$CWD"
+        printf 'updated_at: %s\n' "$UPDATED_AT"
+        printf 'turns_summarized: %s\n' "$TURN_COUNT"
+        printf 'distiller: %s\n' "$DISTILLER"
+        printf -- '---\n\n'
+        printf '%s\n' "$DISTILLED"
+    } > "$TMP_FILE"
+    chmod 0600 "$TMP_FILE"
+    mv "$TMP_FILE" "$SESSION_FILE"
+
+    log "wrote $SESSION_FILE (${#DISTILLED} chars, distiller=$DISTILLER, cwd=$CWD)"
+) &
+
+exit 0

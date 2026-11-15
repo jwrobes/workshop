@@ -1,123 +1,714 @@
 #!/usr/bin/env bash
 # dictate: record -> transcribe -> llm cleanup -> pbcopy
-# Usage: dictate [--model whisper-model] [--backend llm|ollama] [context hint...]
+#
+# Usage: dictate [flags] [context hint...]
+#        dictate --meeting [--audio FILE] [--num-speakers N | --min-speakers N --max-speakers N] [--out FILE]
+#
+# Options (value flags accept both "--flag value" and "--flag=value"):
+#   --backend llm|claude|ollama    cleanup backend (default llm)
+#   --model MODEL                  mlx-community whisper model (default whisper-small.en-mlx)
+#   --ollama-model MODEL           ollama model for --backend ollama (default llama3.2)
+#   --raw                          skip LLM cleanup, copy the raw transcript
+#   --context NAMES                load comma-separated context bundle(s), e.g. myproject,slack
+#   --session                      include distilled session context for the current dir
+#   --no-session                   disable session context
+#   --session-cwd DIR              use DIR instead of $PWD for session lookup
+#   --show-context                 dry-run: print the assembled cleanup prompt, then exit
+#   --list-contexts                list installed context bundles, then exit
+#   --generate-context NAME        generate a context bundle (with --from PATH [--force])
+#   --gc-sessions                  remove session files older than 24h, then exit
+#   --gc-recordings                remove saved recordings older than 15 days, then exit
+#   --meeting                      diarize + attribute speakers (meeting mode)
+#   --clean                        meeting mode: LLM-polish the attributed transcript
+#   --audio FILE                   attribute an existing recording (skip live recording)
+#   --num-speakers N               hint the exact speaker count to diarization
+#   --min-speakers N               lower bound on speakers (for 5-7 person meetings)
+#   --max-speakers N               upper bound on speakers (for 5-7 person meetings)
+#   --out FILE                     also write the final transcript to FILE
+#   --to-sharpen                   deliver the transcript into the paired sharpen session's tmux
+#                                  pane and submit it (light cleanup). Never writes the clipboard:
+#                                  on failure it exits 3 and `sharpen resend` retries the saved
+#                                  transcript. See ../sharpen_prompt/README.md
+#   --refine                       with --to-sharpen: send as a refinement of the current draft
+#   --from-pane %ID                with --to-sharpen: pick the pair from this tmux pane
+#   --pair NAME                    with --to-sharpen: pick the pair by name
+#   -h, --help                     show this help
 #
 # Backends:
-#   llm      — Simon Willison's llm CLI (pip install llm; llm keys set openai)
-#   ollama   — ollama run directly (offline / no API key; no extra deps)
+#   llm      — Simon Willison's llm CLI (default; pip install llm; llm keys set openai)
+#   claude   — claude -p (uses your logged-in Claude Code; no extra key)
+#   ollama   — ollama run directly (fully local; offline; no API key)
+#
+# Meeting mode (--meeting): diarize a multi-speaker recording on-device (pyannote)
+# and emit a speaker-attributed transcript instead of a single cleaned prompt.
+# Install the deps with: bash setup.sh --meeting-deps
+# Every recording (single-voice and meeting) is saved to DICTATE_RECORDINGS_DIR
+# and never auto-deleted, so a forgotten --meeting can be recovered later via
+# --audio. Prune old ones with 'dictate --gc-recordings'. Audio never leaves the
+# machine; only --clean sends the text transcript to the LLM (labels preserved).
 #
 # Examples:
 #   dictate                                 # record, transcribe, clean via llm, copy
+#   dictate --context myproject             # load a vocabulary bundle
+#   dictate --context myproject,slack       # load multiple bundles in order
+#   dictate --session                       # include distilled session context for $PWD
+#   dictate --show-context --context myproject    # dry-run: print assembled prompt, no recording
+#   dictate --list-contexts                 # list installed context bundles
+#   dictate --generate-context myproject --from ~/workspace/myproject/docs   # generate a bundle
+#   dictate --gc-sessions                   # remove session files older than 24h
 #   dictate --backend ollama                # fully local cleanup
-#   dictate --model whisper-small.en        # use a larger whisper model
 #   dictate --raw                           # skip LLM cleanup, copy raw transcript
-#   dictate write a cursor cli prompt       # context hint for the cleanup LLM
+#   dictate --meeting                       # record a meeting, attribute speakers, relabel
+#   dictate --meeting --audio call.wav      # attribute an existing recording
+#   dictate --meeting --clean               # attribute, then LLM-polish (labels preserved)
+#   dictate --meeting --num-speakers 3 --out notes.md
+#   dictate --meeting --min-speakers 5 --max-speakers 7   # larger meeting, unsure of exact count
+#   dictate --meeting --audio ~/.config/dictate/recordings/dictate-<ts>.wav  # re-attribute a saved recording
+#   dictate --gc-recordings                 # prune recordings older than 15 days
+#
+# Recording / meeting env overrides:
+#   DICTATE_DIARIZE_VENV         (default ~/.local/share/dictate-diarize/.venv)
+#   DICTATE_DIARIZE_DEVICE       mps|cpu (default mps; auto-falls back to cpu)
+#   DICTATE_RECORDINGS_DIR       where all recordings are saved
+#                                (default ~/.config/dictate/recordings)
+#   DICTATE_RECORDINGS_TTL_DAYS  reminder + --gc-recordings age threshold (default 15)
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$_SOURCE" ]]; do
+    _DIR="$(cd -P "$(dirname "$_SOURCE")" && pwd)"
+    _SOURCE="$(readlink "$_SOURCE")"
+    [[ "$_SOURCE" != /* ]] && _SOURCE="$_DIR/$_SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_SOURCE")" && pwd)"
+unset _SOURCE _DIR
+
 WHISPER_MODEL="mlx-community/whisper-small.en-mlx"
 LLM_BACKEND="llm"
 OLLAMA_MODEL="llama3.2"
 RAW_MODE=false
-CONTEXT=""
 
+CONTEXT_BUNDLES=""        # comma-separated bundle names (--context)
+LIST_CONTEXTS=false
+SHOW_CONTEXT=false
+GENERATE_CONTEXT_NAME=""  # --generate-context <name>
+GENERATE_FROM=""          # --from <path>
+GENERATE_FORCE=false
+
+SESSION_MODE=false
+SESSION_CWD="$PWD"
+GC_SESSIONS=false
+GC_RECORDINGS=false
+
+HINT=""                   # positional context hint
+
+# Meeting mode (on-device speaker diarization)
+MEETING_MODE=false
+CLEAN_MEETING=false
+AUDIO_FILE=""
+OUT_FILE=""
+NUM_SPEAKERS=""
+MIN_SPEAKERS=""
+MAX_SPEAKERS=""
+
+# Sharpen loop (--to-sharpen): hand the transcript to the sharpen CLI instead of pbcopy
+TO_SHARPEN=false
+SHARPEN_REFINE=false
+SHARPEN_FROM_PANE=""
+SHARPEN_PAIR_NAME=""
+DIARIZE_VENV="${DICTATE_DIARIZE_VENV:-$HOME/.local/share/dictate-diarize/.venv}"
+DIARIZE_DEVICE="${DICTATE_DIARIZE_DEVICE:-mps}"
+
+CONTEXT_DIR="$HOME/.config/dictate"
+CONTEXTS_DIR="$CONTEXT_DIR/contexts"
+SESSIONS_DIR="$CONTEXT_DIR/sessions"
+CONTEXT_FILE="${DICTATE_CONTEXT_FILE:-$CONTEXT_DIR/context.md}"
+# All recordings (single-voice and meeting) are saved here so a forgotten
+# --meeting can be recovered later with: dictate --meeting --audio <file>
+RECORDINGS_DIR="${DICTATE_RECORDINGS_DIR:-$CONTEXT_DIR/recordings}"
+RECORDINGS_TTL_DAYS="${DICTATE_RECORDINGS_TTL_DAYS:-15}"
+
+BUDGET_CAP=6500
+
+# ── Arg parsing ──────────────────────────────────────────────────────────────
+# Value flags accept both "--flag value" and "--flag=value". Unknown --flags are
+# rejected (rather than silently swallowed into the context hint).
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --model)   WHISPER_MODEL="$2"; shift 2 ;;
-        --backend) LLM_BACKEND="$2"; shift 2 ;;
-        --ollama-model) OLLAMA_MODEL="$2"; shift 2 ;;
-        --raw)     RAW_MODE=true; shift ;;
+        --model)              WHISPER_MODEL="$2"; shift 2 ;;
+        --model=*)            WHISPER_MODEL="${1#*=}"; shift ;;
+        --backend)            LLM_BACKEND="$2"; shift 2 ;;
+        --backend=*)          LLM_BACKEND="${1#*=}"; shift ;;
+        --ollama-model)       OLLAMA_MODEL="$2"; shift 2 ;;
+        --ollama-model=*)     OLLAMA_MODEL="${1#*=}"; shift ;;
+        --raw)                RAW_MODE=true; shift ;;
+        --context)            CONTEXT_BUNDLES="$2"; shift 2 ;;
+        --context=*)          CONTEXT_BUNDLES="${1#*=}"; shift ;;
+        --list-contexts)      LIST_CONTEXTS=true; shift ;;
+        --show-context)       SHOW_CONTEXT=true; shift ;;
+        --generate-context)   GENERATE_CONTEXT_NAME="$2"; shift 2 ;;
+        --generate-context=*) GENERATE_CONTEXT_NAME="${1#*=}"; shift ;;
+        --from)               GENERATE_FROM="$2"; shift 2 ;;
+        --from=*)             GENERATE_FROM="${1#*=}"; shift ;;
+        --force)              GENERATE_FORCE=true; shift ;;
+        --session)            SESSION_MODE=true; shift ;;
+        --no-session)         SESSION_MODE=false; shift ;;
+        --session-cwd)        SESSION_CWD="$2"; shift 2 ;;
+        --session-cwd=*)      SESSION_CWD="${1#*=}"; shift ;;
+        --gc-sessions)        GC_SESSIONS=true; shift ;;
+        --gc-recordings)      GC_RECORDINGS=true; shift ;;
+        --meeting|--diarize)  MEETING_MODE=true; shift ;;
+        --clean)              CLEAN_MEETING=true; shift ;;
+        --audio)              AUDIO_FILE="$2"; shift 2 ;;
+        --audio=*)            AUDIO_FILE="${1#*=}"; shift ;;
+        --out)                OUT_FILE="$2"; shift 2 ;;
+        --out=*)              OUT_FILE="${1#*=}"; shift ;;
+        --num-speakers)       NUM_SPEAKERS="$2"; shift 2 ;;
+        --num-speakers=*)     NUM_SPEAKERS="${1#*=}"; shift ;;
+        --min-speakers)       MIN_SPEAKERS="$2"; shift 2 ;;
+        --min-speakers=*)     MIN_SPEAKERS="${1#*=}"; shift ;;
+        --max-speakers)       MAX_SPEAKERS="$2"; shift 2 ;;
+        --max-speakers=*)     MAX_SPEAKERS="${1#*=}"; shift ;;
+        --to-sharpen)         TO_SHARPEN=true; shift ;;
+        --refine)             SHARPEN_REFINE=true; shift ;;
+        --from-pane)          SHARPEN_FROM_PANE="$2"; shift 2 ;;
+        --from-pane=*)        SHARPEN_FROM_PANE="${1#*=}"; shift ;;
+        --pair)               SHARPEN_PAIR_NAME="$2"; shift 2 ;;
+        --pair=*)             SHARPEN_PAIR_NAME="${1#*=}"; shift ;;
         -h|--help)
             sed -n '2,/^$/s/^# //p' "$0"
             exit 0
             ;;
-        *)         CONTEXT="$CONTEXT $1"; shift ;;
+        --*)  echo "Unknown option: $1" >&2; echo "Run 'dictate --help' for usage." >&2; exit 2 ;;
+        *)    HINT="$HINT $1"; shift ;;
     esac
 done
-CONTEXT="${CONTEXT# }"
-
-TMP_DIR=$(mktemp -d /tmp/dictate_XXXX)
-TMP_AUDIO="$TMP_DIR/recording.wav"
-TMP_TRANSCRIPT="$TMP_DIR/recording.txt"
-
-cleanup() { rm -rf "$TMP_DIR"; }
-trap cleanup EXIT
+HINT="${HINT# }"
 
 step_time() { date +%s; }
 
-SYSTEM_PROMPT="Clean up this voice transcription for use as a developer prompt or message. \
-Fix grammar, remove filler words (um, uh, like, you know), make it concise and clear. \
-Preserve technical terms, code references, and variable names exactly as spoken. \
-Return only the cleaned text with no commentary."
+# ── Helper: strip frontmatter ────────────────────────────────────────────────
+strip_frontmatter() {
+    # Removes leading --- ... --- block from stdin
+    awk '
+        BEGIN { in_fm=0; done=0 }
+        done { print; next }
+        NR==1 && /^---/ { in_fm=1; next }
+        in_fm && /^---/ { in_fm=0; done=1; next }
+        in_fm { next }
+        { print }
+    '
+}
 
-# --- Step 1: Record ---
-echo "Recording... (Ctrl-C to stop)"
-START=$(step_time)
+# ── Helper: read frontmatter field ──────────────────────────────────────────
+get_frontmatter_field() {
+    local file="$1" field="$2"
+    awk -v field="$field" '
+        /^---/ { count++; next }
+        count==1 && $0 ~ "^" field ":" {
+            sub("^" field ": *", ""); print; exit
+        }
+        count>=2 { exit }
+    ' "$file"
+}
 
-trap '' INT
-rec -q -c 1 "$TMP_AUDIO" || true
-trap - INT
+# ── Helper: dispatch an LLM cleanup call (used by meeting --clean) ────────────
+# $1 = system prompt; text on stdin. A large token cap accommodates long transcripts.
+llm_clean() {
+    local sys="$1" input
+    input=$(cat)
+    case "$LLM_BACKEND" in
+        llm)     printf '%s' "$input" | llm -s "$sys" ;;
+        claude)  printf '%s\n\n%s' "$sys" "$input" | claude -p ;;
+        ollama)  ollama run "$OLLAMA_MODEL" "$(printf '%s\n\n%s' "$sys" "$input")" ;;
+        *)       echo "Unknown backend: $LLM_BACKEND (use llm, claude, or ollama)" >&2; return 1 ;;
+    esac
+}
 
-DURATION=$(( $(step_time) - START ))
-echo "Recorded ${DURATION}s of audio."
+# ── Helper: remind about recordings older than the TTL (safety-net nudge) ─────
+remind_old_recordings() {
+    [[ -d "$RECORDINGS_DIR" ]] || return 0
+    local old
+    old=$(find "$RECORDINGS_DIR" -maxdepth 1 -name '*.wav' -mtime "+${RECORDINGS_TTL_DAYS}" 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$old" -gt 0 ]]; then
+        echo "Reminder: $old recording(s) older than ${RECORDINGS_TTL_DAYS} days in $RECORDINGS_DIR."
+        echo "  Prune them with: dictate --gc-recordings"
+    fi
+}
 
-if [[ ! -s "$TMP_AUDIO" ]]; then
-    echo "No audio captured. Exiting."
-    exit 1
+# ── GC sessions ──────────────────────────────────────────────────────────────
+if $GC_SESSIONS; then
+    if [[ ! -d "$SESSIONS_DIR" ]]; then
+        echo "No sessions directory at $SESSIONS_DIR."
+        exit 0
+    fi
+    removed=0
+    now=$(date +%s)
+    while IFS= read -r -d '' f; do
+        age=$(( now - $(stat -f %m "$f" 2>/dev/null || echo "$now") ))
+        if [[ "$age" -gt 86400 ]]; then
+            echo "Removing stale session: $f (age: $(( age / 3600 ))h)"
+            rm -f "$f"
+            (( removed++ )) || true
+        fi
+    done < <(find "$SESSIONS_DIR" -maxdepth 1 -name '*.md' -print0 2>/dev/null)
+    echo "GC complete. Removed $removed file(s)."
+    exit 0
 fi
 
-# --- Step 2: Transcribe ---
-echo "Transcribing..."
-START=$(step_time)
-
-mlx_whisper "$TMP_AUDIO" \
-    --model "$WHISPER_MODEL" \
-    --output-format txt \
-    --output-dir "$TMP_DIR" \
-    2>/dev/null
-
-if [[ ! -s "$TMP_TRANSCRIPT" ]]; then
-    echo "Transcription failed or produced empty output."
-    exit 1
+# ── GC recordings ─────────────────────────────────────────────────────────────
+if $GC_RECORDINGS; then
+    if [[ ! -d "$RECORDINGS_DIR" ]]; then
+        echo "No recordings directory at $RECORDINGS_DIR."
+        exit 0
+    fi
+    removed=0
+    now=$(date +%s)
+    ttl_secs=$(( RECORDINGS_TTL_DAYS * 86400 ))
+    while IFS= read -r -d '' f; do
+        age=$(( now - $(stat -f %m "$f" 2>/dev/null || echo "$now") ))
+        if [[ "$age" -gt "$ttl_secs" ]]; then
+            echo "Removing recording: $f (age: $(( age / 86400 ))d)"
+            rm -f "$f"
+            (( removed++ )) || true
+        fi
+    done < <(find "$RECORDINGS_DIR" -maxdepth 1 -name '*.wav' -print0 2>/dev/null)
+    echo "GC complete. Removed $removed recording(s) older than ${RECORDINGS_TTL_DAYS}d."
+    exit 0
 fi
 
-RAW=$(cat "$TMP_TRANSCRIPT")
-DURATION=$(( $(step_time) - START ))
-echo "Transcribed in ${DURATION}s. (${#RAW} chars)"
+# ── List contexts ─────────────────────────────────────────────────────────────
+if $LIST_CONTEXTS; then
+    if [[ ! -d "$CONTEXTS_DIR" ]]; then
+        echo "No contexts installed. ($CONTEXTS_DIR does not exist)"
+        exit 0
+    fi
+    found=0
+    now=$(date +%s)
+    while IFS= read -r -d '' f; do
+        name=$(basename "$f" .md)
+        chars=$(wc -c < "$f" | tr -d ' ')
+        generated_from=$(get_frontmatter_field "$f" "generated_from")
+        generated_at=$(get_frontmatter_field  "$f" "generated_at")
+        [[ -z "$generated_from" ]] && generated_from="hand-written"
+        stale_tag=""
+        if [[ -n "$generated_at" ]]; then
+            gen_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$generated_at" +%s 2>/dev/null || echo 0)
+            age_days=$(( (now - gen_epoch) / 86400 ))
+            [[ "$age_days" -gt 30 ]] && stale_tag=" [stale: ${age_days}d]"
+        fi
+        printf '  %-20s  %5s chars  from: %s  generated: %s%s\n' \
+            "$name" "$chars" "$generated_from" "${generated_at:-unknown}" "$stale_tag"
+        (( found++ )) || true
+    done < <(find "$CONTEXTS_DIR" -maxdepth 1 -name '*.md' -print0 2>/dev/null | sort -z)
+    [[ "$found" -eq 0 ]] && echo "No contexts installed. (directory is empty)"
+    exit 0
+fi
 
-# --- Step 3: LLM Cleanup ---
-if $RAW_MODE; then
-    FINAL="$RAW"
-else
-    echo "Cleaning up via $LLM_BACKEND..."
-    START=$(step_time)
+# ── Generate context bundle ───────────────────────────────────────────────────
+if [[ -n "$GENERATE_CONTEXT_NAME" ]]; then
+    # Delegate to dedicated script if available
+    GENERATOR="$SCRIPT_DIR/bin/dictate-generate-context"
+    if [[ -x "$GENERATOR" ]]; then
+        args=("$GENERATE_CONTEXT_NAME")
+        [[ -n "$GENERATE_FROM" ]] && args+=(--from "$GENERATE_FROM")
+        $GENERATE_FORCE && args+=(--force)
+        exec "$GENERATOR" "${args[@]}"
+    else
+        echo "Error: $GENERATOR not found." >&2
+        exit 1
+    fi
+fi
 
-    PROMPT="$SYSTEM_PROMPT"
-    if [[ -n "$CONTEXT" ]]; then
-        PROMPT="$PROMPT Context for this dictation: $CONTEXT"
+# ══ Meeting mode: diarize + attribute speakers ════════════════════════════════
+if $MEETING_MODE; then
+    TMP_DIR=$(mktemp -d /tmp/dictate_XXXX)
+    cleanup() { rm -rf "$TMP_DIR"; }
+    trap cleanup EXIT
+
+    # ── Step 1: Acquire audio ──
+    if [[ -n "$AUDIO_FILE" ]]; then
+        [[ -f "$AUDIO_FILE" ]] || { echo "Audio file not found: $AUDIO_FILE"; exit 1; }
+        SOURCE_AUDIO="$AUDIO_FILE"
+        echo "Using existing audio: $SOURCE_AUDIO"
+    else
+        # Recordings are preserved (never auto-deleted; prune via --gc-recordings).
+        mkdir -p "$RECORDINGS_DIR"
+        SOURCE_AUDIO="$RECORDINGS_DIR/meeting-$(date +%Y%m%d-%H%M%S).wav"
+
+        echo "Recording... (Ctrl-C to stop)"
+        START=$(step_time)
+        trap '' INT
+        rec -q -c 1 "$SOURCE_AUDIO" || true
+        trap - INT
+        DURATION=$(( $(step_time) - START ))
+        echo "Recorded ${DURATION}s of audio."
+
+        if [[ ! -s "$SOURCE_AUDIO" ]]; then
+            echo "No audio captured. Exiting."
+            exit 1
+        fi
+        echo "Recording saved: $SOURCE_AUDIO"
     fi
 
-    case "$LLM_BACKEND" in
-        llm)
-            FINAL=$(echo "$RAW" | llm -s "$PROMPT")
-            ;;
-        ollama)
-            FINAL=$(ollama run "$OLLAMA_MODEL" "$(printf '%s\n\n%s' "$PROMPT" "$RAW")")
-            ;;
-        *)
-            echo "Unknown backend: $LLM_BACKEND (use llm or ollama)"
-            exit 1
-            ;;
-    esac
+    # ── Step 2: Transcribe (JSON segments for alignment) ──
+    echo "Transcribing..."
+    START=$(step_time)
+    BASE=$(basename "$SOURCE_AUDIO"); BASE="${BASE%.*}"
+    mlx_whisper "$SOURCE_AUDIO" \
+        --model "$WHISPER_MODEL" \
+        --output-format json \
+        --output-dir "$TMP_DIR" \
+        2>/dev/null
+    WH_JSON="$TMP_DIR/$BASE.json"
+    if [[ ! -s "$WH_JSON" ]]; then
+        echo "Transcription failed (no JSON segments)."
+        exit 1
+    fi
+    echo "Transcribed in $(( $(step_time) - START ))s."
 
+    # ── Step 3: Diarize on-device, then merge with the transcript ──
+    DIARIZE_PY="$DIARIZE_VENV/bin/python"
+    if [[ ! -x "$DIARIZE_PY" ]]; then
+        echo "Meeting mode needs the diarization deps venv (not found at $DIARIZE_PY)."
+        echo "Install it: bash $SCRIPT_DIR/setup.sh --meeting-deps"
+        exit 1
+    fi
+
+    echo "Diarizing on $DIARIZE_DEVICE..."
+    START=$(step_time)
+    NS_ARG=""
+    [[ -n "$NUM_SPEAKERS" ]] && NS_ARG="--num-speakers $NUM_SPEAKERS"
+    [[ -n "$MIN_SPEAKERS" ]] && NS_ARG="$NS_ARG --min-speakers $MIN_SPEAKERS"
+    [[ -n "$MAX_SPEAKERS" ]] && NS_ARG="$NS_ARG --max-speakers $MAX_SPEAKERS"
+    # shellcheck disable=SC2086  # NS_ARG is a controlled numeric flag, intentional split
+    if ! "$DIARIZE_PY" "$SCRIPT_DIR/diarize.py" "$SOURCE_AUDIO" --device "$DIARIZE_DEVICE" $NS_ARG > "$TMP_DIR/turns.json"; then
+        echo "Diarization failed. See the error above (model terms / hf auth login?)."
+        exit 1
+    fi
+    echo "Diarized in $(( $(step_time) - START ))s."
+
+    python3 "$SCRIPT_DIR/merge.py" "$WH_JSON" "$TMP_DIR/turns.json" > "$TMP_DIR/attributed.txt"
+
+    # Interactive relabel: map SPEAKER_NN -> real names (TTY only; skip when piped).
+    LABELS=$(grep -oE '^SPEAKER_[0-9]+' "$TMP_DIR/attributed.txt" | sort -u || true)
+    if [[ -t 0 && -n "$LABELS" ]]; then
+        echo "Detected speakers: $(echo "$LABELS" | tr '\n' ' ')"
+        echo "Enter a name for each (blank keeps the label):"
+        while IFS= read -r label; do
+            [[ -z "$label" ]] && continue
+            printf '  %s = ' "$label" > /dev/tty
+            read -r name < /dev/tty || name=""
+            [[ -n "$name" ]] && sed -i '' "s/^${label}:/${name}:/" "$TMP_DIR/attributed.txt"
+        done <<< "$LABELS"
+    elif [[ -n "$LABELS" ]]; then
+        echo "(non-interactive: keeping anonymous speaker labels)"
+    fi
+
+    FINAL=$(cat "$TMP_DIR/attributed.txt")
+
+    # ── Optional --clean: polish the attributed transcript, preserving structure ──
+    if $CLEAN_MEETING; then
+        echo "Cleaning attributed transcript via $LLM_BACKEND..."
+        START=$(step_time)
+        MEETING_PROMPT="You are cleaning up a speaker-attributed meeting transcript. \
+Each block begins with a speaker label followed by a colon (e.g. 'Jon:' or 'SPEAKER_00:'). \
+Rules: keep every speaker label exactly as written; preserve the order and boundaries of turns; \
+do NOT merge turns, move text between speakers, or add or drop speakers. Within each turn, fix \
+grammar, remove filler words (um, uh, like, you know), and correct obvious transcription errors, \
+but stay faithful to the meaning. Preserve technical terms, code references, names, and numbers \
+exactly. Return only the cleaned attributed transcript, no commentary."
+        if [[ -f "$CONTEXT_FILE" ]]; then
+            MEETING_PROMPT="$MEETING_PROMPT"$'\n\nVocabulary and context to respect:\n'"$(cat "$CONTEXT_FILE")"
+        fi
+        if [[ -n "$HINT" ]]; then
+            MEETING_PROMPT="$MEETING_PROMPT"$'\n\nContext for this meeting: '"$HINT"
+        fi
+        if CLEANED=$(printf '%s' "$FINAL" | llm_clean "$MEETING_PROMPT") && [[ -n "$CLEANED" ]]; then
+            FINAL="$CLEANED"
+            echo "Cleaned in $(( $(step_time) - START ))s."
+        else
+            echo "Cleanup failed — keeping the raw attributed transcript."
+        fi
+    fi
+
+# ══ Single-voice mode: context-aware cleanup ══════════════════════════════════
+else
+    # ── Load context.md ──
+    CONTEXT_MD_CONTENT=""
+    if [[ -f "$CONTEXT_FILE" ]]; then
+        CONTEXT_MD_CONTENT=$(cat "$CONTEXT_FILE")
+    fi
+
+    # ── Load context bundles ──
+    BUNDLE_CONTENT=""
+    BUNDLE_NAMES_LOADED=()
+    BUNDLE_MTIMES=()
+
+    load_contexts() {
+        local names_csv="$1"
+        IFS=',' read -ra names <<< "$names_csv"
+        for name in "${names[@]}"; do
+            name="${name// /}"
+            if [[ ! "$name" =~ ^[a-z0-9-]+$ ]]; then
+                echo "Error: invalid context name '$name' (must match [a-z0-9-]+)" >&2
+                exit 1
+            fi
+            local bundle_file="$CONTEXTS_DIR/${name}.md"
+            if [[ ! -f "$bundle_file" ]]; then
+                echo "Error: context bundle '$name' not found at $bundle_file" >&2
+                exit 1
+            fi
+            local content
+            content=$(strip_frontmatter < "$bundle_file")
+            BUNDLE_CONTENT="${BUNDLE_CONTENT}${content}"$'\n'
+            BUNDLE_NAMES_LOADED+=("$name")
+            BUNDLE_MTIMES+=("$(stat -f %m "$bundle_file" 2>/dev/null || echo 0)")
+
+            # Hand-edit detection: if mtime > generated_at and hand_edited: false, flip the flag
+            local hand_edited generated_at
+            hand_edited=$(get_frontmatter_field "$bundle_file" "hand_edited")
+            generated_at=$(get_frontmatter_field "$bundle_file" "generated_at")
+            if [[ "$hand_edited" == "false" && -n "$generated_at" ]]; then
+                local gen_epoch mtime
+                gen_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$generated_at" +%s 2>/dev/null || echo 0)
+                mtime=$(stat -f %m "$bundle_file" 2>/dev/null || echo 0)
+                if [[ "$mtime" -gt "$gen_epoch" ]]; then
+                    sed -i '' 's/^hand_edited: false$/hand_edited: true/' "$bundle_file"
+                fi
+            fi
+        done
+    }
+
+    if [[ -n "$CONTEXT_BUNDLES" ]]; then
+        load_contexts "$CONTEXT_BUNDLES"
+    fi
+
+    # ── Load session context ──
+    SESSION_CONTENT=""
+    SESSION_LABEL=""
+
+    if $SESSION_MODE; then
+        SESSION_HASH=$(printf '%s' "$SESSION_CWD" | shasum -a 256 | cut -c1-16)
+        SESSION_FILE="$SESSIONS_DIR/${SESSION_HASH}.md"
+        if [[ -f "$SESSION_FILE" ]]; then
+            SESSION_CONTENT=$(strip_frontmatter < "$SESSION_FILE")
+            UPDATED_AT=$(get_frontmatter_field "$SESSION_FILE" "updated_at")
+            SESSION_CHARS="${#SESSION_CONTENT}"
+
+            age_secs=0
+            if [[ -n "$UPDATED_AT" ]]; then
+                epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$UPDATED_AT" +%s 2>/dev/null || echo 0)
+                age_secs=$(( $(date +%s) - epoch ))
+            fi
+            age_min=$(( age_secs / 60 ))
+
+            SESSION_LABEL="${SESSION_CHARS} chars, updated ${age_min}m ago"
+            if [[ "$age_secs" -gt 1800 ]]; then
+                echo "Warning: session context is stale (${age_min}m old). Still including." >&2
+            fi
+        else
+            echo "Session context: none for this cwd ($SESSION_CWD)."
+            SESSION_MODE=false
+        fi
+    fi
+
+    # ── Budget enforcement (sources 1–3 counted; raw transcript excluded) ──
+    ctx_chars="${#CONTEXT_MD_CONTENT}"
+    bundle_chars="${#BUNDLE_CONTENT}"
+    session_chars="${#SESSION_CONTENT}"
+    total_chars=$(( ctx_chars + bundle_chars + session_chars ))
+
+    SESSION_DROPPED=false
+    BUNDLES_DROPPED=()
+
+    if [[ "$total_chars" -gt "$BUDGET_CAP" ]]; then
+        # Drop session first
+        if $SESSION_MODE && [[ "$session_chars" -gt 0 ]]; then
+            over_by=$(( total_chars - BUDGET_CAP ))
+            echo "Context: session dropped — would have added ${session_chars} chars (over by ${over_by})." >&2
+            SESSION_CONTENT=""
+            SESSION_MODE=false
+            SESSION_DROPPED=true
+            total_chars=$(( ctx_chars + bundle_chars ))
+        fi
+
+        # Drop bundles oldest-first if still over
+        if [[ "$total_chars" -gt "$BUDGET_CAP" ]] && [[ "${#BUNDLE_NAMES_LOADED[@]}" -gt 0 ]]; then
+            for idx in "${!BUNDLE_NAMES_LOADED[@]}"; do
+                if [[ "$total_chars" -le "$BUDGET_CAP" ]]; then break; fi
+                drop_name="${BUNDLE_NAMES_LOADED[$idx]}"
+                drop_file="$CONTEXTS_DIR/${drop_name}.md"
+                drop_content=$(strip_frontmatter < "$drop_file")
+                drop_chars="${#drop_content}"
+                BUNDLE_CONTENT="${BUNDLE_CONTENT//$drop_content/}"
+                BUNDLES_DROPPED+=("$drop_name")
+                bundle_chars=$(( bundle_chars - drop_chars ))
+                total_chars=$(( ctx_chars + bundle_chars ))
+                echo "Context: bundle '$drop_name' dropped (over budget)." >&2
+            done
+        fi
+
+        # context.md is never dropped — warn if it alone exceeds cap
+        if [[ "$ctx_chars" -gt "$BUDGET_CAP" ]]; then
+            echo "Warning: context.md alone (${ctx_chars} chars) exceeds cap. Proceeding anyway." >&2
+        fi
+    fi
+
+    # ── Visibility line ──
+    vis_sources="context.md"
+    if [[ "${#BUNDLE_NAMES_LOADED[@]}" -gt 0 ]]; then
+        for n in "${BUNDLE_NAMES_LOADED[@]}"; do
+            dropped=false
+            if [[ "${#BUNDLES_DROPPED[@]}" -gt 0 ]]; then
+                for d in "${BUNDLES_DROPPED[@]}"; do [[ "$d" == "$n" ]] && dropped=true; done
+            fi
+            $dropped || vis_sources="${vis_sources} + ${n}"
+        done
+    fi
+    $SESSION_MODE && [[ -n "$SESSION_CONTENT" ]] && vis_sources="${vis_sources} + session"
+
+    total_loaded=$(( ${#CONTEXT_MD_CONTENT} + ${#BUNDLE_CONTENT} + ${#SESSION_CONTENT} ))
+    if [[ "$total_loaded" -le "$BUDGET_CAP" ]]; then
+        budget_status="Within budget."
+    else
+        budget_status="Over budget (${total_loaded} chars)."
+    fi
+    echo "Context: ${total_loaded} chars (${vis_sources}). ${budget_status}"
+    $SESSION_MODE && [[ -n "$SESSION_LABEL" ]] && echo "Session context: ${SESSION_LABEL}."
+
+    # ── Assemble full prompt ──
+    SYSTEM_PROMPT="Clean up this voice transcription for use as a developer prompt or message. \
+Fix grammar, remove filler words (um, uh, like, you know), make it concise and clear. \
+Preserve technical terms, code references, and variable names exactly as spoken. \
+Return ONLY the cleaned text. Do not add questions, suggestions, commentary, or any text that was not in the original. Stop after the last sentence of the transcription."
+
+    # The sharpen session restructures the draft itself, and its prompt log tracks my drafting
+    # habits, so only fix transcription noise here rather than polishing.
+    if $TO_SHARPEN; then
+        SYSTEM_PROMPT="Lightly clean up this voice transcription. It is a rough draft that another \
+tool will restructure, so keep my wording, order, and structure. Only fix misheard words, \
+punctuation, and capitalization, and remove filler words (um, uh, like, you know) and false starts. \
+Do not merge, reorder, or summarize sentences, and do not resolve ambiguity or fix hedging. \
+Preserve technical terms, code references, and variable names exactly as spoken. \
+Return ONLY the cleaned text, with no commentary. Stop after the last sentence of the transcription."
+    fi
+
+    assemble_prompt() {
+        local prompt="$SYSTEM_PROMPT"
+        [[ -n "$CONTEXT_MD_CONTENT" ]] && prompt="${prompt}"$'\n\n'"${CONTEXT_MD_CONTENT}"
+        [[ -n "$BUNDLE_CONTENT" ]]     && prompt="${prompt}"$'\n\n'"${BUNDLE_CONTENT}"
+        [[ -n "$SESSION_CONTENT" ]]    && prompt="${prompt}"$'\n\n'"${SESSION_CONTENT}"
+        [[ -n "$HINT" ]]               && prompt="${prompt}"$'\n\n'"Context for this dictation: ${HINT}"
+        printf '%s' "$prompt"
+    }
+
+    # ── --show-context dry run ──
+    if $SHOW_CONTEXT; then
+        assemble_prompt
+        exit 0
+    fi
+
+    # ── Temp dir (transcript scratch; audio is saved persistently below) ──
+    TMP_DIR=$(mktemp -d /tmp/dictate_XXXX)
+    cleanup() { rm -rf "$TMP_DIR"; }
+    trap cleanup EXIT
+
+    # ── Step 1: Record (saved to RECORDINGS_DIR so a forgotten --meeting is recoverable) ──
+    mkdir -p "$RECORDINGS_DIR"
+    SOURCE_AUDIO="$RECORDINGS_DIR/dictate-$(date +%Y%m%d-%H%M%S).wav"
+    echo "Recording... (Ctrl-C to stop)"
+    START=$(step_time)
+    trap '' INT
+    rec -q -c 1 "$SOURCE_AUDIO" || true
+    trap - INT
     DURATION=$(( $(step_time) - START ))
-    echo "Cleaned in ${DURATION}s."
+    echo "Recorded ${DURATION}s of audio."
+
+    if [[ ! -s "$SOURCE_AUDIO" ]]; then
+        echo "No audio captured. Exiting."
+        rm -f "$SOURCE_AUDIO"
+        exit 1
+    fi
+    echo "Recording saved: $SOURCE_AUDIO"
+
+    # ── Step 2: Transcribe ──
+    echo "Transcribing..."
+    START=$(step_time)
+    BASE=$(basename "$SOURCE_AUDIO"); BASE="${BASE%.*}"
+    mlx_whisper "$SOURCE_AUDIO" \
+        --model "$WHISPER_MODEL" \
+        --output-format txt \
+        --output-dir "$TMP_DIR" \
+        2>/dev/null
+
+    TXT="$TMP_DIR/$BASE.txt"
+    if [[ ! -s "$TXT" ]]; then
+        echo "Transcription failed or produced empty output."
+        exit 1
+    fi
+
+    RAW=$(cat "$TXT")
+    DURATION=$(( $(step_time) - START ))
+    echo "Transcribed in ${DURATION}s. (${#RAW} chars)"
+
+    # ── Step 3: LLM cleanup ──
+    if $RAW_MODE; then
+        FINAL="$RAW"
+    else
+        echo "Cleaning up via $LLM_BACKEND..."
+        START=$(step_time)
+        PROMPT=$(assemble_prompt)
+        case "$LLM_BACKEND" in
+            llm)
+                FINAL=$(echo "$RAW" | llm -s "$PROMPT")
+                ;;
+            claude)
+                FINAL=$(printf '%s\n\n%s' "$PROMPT" "$RAW" | claude -p)
+                ;;
+            ollama)
+                FINAL=$(ollama run "$OLLAMA_MODEL" "$(printf '%s\n\n%s' "$PROMPT" "$RAW")")
+                ;;
+            *)
+                echo "Unknown backend: $LLM_BACKEND (use llm, claude, or ollama)" >&2
+                exit 1
+                ;;
+        esac
+        DURATION=$(( $(step_time) - START ))
+        echo "Cleaned in ${DURATION}s."
+    fi
 fi
 
-# --- Step 4: Clipboard ---
+# ── Output (common to both modes) ─────────────────────────────────────────────
+if $TO_SHARPEN && ! $MEETING_MODE; then
+    SHARPEN_BIN="$SCRIPT_DIR/../sharpen_prompt/sharpen"
+    SHARPEN_ARGS=(deliver --voice)
+    $SHARPEN_REFINE && SHARPEN_ARGS+=(--refine)
+    [[ -n "$SHARPEN_FROM_PANE" ]] && SHARPEN_ARGS+=(--from-pane "$SHARPEN_FROM_PANE")
+    [[ -n "$SHARPEN_PAIR_NAME" ]] && SHARPEN_ARGS+=(--pair "$SHARPEN_PAIR_NAME")
+    echo "---"
+    echo "$FINAL"
+    echo "---"
+    if [[ -x "$SHARPEN_BIN" ]] && printf '%s\n' "$FINAL" | "$SHARPEN_BIN" "${SHARPEN_ARGS[@]}"; then
+        remind_old_recordings
+        exit 0
+    fi
+    # Deliberately no pbcopy here: the clipboard may hold a sharpened message from another pair
+    # that hasn't been pasted yet. sharpen saved the transcript under ~/.config/sharpen/pairs/
+    # and `sharpen resend` sends it again. Exit non-zero so the popup stays open with the reason.
+    echo "Not delivered, and the clipboard was left alone. The transcript is above."
+    [[ -x "$SHARPEN_BIN" ]] || echo "(sharpen not found at $SHARPEN_BIN)"
+    exit 3
+fi
 echo "$FINAL" | pbcopy
 echo "---"
 echo "$FINAL"
 echo "---"
 echo "Copied to clipboard."
+if [[ -n "$OUT_FILE" ]]; then
+    printf '%s\n' "$FINAL" > "$OUT_FILE"
+    echo "Wrote transcript to $OUT_FILE"
+fi
+
+remind_old_recordings
